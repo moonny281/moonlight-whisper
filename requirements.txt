@@ -1,12 +1,12 @@
-# Moonlight Whisper 依赖清单 (锁定与 CUDA 12 / cuDNN 9 兼容版本)
-faster-whisper==1.1.0
-ctranslate2==4.5.0
-av>=12.0.0,<14.0.0
-onnxruntime>=1.17.0,<2.0.0
-huggingface_hub>=0.23.0,<1.0.0
-tokenizers>=0.19.0,<1.0.0
+# Moonlight Whisper 依赖清单 (兼容 CUDA 12 / cuDNN 9 与 Windows x64 Python 3.10~3.12)
+faster-whisper>=1.1.0
+ctranslate2>=4.5.0,<5.0.0
+av>=11.0.0
+onnxruntime>=1.17.0
+huggingface_hub>=0.23.0
+tokenizers>=0.19.0
 yt-dlp>=2025.1.15
-PySide6>=6.6.0,<6.9.0
+PySide6>=6.6.0
 opencc-python-reimplemented>=0.1.7
 requests>=2.31.0
 PySocks>=1.7.1
