@@ -84,10 +84,13 @@ class TestReviewFixes(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gpu_dir = Path(tmp) / "gpu_runtime"
             gpu_dir.mkdir()
-            gpu_runtime._DLL_DIR_HANDLES.clear()
-            gpu_runtime.register_dll_directory(gpu_dir)
-            gpu_runtime.register_dll_directory(gpu_dir)
-            self.assertEqual(len(gpu_runtime._DLL_DIR_HANDLES), 1)
+            gpu_runtime.clear_dll_directory_handles()
+            try:
+                gpu_runtime.register_dll_directory(gpu_dir)
+                gpu_runtime.register_dll_directory(gpu_dir)
+                self.assertEqual(len(gpu_runtime._DLL_DIR_HANDLES), 1)
+            finally:
+                gpu_runtime.clear_dll_directory_handles()
 
     def test_p2_3_chinese_closing_quote_punctuation_merging(self) -> None:
         segs = [
