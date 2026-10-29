@@ -427,8 +427,10 @@ def update_yt_dlp_from_pypi(
         shutil.move(str(src_pkg), str(target_pkg))
 
     ensure_plugin_yt_dlp_on_path(paths)
-    if "yt_dlp" in sys.modules:
-        importlib.reload(sys.modules["yt_dlp"])
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "yt_dlp" or mod_name.startswith("yt_dlp."):
+            sys.modules.pop(mod_name, None)
+    importlib.import_module("yt_dlp")
 
     if on_log:
         on_log(f"yt-dlp 已成功更新至 {latest_version}")

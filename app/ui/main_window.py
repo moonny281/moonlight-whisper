@@ -495,6 +495,12 @@ class MainWindow(QMainWindow):
             "<p><small>仅供个人学习与研究使用，请遵守各视频站点服务条款与版权法规。</small></p>",
         )
 
+    def dragEnterEvent(self, event) -> None:
+        self.input_edit.dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:
+        self.input_edit.dropEvent(event)
+
     def closeEvent(self, event) -> None:
         if self.queue.is_running:
             ans = QMessageBox.question(

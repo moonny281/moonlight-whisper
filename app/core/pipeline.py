@@ -205,7 +205,7 @@ def run(
                 model_name=cfg.model,
                 hf_mirror=cfg.hf_mirror,
                 proxy=cfg.proxy,
-                on_progress=lambda ratio, msg: _emit_log(msg),
+                on_progress=lambda ratio, msg: _emit_stage(f"下载模型 ({cfg.model}) {int(ratio * 100)}%"),
                 on_log=_emit_log,
                 token=token,
                 paths=paths,

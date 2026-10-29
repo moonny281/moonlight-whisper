@@ -163,6 +163,7 @@ def download_model(
 
     completed_prior_bytes = 0
     start_ts = time.monotonic()
+    last_emit_ts = [0.0]
 
     try:
         for idx, (rfile, declared_size) in enumerate(file_entries, start=1):
@@ -181,6 +182,10 @@ def download_model(
             ) -> None:
                 if not on_progress:
                     return
+                now = time.monotonic()
+                if cur_bytes < file_total and (now - last_emit_ts[0]) < 0.2:
+                    return
+                last_emit_ts[0] = now
                 effective_total = max(total_expected_bytes, base + file_total)
                 overall = base + cur_bytes
                 ratio = min(0.99, max(0.02, overall / max(1, effective_total)))

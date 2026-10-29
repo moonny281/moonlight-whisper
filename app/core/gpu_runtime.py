@@ -316,6 +316,7 @@ def install(
 
     completed_prior_bytes = 0
     start_ts = time.monotonic()
+    last_emit_ts = [0.0]
     downloaded_wheels: List[Path] = []
 
     for pkg, w in wheels_meta:
@@ -331,6 +332,10 @@ def install(
         def _on_chunk(cur_bytes: int, file_total: int, base: int = completed_prior_bytes, pkg_label: str = pkg) -> None:
             if not on_progress:
                 return
+            now = time.monotonic()
+            if cur_bytes < file_total and (now - last_emit_ts[0]) < 0.2:
+                return
+            last_emit_ts[0] = now
             effective_total = max(total_estimated_bytes, base + file_total)
             overall = base + cur_bytes
             ratio = min(0.92, max(0.0, overall / max(1, effective_total)))

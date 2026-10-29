@@ -1,4 +1,4 @@
- ; Inno Setup Script for Moonlight Whisper (Windows 10/11 x64)
+﻿; Inno Setup Script for Moonlight Whisper (Windows 10/11 x64)
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
@@ -31,14 +31,12 @@ SolidCompression=yes
 WizardStyle=modern
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 只覆盖 PyInstaller 产物文件与 bin/，升级安装时绝不清空同目录下的 models/、gpu_runtime/、output/、config.json
 Source: "..\dist\MoonlightWhisper\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\MoonlightWhisper\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
