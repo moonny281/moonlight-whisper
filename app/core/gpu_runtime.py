@@ -170,6 +170,20 @@ def register_dll_directory(gpu_dir: Path) -> bool:
     return True
 
 
+
+
+def clear_dll_directory_handles() -> None:
+    """Close and clear all registered Windows DLL directory handles."""
+    for handle in list(_DLL_DIR_HANDLES.values()):
+        close_fn = getattr(handle, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+    _DLL_DIR_HANDLES.clear()
+
+
 def _verify_ctranslate2_cuda() -> Tuple[bool, str]:
     """Verify `ctranslate2.get_cuda_device_count() > 0`."""
     try:
