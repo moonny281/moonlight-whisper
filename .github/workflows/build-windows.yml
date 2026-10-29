@@ -1,0 +1,48 @@
+name: Build Windows EXE & Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download FFmpeg essentials binary into bin/
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          curl.exe -L "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          $ffmpegExe = Get-ChildItem -Path ffmpeg_tmp -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+          Copy-Item $ffmpegExe.FullName -Destination "bin/ffmpeg.exe" -Force
+          Remove-Item -Recurse -Force ffmpeg.zip, ffmpeg_tmp
+
+      - name: Run unit tests & build EXE + Inno Setup Installer
+        shell: pwsh
+        run: |
+          ./build/build.ps1 -Version 1.0.0
+
+      - name: Upload Portable ZIP & Setup EXE Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoonlightWhisper-Windows-x64
+          path: |
+            dist/installer/*.exe
+            dist/MoonlightWhisper/
