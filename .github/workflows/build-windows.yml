@@ -3,46 +3,69 @@ name: Build Windows EXE & Installer
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+      - master
     tags:
       - "v*"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
+      - name: Locate project root, download FFmpeg, install deps & build EXE
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          # 兼容用户将外层 moonlight-whisper 文件夹一并上传的情况
+          if ((-not (Test-Path "requirements.txt")) -and (Test-Path "moonlight-whisper/requirements.txt")) {
+              Write-Host "检测到项目位于子目录 moonlight-whisper/，自动切换工作目录..."
+              Set-Location "moonlight-whisper"
+          }
+
+          if (-not (Test-Path "requirements.txt")) {
+              Get-ChildItem -Recurse -Depth 2
+              throw "未在仓库中找到 requirements.txt，请确认已将项目源码上传至仓库。"
+          }
+
+          Write-Host "=== 1. 检查 Python 环境 ==="
+          python --version
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
 
-      - name: Download FFmpeg essentials binary into bin/
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          curl.exe -L "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o ffmpeg.zip
-          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
-          $ffmpegExe = Get-ChildItem -Path ffmpeg_tmp -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
-          Copy-Item $ffmpegExe.FullName -Destination "bin/ffmpeg.exe" -Force
-          Remove-Item -Recurse -Force ffmpeg.zip, ffmpeg_tmp
+          Write-Host "=== 2. 安装项目依赖 ==="
+          python -m pip install -r requirements.txt
 
-      - name: Run unit tests & build EXE + Inno Setup Installer
-        shell: pwsh
-        run: |
+          Write-Host "=== 3. 下载 FFmpeg essentials 到 bin/ffmpeg.exe ==="
+          New-Item -ItemType Directory -Force -Path "bin" | Out-Null
+          if (-not (Test-Path "bin/ffmpeg.exe")) {
+              curl.exe -L --retry 3 "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o ffmpeg.zip
+              Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+              $ffmpegExe = Get-ChildItem -Path ffmpeg_tmp -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+              if ($null -eq $ffmpegExe) {
+                  throw "解压 FFmpeg 失败，未找到 ffmpeg.exe"
+              }
+              Copy-Item $ffmpegExe.FullName -Destination "bin/ffmpeg.exe" -Force
+              Remove-Item -Recurse -Force ffmpeg.zip, ffmpeg_tmp
+          }
+
+          Write-Host "=== 4. 执行单元测试、PyInstaller 打包与 Inno Setup 编译 ==="
           ./build/build.ps1 -Version 1.0.0
 
-      - name: Upload Portable ZIP & Setup EXE Artifacts
+          # 将产物统一复制到仓库根目录下的 release_out/ 以便上传 Artifact
+          $OutRoot = Join-Path $env:GITHUB_WORKSPACE "release_out"
+          New-Item -ItemType Directory -Force -Path $OutRoot | Out-Null
+          Copy-Item -Path "dist/installer/*" -Destination $OutRoot -Force
+
+      - name: Upload Windows EXE & Portable ZIP Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: MoonlightWhisper-Windows-x64
-          path: |
-            dist/installer/*.exe
-            dist/MoonlightWhisper/
+          path: release_out/*
+          if-no-files-found: error
