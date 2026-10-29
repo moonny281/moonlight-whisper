@@ -99,3 +99,33 @@ def generate_summary(
             on_log(f"[摘要跳过] LLM 接口调用失败，已保留默认占位符：{exc}")
 
     return PLACEHOLDER_SUMMARY
+
+
+def test_llm_connection(llm_cfg: LlmConfig, proxy: str = "") -> tuple[bool, str]:
+    """Send a lightweight ping request to verify the OpenAI-compatible API endpoint and key."""
+    if not llm_cfg.api_key.strip():
+        return False, "请先填写 API Key。"
+    endpoint = llm_cfg.base_url.rstrip("/")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint = f"{endpoint}/chat/completions"
+    payload = {
+        "model": llm_cfg.model.strip() or "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "请回复 OK"}],
+        "max_tokens": 8,
+        "temperature": 0.0,
+    }
+    try:
+        body = http_client.post_json(
+            url=endpoint,
+            payload=payload,
+            headers={"Authorization": f"Bearer {llm_cfg.api_key.strip()}"},
+            proxy=proxy,
+            timeout=min(20, max(5, llm_cfg.timeout_sec)),
+        )
+        choices = body.get("choices") or []
+        if choices:
+            reply = choices[0].get("message", {}).get("content", "").strip()
+            return True, f"连接成功！模型响应：{reply or 'OK'}"
+        return False, f"收到响应但格式异常：{body}"
+    except Exception as exc:
+        return False, f"连接失败：{exc}"

@@ -38,6 +38,7 @@ class SettingsDialog(QDialog):
         self,
         cfg: Config,
         paths: AppPaths = PATHS,
+        initial_tab: int = 0,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -46,9 +47,11 @@ class SettingsDialog(QDialog):
         self._ytdlp_worker: Optional[YtDlpUpdateWorker] = None
 
         self.setWindowTitle("设置 - Moonlight Whisper")
-        self.setMinimumSize(640, 520)
+        self.setMinimumSize(660, 540)
         self._build_ui()
         self._load_from_config()
+        if 0 <= initial_tab < self.tabs.count():
+            self.tabs.setCurrentIndex(initial_tab)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -62,7 +65,8 @@ class SettingsDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
-        self.btn_save = QPushButton("保存")
+        self.btn_save = QPushButton("保存配置")
+        self.btn_save.setObjectName("PrimaryButton")
         self.btn_cancel = QPushButton("取消")
         self.btn_save.clicked.connect(self._save_and_accept)
         self.btn_cancel.clicked.connect(self.reject)
@@ -193,6 +197,15 @@ class SettingsDialog(QDialog):
         self.edit_llm_prompt.setMaximumHeight(110)
         llm_form.addRow("系统提示词：", self.edit_llm_prompt)
 
+        test_row = QHBoxLayout()
+        self.btn_test_llm = QPushButton("测试 API 连接")
+        self.btn_test_llm.clicked.connect(self._test_llm_api)
+        self.lbl_llm_test_result = QLabel("可点击左侧按钮验证 Base URL 与 API Key 是否可用")
+        self.lbl_llm_test_result.setObjectName("MutedLabel")
+        test_row.addWidget(self.btn_test_llm)
+        test_row.addWidget(self.lbl_llm_test_result, 1)
+        llm_form.addRow("连通性测试：", test_row)
+
         layout.addWidget(llm_group)
         hint = QLabel("说明：若未启用或接口调用失败，文档中的「## 摘要」将自动保留 `> （待填写）` 占位，不影响转录正文。")
         hint.setWordWrap(True)
@@ -314,6 +327,30 @@ class SettingsDialog(QDialog):
         self.btn_update_ytdlp.setEnabled(True)
         self.lbl_ytdlp_ver.setText(f"当前版本：{downloader.get_yt_dlp_version(self.paths)}")
         QMessageBox.warning(self, "更新失败", f"{err.user_message}\n\n{err.detail}")
+
+    def _test_llm_api(self) -> None:
+        from app.config import LlmConfig
+        from app.core import summarizer
+        temp_llm = LlmConfig(
+            enabled=True,
+            base_url=self.edit_llm_base_url.text().strip() or "https://api.openai.com/v1",
+            api_key=self.edit_llm_api_key.text().strip(),
+            model=self.edit_llm_model.text().strip() or "gpt-4o-mini",
+            system_prompt=self.edit_llm_prompt.toPlainText().strip(),
+            timeout_sec=15,
+        )
+        self.btn_test_llm.setEnabled(False)
+        self.lbl_llm_test_result.setText("正在请求接口...")
+        QApplication_process = getattr(__import__("PySide6.QtWidgets", fromlist=["QApplication"]).QApplication, "processEvents", None)
+        if callable(QApplication_process):
+            QApplication_process()
+        ok, msg = summarizer.test_llm_connection(temp_llm, proxy=self.edit_proxy.text().strip())
+        self.btn_test_llm.setEnabled(True)
+        self.lbl_llm_test_result.setText(msg)
+        if ok:
+            QMessageBox.information(self, "连接成功", msg)
+        else:
+            QMessageBox.warning(self, "连接失败", msg)
 
     def _save_and_accept(self) -> None:
         old_gpu_dir = self.paths.gpu_runtime_dir

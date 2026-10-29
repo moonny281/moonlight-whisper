@@ -124,7 +124,9 @@ def _fetch_repo_file_list(repo_id: str, endpoint: str, proxy: str) -> List[Tuple
 
     return [
         ("config.json", 2048),
+        ("preprocessor_config.json", 2048),
         ("tokenizer.json", 2 * 1024 * 1024),
+        ("vocabulary.json", 1024 * 1024),
         ("vocabulary.txt", 512 * 1024),
         ("model.bin", 0),
     ]
@@ -212,7 +214,7 @@ def download_model(
                 raise
             except Exception as file_exc:
                 # Optional vocabulary file variations (e.g. vocabulary.json vs vocabulary.txt)
-                if rfile.startswith("vocabulary.") and (target_dir / "tokenizer.json").exists():
+                if rfile in ("vocabulary.txt", "vocabulary.json", "preprocessor_config.json") and rfile != "model.bin":
                     continue
                 raise file_exc
 

@@ -98,6 +98,7 @@ def _build_common_ydl_opts(
         "noplaylist": not opts.allow_playlist,
         "quiet": True,
         "no_warnings": True,
+        "windowsfilenames": True,
         "logger": _YtDlpLogger(on_log),
         "socket_timeout": 30,
         "retries": 3,

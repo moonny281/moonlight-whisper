@@ -460,3 +460,31 @@ class TaskQueue(QObject):
         item.error_info = None
         self.task_updated.emit(job_id)
         self._schedule_next()
+
+    def retry_failed_tasks(self) -> int:
+        """Retry all FAILED or CANCELLED tasks in the queue."""
+        count = 0
+        for jid in self._order:
+            item = self._tasks.get(jid)
+            if item and item.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                item.token = CancelToken()
+                item.status = TaskStatus.WAITING
+                item.stage_text = "等待"
+                item.progress = 0
+                item.error_info = None
+                self.task_updated.emit(jid)
+                count += 1
+        if count > 0:
+            self._schedule_next()
+        return count
+
+    def stats(self) -> Dict[str, int]:
+        """Return task counts grouped by status."""
+        items = self.all_tasks()
+        return {
+            "total": len(items),
+            "running": sum(1 for i in items if i.status == TaskStatus.RUNNING),
+            "waiting": sum(1 for i in items if i.status == TaskStatus.WAITING),
+            "completed": sum(1 for i in items if i.status == TaskStatus.COMPLETED),
+            "failed": sum(1 for i in items if i.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)),
+        }

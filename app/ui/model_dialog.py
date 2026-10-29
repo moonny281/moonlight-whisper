@@ -91,6 +91,7 @@ class ModelManagerDialog(QDialog):
 
         btn_row = QHBoxLayout()
         self.btn_download = QPushButton("下载选中模型")
+        self.btn_download.setObjectName("PrimaryButton")
         self.btn_import = QPushButton("手动导入选中模型...")
         self.btn_cancel_dl = QPushButton("取消下载")
         self.btn_cancel_dl.setEnabled(False)

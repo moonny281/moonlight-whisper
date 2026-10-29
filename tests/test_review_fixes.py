@@ -103,5 +103,24 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(paras[0][1], "他说：“你好。”随后离开了房间。")
 
 
+
+    def test_v1_1_0_version_and_llm_connection_helper(self) -> None:
+        import app
+        from app.config import LlmConfig
+        from app.core import summarizer
+        self.assertEqual(app.__version__, "1.1.0")
+
+        empty_cfg = LlmConfig(enabled=True, api_key="")
+        ok, msg = summarizer.test_llm_connection(empty_cfg)
+        self.assertFalse(ok)
+        self.assertIn("API Key", msg)
+
+        valid_cfg = LlmConfig(enabled=True, api_key="sk-test", model="gpt-4o-mini")
+        with patch("app.core.http_client.post_json", return_value={"choices": [{"message": {"content": "OK"}}]}):
+            ok2, msg2 = summarizer.test_llm_connection(valid_cfg)
+            self.assertTrue(ok2)
+            self.assertIn("OK", msg2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -102,6 +102,7 @@ class GpuRuntimeDialog(QDialog):
 
         btn_row = QHBoxLayout()
         self.btn_download = QPushButton("在线下载并安装")
+        self.btn_download.setObjectName("PrimaryButton")
         self.btn_import_zip = QPushButton("导入本地压缩包 (.zip/.whl)...")
         self.btn_import_dir = QPushButton("导入本地文件夹...")
         self.btn_cancel = QPushButton("取消")

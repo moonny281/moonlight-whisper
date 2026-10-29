@@ -1,6 +1,6 @@
 ﻿; Inno Setup Script for Moonlight Whisper (Windows 10/11 x64)
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.1.0"
 #endif
 
 #define MyAppName "Moonlight Whisper"
