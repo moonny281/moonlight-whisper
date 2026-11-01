@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import struct
 import sys
@@ -9,13 +10,31 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from typing import Any, Iterator
 from unittest.mock import patch
+
+import numpy as np  # Pre-import C-extension at module load so sys.modules never reloads it
 
 from app.core import downloader, gpu_runtime, http_client, md_writer, model_manager
 from app.core.cancel import CancelToken
 from app.core.errors import CancelledError
 from app.core.transcriber import Segment, TranscribeOptions
 from app.paths import AppPaths
+
+
+@contextlib.contextmanager
+def _patch_sys_module(name: str, fake_mod: Any) -> Iterator[None]:
+    """Patch a single entry in `sys.modules` without clearing other C-extension modules on exit."""
+    had_prev = name in sys.modules
+    prev_mod = sys.modules.get(name)
+    sys.modules[name] = fake_mod
+    try:
+        yield
+    finally:
+        if had_prev and prev_mod is not None:
+            sys.modules[name] = prev_mod
+        else:
+            sys.modules.pop(name, None)
 
 
 class TestReviewFixes(unittest.TestCase):
@@ -146,7 +165,7 @@ class TestReviewFixes(unittest.TestCase):
 
             fake_fw = type(sys)("faster_whisper")
             fake_fw.WhisperModel = DummyWhisperModel  # type: ignore[attr-defined]
-            with patch.dict("sys.modules", {"faster_whisper": fake_fw}):
+            with _patch_sys_module("faster_whisper", fake_fw):
                 transcriber.MODEL_CACHE.clear()
                 transcriber.MODEL_CACHE.get_or_create(
                     model_path_or_size="large-v3-turbo",
@@ -176,7 +195,7 @@ class TestReviewFixes(unittest.TestCase):
             return "CONTAINER_OK"
 
         fake_av.open = _strict_pyav19_open  # type: ignore[attr-defined]
-        with patch.dict("sys.modules", {"av": fake_av}):
+        with _patch_sys_module("av", fake_av):
             transcriber._patch_runtime_compat()
             res = fake_av.open("test.wav", mode="r", metadata_errors="ignore")
             self.assertEqual(res, "CONTAINER_OK")
@@ -229,7 +248,7 @@ class TestReviewFixes(unittest.TestCase):
 
             fake_fw = type(sys)("faster_whisper")
             fake_fw.WhisperModel = DummyModelWithBrokenVad  # type: ignore[attr-defined]
-            with patch.dict("sys.modules", {"faster_whisper": fake_fw}):
+            with _patch_sys_module("faster_whisper", fake_fw):
                 transcriber.MODEL_CACHE.clear()
                 opts = TranscribeOptions(model="small", device="cpu", vad=True, models_dir=model_dir.parent)
                 segs, meta = transcriber.transcribe(wav_file, opts)

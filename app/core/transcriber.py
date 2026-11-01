@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import wave
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
