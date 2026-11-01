@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release 版本号 (例如 1.1.0)"
+        description: "自定义版本号 (留空则自动读取 app/__init__.py 中的 __version__)"
         required: false
-        default: "1.1.0"
+        default: "" 
       publish_release:
         description: "构建完成后自动发布到 GitHub Releases"
         required: false
@@ -44,18 +44,19 @@ jobs:
               Set-Location "moonlight-whisper"
           }
 
-          # 解析版本号：若由 tag (如 v1.1.0) 触发则提取 tag 版本，否则使用输入参数或默认 1.1.0
+          # 自动从 app/__init__.py 读取 __version__，以后永远无需再手动修改本 yml 文件的版本号！
+          $CodeVer = (python -c "import app; print(app.__version__)").Trim()
           $InputVer = "${{ inputs.version }}"
-          if ([string]::IsNullOrWhiteSpace($InputVer)) {
-              $InputVer = "1.1.0"
-          }
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME.StartsWith("v")) {
               $AppVersion = $env:GITHUB_REF_NAME.Substring(1)
-              $ReleaseTag = $env:GITHUB_REF_NAME
-          } else {
+          } elseif (-not [string]::IsNullOrWhiteSpace($InputVer)) {
               $AppVersion = $InputVer.TrimStart("v")
-              $ReleaseTag = "v$AppVersion"
+          } elseif (-not [string]::IsNullOrWhiteSpace($CodeVer)) {
+              $AppVersion = $CodeVer
+          } else {
+              $AppVersion = "1.2.0"
           }
+          $ReleaseTag = "v$AppVersion" 
           $env:APP_VERSION = $AppVersion
           "app_version=$AppVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "release_tag=$ReleaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
