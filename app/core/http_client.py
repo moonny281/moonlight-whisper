@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from app.core.cancel import CancelToken
 from app.core.errors import CancelledError
 
-USER_AGENT = "MoonlightWhisper/1.0"
+USER_AGENT = "MoonlightWhisper/1.2.1"
 
 _PEP503_LINK_RE = re.compile(
     r'<a\s+[^>]*href=["\']([^"\']+\.whl(?:#sha256=[0-9a-fA-F]+)?)["\'][^>]*>([^<]+)</a>',
@@ -25,7 +25,8 @@ def _proxies_dict(proxy: str) -> Optional[Dict[str, str]]:
     p = (proxy or "").strip()
     if not p:
         return None
-    # Convert socks5:// to socks5h:// for remote DNS resolution when using requests
+    if p.startswith("socks5://"):
+        p = "socks5h://" + p[len("socks5://") :]
     return {"http": p, "https": p}
 
 
@@ -102,7 +103,6 @@ def post_json(
 
 
 def _extract_version_tuple(filename: str) -> Tuple[int, ...]:
-    # Wheel format: {distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl
     parts = filename.split("-")
     if len(parts) < 2:
         return (0,)
@@ -159,10 +159,7 @@ def resolve_pypi_wheel(
     proxy: str = "",
     win_amd64_only: bool = False,
 ) -> Dict[str, Any]:
-    """Resolve the latest wheel metadata for `pkg_name` across Tuna, Aliyun, or Official PyPI.
-
-    Supports both Warehouse JSON API and PEP 503 Simple Index HTML (used by Aliyun).
-    """
+    """Resolve the latest wheel metadata for `pkg_name` across Tuna, Aliyun, or Official PyPI."""
     json_urls: List[str] = []
     simple_urls: List[str] = []
 
@@ -178,7 +175,6 @@ def resolve_pypi_wheel(
 
     last_err: Optional[BaseException] = None
 
-    # For Aliyun, try PEP 503 Simple Index first since Warehouse JSON endpoint often 404s
     search_order = (
         [("simple", u) for u in simple_urls] + [("json", u) for u in json_urls]
         if mirror == "aliyun"
@@ -247,11 +243,9 @@ def stream_download_with_resume(
     on_chunk_progress: Optional[Callable[[int, int], None]] = None,
     token: Optional[CancelToken] = None,
     timeout: int = 60,
+    expected_size: int = 0,
 ) -> Path:
-    """Download `url` to `dest_file` with HTTP Range resume, SOCKS5 support, and per-chunk cancellation.
-
-    `on_chunk_progress(downloaded_bytes, total_bytes)` is invoked on every 128KB chunk.
-    """
+    """Download `url` to `dest_file` with HTTP Range resume, completeness check, and per-chunk cancellation."""
     if token:
         token.check()
 
@@ -259,14 +253,24 @@ def stream_download_with_resume(
     part_file = dest_file.with_suffix(dest_file.suffix + ".part")
 
     if dest_file.exists():
-        if not expected_sha256 or compute_sha256(dest_file).lower() == expected_sha256.lower():
-            sz = dest_file.stat().st_size
+        sz = dest_file.stat().st_size
+        if expected_size > 0 and sz != expected_size:
+            if 0 < sz < expected_size and not part_file.exists():
+                dest_file.replace(part_file)
+            else:
+                dest_file.unlink(missing_ok=True)
+        elif not expected_sha256 or compute_sha256(dest_file).lower() == expected_sha256.lower():
             if on_chunk_progress:
                 on_chunk_progress(sz, sz)
             return dest_file
-        dest_file.unlink()
+        else:
+            dest_file.unlink(missing_ok=True)
 
     existing_bytes = part_file.stat().st_size if part_file.exists() else 0
+    if expected_size > 0 and existing_bytes > expected_size:
+        part_file.unlink(missing_ok=True)
+        existing_bytes = 0
+
     headers = {"User-Agent": USER_AGENT}
     if existing_bytes > 0:
         headers["Range"] = f"bytes={existing_bytes}-"
@@ -279,9 +283,9 @@ def stream_download_with_resume(
             proxies=_proxies_dict(proxy),
             stream=True,
             timeout=timeout,
+            allow_redirects=True,
         ) as resp:
             if resp.status_code == 416:
-                # Range not satisfiable -> restart cleanly
                 existing_bytes = 0
                 part_file.unlink(missing_ok=True)
                 return stream_download_with_resume(
@@ -292,6 +296,7 @@ def stream_download_with_resume(
                     on_chunk_progress=on_chunk_progress,
                     token=token,
                     timeout=timeout,
+                    expected_size=expected_size,
                 )
             resp.raise_for_status()
             is_partial = resp.status_code == 206 and existing_bytes > 0
@@ -300,7 +305,7 @@ def stream_download_with_resume(
                 existing_bytes = 0
 
             content_len = int(resp.headers.get("Content-Length") or 0)
-            total_bytes = (existing_bytes + content_len) if content_len > 0 else 0
+            total_bytes = (existing_bytes + content_len) if content_len > 0 else expected_size
             downloaded = existing_bytes
             if on_chunk_progress:
                 on_chunk_progress(downloaded, total_bytes)
@@ -318,7 +323,6 @@ def stream_download_with_resume(
     except CancelledError:
         raise
     except ImportError:
-        # Fallback to urllib if requests is not installed
         handlers = []
         if proxy.strip():
             handlers.append(urllib.request.ProxyHandler({"http": proxy.strip(), "https": proxy.strip()}))
@@ -331,7 +335,7 @@ def stream_download_with_resume(
             if not is_partial:
                 existing_bytes = 0
             content_len = int(resp.headers.get("Content-Length") or 0)
-            total_bytes = (existing_bytes + content_len) if content_len > 0 else 0
+            total_bytes = (existing_bytes + content_len) if content_len > 0 else expected_size
             downloaded = existing_bytes
             if on_chunk_progress:
                 on_chunk_progress(downloaded, total_bytes)
@@ -347,6 +351,11 @@ def stream_download_with_resume(
                     downloaded += len(chunk)
                     if on_chunk_progress:
                         on_chunk_progress(downloaded, total_bytes)
+
+    if total_bytes > 0 and downloaded < total_bytes:
+        raise IOError(
+            f"文件 {dest_file.name} 下载流提前中断 (已接收 {downloaded} / {total_bytes} 字节，支持重试断点续传)"
+        )
 
     if expected_sha256:
         actual_sha = compute_sha256(part_file)

@@ -1,4 +1,4 @@
-"""End-to-end transcription pipeline orchestrating download, transcode, GPU/model readiness, transcribe, summary, and output."""
+"""End-to-end transcription pipeline orchestrating download, transcode, GPU/model readiness, transcribe (with corrupted model self-healing), summary, and output."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from app.config import Config
 from app.core import audio, downloader, gpu_runtime, md_writer, model_manager, summarizer, transcriber
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions, MediaInfo
-from app.core.errors import CancelledError, MoonlightError
+from app.core.errors import CancelledError, MoonlightError, TranscribeError
 from app.core.gpu_runtime import GpuStatus
 from app.core.transcriber import TranscribeOptions
 from app.paths import PATHS, AppPaths
@@ -160,7 +160,7 @@ def run(
 
         token.check()
 
-        # Step 4: Convert audio to 16kHz mono WAV (30% - 35%) and backfill duration if unknown (Fixes P2-3)
+        # Step 4: Convert audio to 16kHz mono WAV (30% - 35%) and backfill duration if unknown
         _emit_stage("转码音频")
         wav_path = workdir / "audio_16k.wav"
 
@@ -200,7 +200,7 @@ def run(
         # Step 6: Ensure model is downloaded locally
         if not model_manager.is_model_installed(cfg.model, paths=paths):
             _emit_stage(f"下载模型 ({cfg.model})")
-            _emit_log(f"本地未找到模型 {cfg.model}，开始自动下载...")
+            _emit_log(f"本地未找到完整模型 {cfg.model}，开始自动下载...")
             model_manager.download_model(
                 model_name=cfg.model,
                 hf_mirror=cfg.hf_mirror,
@@ -213,7 +213,7 @@ def run(
 
         token.check()
 
-        # Step 7: Transcribe with faster-whisper (35% - 95%)
+        # Step 7: Transcribe with faster-whisper (35% - 95%), with auto-repair if cached local model is corrupted
         _emit_stage("加载模型与转录中")
         tr_opts = TranscribeOptions(
             model=cfg.model,
@@ -227,19 +227,62 @@ def run(
             models_dir=paths.models_dir,
             vram_gb=vram_gb,
         )
-        segments, meta = transcriber.transcribe(
-            wav_path=wav_path,
-            opts=tr_opts,
-            on_progress=lambda ratio, detail: _emit_progress(35 + int(ratio * 60)),
-            on_log=_emit_log,
-            token=token,
-            paths=paths,
-        )
+        try:
+            segments, meta = transcriber.transcribe(
+                wav_path=wav_path,
+                opts=tr_opts,
+                on_progress=lambda ratio, detail: _emit_progress(35 + int(ratio * 60)),
+                on_log=_emit_log,
+                token=token,
+                paths=paths,
+            )
+        except TranscribeError as first_tr_err:
+            err_text = f"{first_tr_err.user_message} {first_tr_err.detail}".lower()
+            is_corrupt_model_err = any(
+                kw in err_text
+                for kw in (
+                    "model.bin",
+                    "config.json",
+                    "tokenizer",
+                    "vocabulary",
+                    "invalid model",
+                    "failed to open",
+                    "failed to read",
+                    "archive",
+                    "corrupt",
+                )
+            )
+            if not is_corrupt_model_err:
+                raise
+            token.check()
+            _emit_log(f"[模型自愈] 检测到本地模型 {cfg.model} 文件可能损坏或不完整 ({first_tr_err.user_message})，正在清理并重新下载...")
+            _emit_stage(f"修复下载模型 ({cfg.model})")
+            transcriber.MODEL_CACHE.clear()
+            model_manager.purge_corrupted_model(cfg.model, paths=paths)
+            model_manager.download_model(
+                model_name=cfg.model,
+                hf_mirror=cfg.hf_mirror,
+                proxy=cfg.proxy,
+                on_progress=lambda ratio, msg: _emit_stage(f"修复模型 ({cfg.model}) {int(ratio * 100)}%"),
+                on_log=_emit_log,
+                token=token,
+                paths=paths,
+            )
+            _emit_stage("加载模型与转录中")
+            segments, meta = transcriber.transcribe(
+                wav_path=wav_path,
+                opts=tr_opts,
+                on_progress=lambda ratio, detail: _emit_progress(35 + int(ratio * 60)),
+                on_log=_emit_log,
+                token=token,
+                paths=paths,
+            )
+
         _emit_progress(95)
 
         if not segments:
             _emit_log(
-                "[提示] 转录结果为空：音频可能不包含人声，或 VAD 静音过滤过于严格（可在设置中关闭 VAD 后重试）。"
+                "[提示] 转录结果为空：音频可能不包含人声，或静音过滤未检出有效语句。"
             )
 
         if info.duration <= 0.0 and meta.get("duration"):

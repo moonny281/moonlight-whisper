@@ -223,7 +223,7 @@ class TaskQueueTable(QTableWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.setColumnWidth(1, 160)
+        self.setColumnWidth(1, 210)
         self.setColumnWidth(2, 175)
         self.setColumnWidth(3, 165)
 

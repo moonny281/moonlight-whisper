@@ -7,6 +7,14 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+# Set critical runtime environment variables BEFORE importing ctranslate2, onnxruntime, or huggingface_hub:
+# 1. Prevent OpenMP duplicate library abort (libiomp5md.dll conflict between ctranslate2 & onnxruntime on Windows)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# 2. Avoid Windows privilege errors when huggingface_hub creates cache symlinks
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+# 3. Default HuggingFace endpoint to hf-mirror.com before huggingface_hub.constants is imported
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 from app import __app_name__, __version__
 from app.config import Config
 from app.core import downloader, gpu_runtime
@@ -22,8 +30,11 @@ def _register_bundled_dll_dirs() -> None:
     candidates = [
         meipass,
         meipass / "ctranslate2",
+        meipass / "ctranslate2.libs",
         meipass / "onnxruntime" / "capi",
+        meipass / "onnxruntime.libs",
         meipass / "av.libs",
+        meipass / "tokenizers.libs",
     ]
     for d in candidates:
         if d.exists() and d.is_dir():
@@ -34,6 +45,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 1. Load configuration and configure custom data/GPU/model directories
     cfg = Config.load(paths=PATHS)
     PATHS.ensure_runtime_dirs()
+
+    if not cfg.hf_mirror:
+        os.environ["HF_ENDPOINT"] = "https://huggingface.co"
 
     # 2. Pre-register bundled DLLs and gpu_runtime/ BEFORE importing ctranslate2 or UI modules (§5.4)
     _register_bundled_dll_dirs()

@@ -612,6 +612,8 @@ class MainWindow(QMainWindow):
         item = self.queue.get_task(job_id)
         if item:
             self.queue_table.update_task_row(item)
+            if item.status.name == "FAILED" and not self.btn_toggle_log.isChecked():
+                self.btn_toggle_log.setChecked(True)
         self._refresh_queue_stats()
         self._refresh_model_combo_labels()
 

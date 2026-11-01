@@ -1,15 +1,22 @@
-"""faster-whisper transcription engine with Chinese-path-safe CTranslate2 loading, model caching, and GPU->CPU fallback."""
+"""faster-whisper transcription engine with PyAV 18/19 compatibility, pure-Python WAV decoding, Chinese-path-safe loading, and VAD/GPU fallback."""
 
 from __future__ import annotations
 
 import ctypes
 import gc
+import inspect
 import os
+import subprocess
 import sys
 import threading
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 from app.core import model_manager
 from app.core.cancel import CancelToken
@@ -64,6 +71,108 @@ def _convert_to_simplified(text: str) -> str:
         return text
 
 
+def load_wav_as_float32_array(wav_path: Path) -> Optional[Any]:
+    """Read a 16kHz 16-bit PCM WAV file directly into a 1D float32 numpy array.
+
+    Completely bypasses `faster_whisper.audio.decode_audio` / `av.open(metadata_errors="ignore")`
+    (which crashes on PyAV 18/19 with `TypeError: open() got an unexpected keyword argument 'metadata_errors'`)
+    as well as any C-level Windows path encoding issues.
+    """
+    try:
+        if not wav_path.exists() or wav_path.stat().st_size <= 44:
+            return None
+        import numpy as np  # type: ignore
+        with wave.open(str(wav_path), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            if n_frames <= 0 or sampwidth != 2:
+                return None
+            raw_bytes = wf.readframes(n_frames)
+        if not raw_bytes:
+            return None
+        pcm = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if n_channels > 1:
+            pcm = pcm.reshape(-1, n_channels).mean(axis=1)
+        if framerate != 16000 and framerate > 0 and pcm.size > 0:
+            duration = pcm.size / float(framerate)
+            target_len = int(round(duration * 16000))
+            if target_len > 0:
+                pcm = np.interp(
+                    np.linspace(0.0, 1.0, target_len, endpoint=False),
+                    np.linspace(0.0, 1.0, pcm.size, endpoint=False),
+                    pcm,
+                ).astype(np.float32)
+        return np.ascontiguousarray(pcm, dtype=np.float32)
+    except Exception:
+        return None
+
+
+def _patch_runtime_compat() -> None:
+    """Apply runtime compatibility patches for PyAV 18/19 and ONNX Runtime non-ASCII asset paths."""
+    # 1. Patch PyAV 18/19 `av.open` which removed `metadata_errors="ignore"` used by faster-whisper <=1.2.1
+    try:
+        import av  # type: ignore
+        if not getattr(av, "_moonlight_patched", False):
+            orig_open = av.open
+            try:
+                sig = inspect.signature(orig_open)
+                has_meta_err = "metadata_errors" in sig.parameters
+            except (ValueError, TypeError):
+                has_meta_err = False
+
+            if not has_meta_err:
+                def _compat_av_open(*args: Any, **kwargs: Any) -> Any:
+                    kwargs.pop("metadata_errors", None)
+                    return orig_open(*args, **kwargs)
+
+                av.open = _compat_av_open  # type: ignore[assignment]
+            av._moonlight_patched = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # 2. Patch `faster_whisper.vad.SileroVADModel.__init__` to load `silero_vad_v6.onnx` via in-memory bytes
+    # so ONNX Runtime C++ never fails when the app is extracted into a Chinese directory on Windows.
+    try:
+        import faster_whisper.vad as fw_vad  # type: ignore
+        if not getattr(fw_vad, "_moonlight_vad_patched", False):
+            orig_vad_init = fw_vad.SileroVADModel.__init__
+
+            def _compat_vad_init(self: Any, path: Any) -> None:
+                try:
+                    import onnxruntime  # type: ignore
+                    candidates = [Path(str(path))]
+                    if getattr(sys, "frozen", False):
+                        meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent / "_internal"))
+                        candidates.append(meipass / "faster_whisper" / "assets" / Path(str(path)).name)
+                        candidates.append(meipass / "faster_whisper" / "assets" / "silero_vad_v6.onnx")
+                        candidates.append(meipass / "faster_whisper" / "assets" / "silero_vad.onnx")
+
+                    for cand in candidates:
+                        if cand.exists() and cand.is_file():
+                            opts = onnxruntime.SessionOptions()
+                            opts.inter_op_num_threads = 1
+                            opts.intra_op_num_threads = 1
+                            opts.enable_cpu_mem_arena = False
+                            opts.log_severity_level = 4
+                            model_bytes = cand.read_bytes()
+                            self.session = onnxruntime.InferenceSession(
+                                model_bytes,
+                                providers=["CPUExecutionProvider"],
+                                sess_options=opts,
+                            )
+                            return
+                except Exception:
+                    pass
+                orig_vad_init(self, path)
+
+            fw_vad.SileroVADModel.__init__ = _compat_vad_init  # type: ignore[method-assign]
+            fw_vad._moonlight_vad_patched = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _try_windows_short_path(path: Path) -> Optional[str]:
     """Attempt to convert a non-ASCII Windows path to its 8.3 ASCII short path via Win32 API."""
     if sys.platform != "win32":
@@ -71,11 +180,66 @@ def _try_windows_short_path(path: Path) -> Optional[str]:
     try:
         buf = ctypes.create_unicode_buffer(1024)
         res = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024)
-        if res > 0 and buf.value and buf.value.isascii():
+        if res > 0 and buf.value and buf.value.isascii() and Path(buf.value).exists():
             return buf.value
     except Exception:
         pass
     return None
+
+
+def _try_windows_ascii_junction(local_dir: Path) -> Optional[str]:
+    """Create a zero-privilege NTFS directory junction under `C:\\Users\\Public\\MoonlightWhisper_Models`
+    when `local_dir` is on a drive with 8.3 short names disabled and contains non-ASCII characters.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "MoonlightWhisper_Models"
+        if not str(public_root).isascii():
+            return None
+        public_root.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "-_.")) else "_" for ch in local_dir.name)
+        junction_path = public_root / (safe_name or "whisper_model")
+
+        if junction_path.exists():
+            try:
+                if junction_path.resolve() == local_dir.resolve():
+                    return str(junction_path)
+            except Exception:
+                pass
+            subprocess.run(
+                ["cmd", "/c", "rmdir", str(junction_path)],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                timeout=5,
+            )
+
+        try:
+            import _winapi  # type: ignore
+            _winapi.CreateJunction(str(local_dir), str(junction_path))
+        except Exception:
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction_path), str(local_dir)],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                timeout=5,
+            )
+
+        if junction_path.exists() and (junction_path / "model.bin").exists() and str(junction_path).isascii():
+            return str(junction_path)
+    except Exception:
+        pass
+    return None
+
+
+def _load_model_files_into_memory(local_dir: Path) -> Dict[str, bytes]:
+    """Load CTranslate2 Whisper model files into a memory dict for `WhisperModel(..., files=files)`."""
+    files: Dict[str, bytes] = {}
+    for name in ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json", "vocabulary.txt"):
+        fp = local_dir / name
+        if fp.exists() and fp.is_file():
+            files[name] = fp.read_bytes()
+    return files
 
 
 class _ModelCache:
@@ -95,6 +259,7 @@ class _ModelCache:
         download_root: Path,
         on_log: Optional[LogCallback] = None,
     ) -> Any:
+        _patch_runtime_compat()
         key = (model_path_or_size, device, compute_type, cpu_threads)
         with self._lock:
             if self._model is not None and self._key == key:
@@ -125,20 +290,17 @@ class _ModelCache:
 
             is_valid_local, missing_files = model_manager.verify_model_dir(local_dir)
             if local_dir.exists() and not is_valid_local and on_log:
-                on_log(f"[模型校验警告] 本地模型目录 {local_dir} 缺少文件：{', '.join(missing_files)}")
+                on_log(f"[模型校验警告] 本地模型目录 {local_dir} 缺少或损坏文件：{', '.join(missing_files)}")
 
             if on_log:
                 on_log(f"正在加载模型：{model_path_or_size} (设备={device}, 精度={compute_type})...")
 
-            # Workaround for CTranslate2 Windows C++ std::ifstream failing on Chinese / non-ASCII directory paths:
-            # When loading from `local_dir` whose path contains non-ASCII characters, temporarily chdir into `local_dir`
-            # and pass `"."` (pure ASCII) so CTranslate2 opens `"./model.bin"`, `"./config.json"`, `"./vocabulary.json"`.
             prev_cwd: Optional[str] = None
             try:
                 if is_valid_local:
                     resolved_str = str(local_dir)
                     if not resolved_str.isascii():
-                        short_p = _try_windows_short_path(local_dir)
+                        short_p = _try_windows_short_path(local_dir) or _try_windows_ascii_junction(local_dir)
                         if short_p:
                             target_arg = short_p
                         else:
@@ -148,14 +310,33 @@ class _ModelCache:
                     else:
                         target_arg = resolved_str
 
-                    model = WhisperModel(
-                        target_arg,
-                        device=device,
-                        device_index=0,
-                        compute_type=compute_type,
-                        cpu_threads=cpu_threads,
-                        local_files_only=True,
-                    )
+                    try:
+                        model = WhisperModel(
+                            target_arg,
+                            device=device,
+                            device_index=0,
+                            compute_type=compute_type,
+                            cpu_threads=cpu_threads,
+                            local_files_only=True,
+                        )
+                    except Exception as path_exc:
+                        # Ultimate fallback for Windows Chinese paths where 8.3 and junctions are unavailable:
+                        # read files in Python (UTF-16 native support) and pass in-memory `files` dict to WhisperModel
+                        if not resolved_str.isascii():
+                            if on_log:
+                                on_log(f"[路径兼容] 正在使用内存字节流方式加载模型 ({path_exc})...")
+                            mem_files = _load_model_files_into_memory(local_dir)
+                            model = WhisperModel(
+                                model_path_or_size,
+                                device=device,
+                                device_index=0,
+                                compute_type=compute_type,
+                                cpu_threads=cpu_threads,
+                                local_files_only=True,
+                                files=mem_files,
+                            )
+                        else:
+                            raise
                 else:
                     model = WhisperModel(
                         model_path_or_size,
@@ -202,6 +383,59 @@ def build_fallback_chain(opts: TranscribeOptions) -> List[Tuple[str, str]]:
     return [("cpu", primary_ct)]
 
 
+def _consume_transcribe_generator(
+    model: Any,
+    audio_input: Any,
+    opts: TranscribeOptions,
+    beam_size: int,
+    initial_prompt: Optional[str],
+    use_vad: bool,
+    on_progress: Optional[ProgressCallback],
+    on_log: Optional[LogCallback],
+    token: Optional[CancelToken],
+) -> Tuple[List[Segment], float, str, float]:
+    vad_params = {"min_silence_duration_ms": opts.min_silence_duration_ms} if use_vad else None
+    segments_gen, info = model.transcribe(
+        audio_input,
+        language=opts.language,
+        beam_size=beam_size,
+        vad_filter=use_vad,
+        vad_parameters=vad_params,
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt,
+        word_timestamps=False,
+    )
+
+    duration = float(getattr(info, "duration", 0.0) or 0.0)
+    detected_lang = str(getattr(info, "language", opts.language or "unknown"))
+    lang_prob = float(getattr(info, "language_probability", 1.0) or 1.0)
+
+    if on_log:
+        vad_label = "开启" if use_vad else "关闭"
+        on_log(
+            f"检测到音频语言：{detected_lang} (置信度 {lang_prob:.2f}，VAD={vad_label})，总时长 {duration:.1f}s，开始逐段解码..."
+        )
+
+    collected: List[Segment] = []
+    for raw_seg in segments_gen:
+        if token:
+            token.check()
+        start = float(raw_seg.start)
+        end = float(raw_seg.end)
+        text = str(raw_seg.text).strip()
+        if not text:
+            continue
+        if opts.to_simplified:
+            text = _convert_to_simplified(text)
+        collected.append(Segment(start=start, end=end, text=text))
+
+        if on_progress and duration > 0:
+            ratio = min(1.0, max(0.0, end / duration))
+            on_progress(ratio, f"[{end:.1f}s / {duration:.1f}s] {text[:36]}")
+
+    return collected, duration, detected_lang, lang_prob
+
+
 def _run_single_attempt(
     wav_path: Path,
     opts: TranscribeOptions,
@@ -233,44 +467,69 @@ def _run_single_attempt(
     if opts.language in (None, "zh") and opts.to_simplified:
         initial_prompt = "以下是普通话的句子。"
 
-    vad_params = {"min_silence_duration_ms": opts.min_silence_duration_ms} if opts.vad else None
+    # Prefer pure-Python wave+numpy float32 array to avoid PyAV 18/19 `metadata_errors` crash & C path issues
+    pcm_array = load_wav_as_float32_array(wav_path)
+    audio_input: Any = pcm_array if pcm_array is not None else str(wav_path)
 
-    segments_gen, info = model.transcribe(
-        str(wav_path),
-        language=opts.language,
-        beam_size=beam_size,
-        vad_filter=opts.vad,
-        vad_parameters=vad_params,
-        condition_on_previous_text=False,
-        initial_prompt=initial_prompt,
-        word_timestamps=False,
-    )
-
-    duration = float(getattr(info, "duration", 0.0) or 0.0)
-    detected_lang = str(getattr(info, "language", opts.language or "unknown"))
-    lang_prob = float(getattr(info, "language_probability", 1.0) or 1.0)
-
-    if on_log:
-        on_log(
-            f"检测到音频语言：{detected_lang} (置信度 {lang_prob:.2f})，总时长 {duration:.1f}s，开始逐段解码..."
+    if opts.vad:
+        try:
+            collected, duration, detected_lang, lang_prob = _consume_transcribe_generator(
+                model=model,
+                audio_input=audio_input,
+                opts=opts,
+                beam_size=beam_size,
+                initial_prompt=initial_prompt,
+                use_vad=True,
+                on_progress=on_progress,
+                on_log=on_log,
+                token=token,
+            )
+            if not collected and duration > 1.5:
+                if on_log:
+                    on_log("[VAD 回退] 开启 VAD 后未检出人声片段，自动切换为无 VAD 模式重试...")
+                collected, duration, detected_lang, lang_prob = _consume_transcribe_generator(
+                    model=model,
+                    audio_input=audio_input,
+                    opts=opts,
+                    beam_size=beam_size,
+                    initial_prompt=initial_prompt,
+                    use_vad=False,
+                    on_progress=on_progress,
+                    on_log=on_log,
+                    token=token,
+                )
+        except CancelledError:
+            raise
+        except Exception as vad_exc:
+            # Only fallback to vad_filter=False if the error is not a CUDA OOM/DLL error
+            err_lower = str(vad_exc).lower()
+            if device == "cuda" and any(k in err_lower for k in ("cublas", "cudnn", "cuda", "out of memory")):
+                raise
+            if on_log:
+                on_log(f"[VAD 回退] VAD 语音活动检测异常 ({vad_exc})，自动切换为无 VAD 模式继续转录...")
+            collected, duration, detected_lang, lang_prob = _consume_transcribe_generator(
+                model=model,
+                audio_input=audio_input,
+                opts=opts,
+                beam_size=beam_size,
+                initial_prompt=initial_prompt,
+                use_vad=False,
+                on_progress=on_progress,
+                on_log=on_log,
+                token=token,
+            )
+    else:
+        collected, duration, detected_lang, lang_prob = _consume_transcribe_generator(
+            model=model,
+            audio_input=audio_input,
+            opts=opts,
+            beam_size=beam_size,
+            initial_prompt=initial_prompt,
+            use_vad=False,
+            on_progress=on_progress,
+            on_log=on_log,
+            token=token,
         )
-
-    collected: List[Segment] = []
-    for raw_seg in segments_gen:
-        if token:
-            token.check()
-        start = float(raw_seg.start)
-        end = float(raw_seg.end)
-        text = str(raw_seg.text).strip()
-        if not text:
-            continue
-        if opts.to_simplified:
-            text = _convert_to_simplified(text)
-        collected.append(Segment(start=start, end=seg_end if (seg_end := end) else end, text=text))
-
-        if on_progress and duration > 0:
-            ratio = min(1.0, max(0.0, end / duration))
-            on_progress(ratio, f"[{end:.1f}s / {duration:.1f}s] {text[:36]}")
 
     meta = {
         "model": opts.model,
@@ -331,7 +590,8 @@ def transcribe(
                     on_log(f"[转录错误] {device}/{compute_type} 最终执行失败：{exc!r}")
                 break
 
+    err_type = type(last_exc).__name__ if last_exc else "Error"
     raise TranscribeError(
-        f"模型加载或语音转录失败：{last_exc}",
+        f"转录失败 ({err_type}): {last_exc}",
         detail=repr(last_exc),
     )

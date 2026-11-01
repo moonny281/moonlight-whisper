@@ -1,4 +1,4 @@
-"""Whisper CTranslate2 model management: strict verification, streaming HF mirror download, and manual import."""
+"""Whisper CTranslate2 model management: strict JSON/binary verification, streaming HF mirror download, and auto-repair."""
 
 from __future__ import annotations
 
@@ -54,9 +54,6 @@ REQUIRED_MODEL_FILES: Tuple[str, ...] = (
     "tokenizer.json",
 )
 
-# Minimum valid size for model.bin in real runtime (1 MB; unit tests can pass allow_small_bin=True)
-MIN_MODEL_BIN_BYTES = 1024 * 1024
-
 
 @dataclass
 class ModelStatus:
@@ -70,7 +67,12 @@ def _ensure_preprocessor_config(directory: Path, mel_bins: int) -> None:
     """Ensure `preprocessor_config.json` exists with the correct `feature_size` (80 or 128 mel bins)."""
     pp_path = directory / "preprocessor_config.json"
     if pp_path.exists() and pp_path.stat().st_size > 20:
-        return
+        try:
+            data = json.loads(pp_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("feature_size") == mel_bins:
+                return
+        except Exception:
+            pass
     default_pp = {
         "chunk_length": 30,
         "feature_extractor_type": "WhisperFeatureExtractor",
@@ -91,14 +93,29 @@ def _ensure_preprocessor_config(directory: Path, mel_bins: int) -> None:
         pass
 
 
+def _is_valid_json_file(path: Path, expect_dict: bool = True) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        if path.stat().st_size == 0:
+            return False
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if expect_dict:
+            return isinstance(parsed, dict)
+        return isinstance(parsed, (dict, list))
+    except Exception:
+        return False
+
+
 def verify_model_dir(directory: Path, min_bin_bytes: int = 4) -> Tuple[bool, List[str]]:
-    """Verify whether `directory` contains a complete CTranslate2 Whisper model.
+    """Verify whether `directory` contains a complete, uncorrupted CTranslate2 Whisper model.
 
     Requires ALL of:
-    1. `model.bin` (non-empty and >= `min_bin_bytes`, not a 130-byte Git LFS pointer)
+    1. `model.bin` (non-empty and >= `min_bin_bytes`, not a Git LFS pointer or HTML error page)
     2. `config.json` (valid JSON object)
-    3. `tokenizer.json` (required by faster-whisper Python Tokenizer)
-    4. `vocabulary.json` OR `vocabulary.txt` (required by CTranslate2 C++ Whisper model loader!)
+    3. `tokenizer.json` (valid JSON object required by faster-whisper Python Tokenizer)
+    4. `vocabulary.json` (valid JSON) OR `vocabulary.txt` (non-empty text, required by CTranslate2 C++)
     """
     if not directory.exists() or not directory.is_dir():
         return False, ["model.bin", "config.json", "tokenizer.json", "vocabulary.json/vocabulary.txt"]
@@ -109,32 +126,50 @@ def verify_model_dir(directory: Path, min_bin_bytes: int = 4) -> Tuple[bool, Lis
     if not model_bin.exists() or model_bin.stat().st_size < min_bin_bytes:
         missing.append("model.bin")
     else:
-        # Check that model.bin is not a tiny Git LFS text pointer ("version https://git-lfs.github.com/spec/v1")
-        if model_bin.stat().st_size < 1024:
-            try:
-                head = model_bin.read_bytes()[:64]
-                if head.startswith(b"version https://git-lfs") or head.startswith(b"<!DOCTYPE") or head.startswith(b"<html"):
-                    missing.append("model.bin (LFS pointer / invalid)")
-            except OSError:
-                missing.append("model.bin")
+        try:
+            with model_bin.open("rb") as f:
+                head = f.read(64)
+            if (
+                head.startswith(b"version https://git-lfs")
+                or head.startswith(b"<!DOCTYPE")
+                or head.startswith(b"<html")
+            ):
+                missing.append("model.bin (LFS pointer / invalid)")
+        except OSError:
+            missing.append("model.bin")
 
     cfg_file = directory / "config.json"
-    if not cfg_file.exists() or cfg_file.stat().st_size == 0:
+    if not _is_valid_json_file(cfg_file, expect_dict=True):
         missing.append("config.json")
 
     tok_file = directory / "tokenizer.json"
-    if not tok_file.exists() or tok_file.stat().st_size == 0:
+    if not _is_valid_json_file(tok_file, expect_dict=True):
         missing.append("tokenizer.json")
 
-    # CTranslate2 C++ strictly requires vocabulary.txt OR vocabulary.json (tokenizer.json alone is NOT enough!)
-    has_vocab = any(
-        (directory / name).exists() and (directory / name).stat().st_size > 0
-        for name in ("vocabulary.json", "vocabulary.txt")
-    )
-    if not has_vocab:
+    vocab_json = directory / "vocabulary.json"
+    vocab_txt = directory / "vocabulary.txt"
+    has_valid_vocab = False
+    if _is_valid_json_file(vocab_json, expect_dict=False):
+        has_valid_vocab = True
+    elif vocab_txt.exists() and vocab_txt.stat().st_size > 0:
+        try:
+            head_txt = vocab_txt.read_bytes()[:64]
+            if not head_txt.startswith(b"<!DOCTYPE") and not head_txt.startswith(b"<html"):
+                has_valid_vocab = True
+        except OSError:
+            pass
+
+    if not has_valid_vocab:
         missing.append("vocabulary.json / vocabulary.txt")
 
     return len(missing) == 0, missing
+
+
+def purge_corrupted_model(model_name: str, paths: AppPaths = PATHS) -> None:
+    """Remove corrupted or incomplete files for `model_name` so a clean download can succeed."""
+    model_dir = paths.models_dir / model_name
+    if model_dir.exists() and model_dir.is_dir():
+        shutil.rmtree(model_dir, ignore_errors=True)
 
 
 def _dir_size_mb(directory: Path) -> float:
@@ -175,7 +210,7 @@ def list_models(paths: AppPaths = PATHS) -> List[ModelStatus]:
 
 
 def _fetch_repo_file_list(repo_id: str, endpoint: str, proxy: str) -> List[Tuple[str, int]]:
-    """Fetch `(rfilename, size_bytes)` list from HuggingFace API (with complete CTranslate2 fallback list)."""
+    """Fetch `(rfilename, exact_size_bytes)` list from HuggingFace API (0 in fallback list)."""
     api_url = f"{endpoint.rstrip('/')}/api/models/{repo_id}"
     allowed_names = {
         "config.json",
@@ -200,11 +235,11 @@ def _fetch_repo_file_list(repo_id: str, endpoint: str, proxy: str) -> List[Tuple
         pass
 
     return [
-        ("config.json", 2048),
-        ("preprocessor_config.json", 2048),
-        ("tokenizer.json", 2 * 1024 * 1024),
-        ("vocabulary.json", 1024 * 1024),
-        ("vocabulary.txt", 512 * 1024),
+        ("config.json", 0),
+        ("preprocessor_config.json", 0),
+        ("tokenizer.json", 0),
+        ("vocabulary.json", 0),
+        ("vocabulary.txt", 0),
         ("model.bin", 0),
     ]
 
@@ -263,10 +298,11 @@ def download_model(
                         token.check()
                     dest_file = target_dir / rfile
 
-                    # If a corrupt/empty/LFS-pointer file exists from an aborted attempt, remove it before downloading
                     if dest_file.exists():
                         sz = dest_file.stat().st_size
                         if sz == 0 or (rfile == "model.bin" and sz < 1024 * 1024):
+                            dest_file.unlink(missing_ok=True)
+                        elif rfile.endswith(".json") and not _is_valid_json_file(dest_file, expect_dict=(rfile != "vocabulary.json")):
                             dest_file.unlink(missing_ok=True)
 
                     quoted_path = urllib.parse.quote(rfile, safe="/")
@@ -298,19 +334,23 @@ def download_model(
                         on_progress(ratio, msg)
 
                     try:
-                        http_client.stream_download_with_resume(
-                            url=file_url,
-                            dest_file=dest_file,
-                            proxy=proxy,
-                            expected_sha256="",
-                            on_chunk_progress=_on_chunk,
-                            token=token,
-                            timeout=60,
-                        )
+                        dl_kwargs = {
+                            "url": file_url,
+                            "dest_file": dest_file,
+                            "proxy": proxy,
+                            "expected_sha256": "",
+                            "on_chunk_progress": _on_chunk,
+                            "token": token,
+                            "timeout": 60,
+                        }
+                        # Pass expected_size only if the target function supports it
+                        import inspect
+                        if "expected_size" in inspect.signature(http_client.stream_download_with_resume).parameters:
+                            dl_kwargs["expected_size"] = declared_size
+                        http_client.stream_download_with_resume(**dl_kwargs)
                     except CancelledError:
                         raise
                     except Exception as file_exc:
-                        # Older models have vocabulary.txt (no vocabulary.json); v3/turbo have vocabulary.json (no vocabulary.txt)
                         if rfile in ("vocabulary.txt", "vocabulary.json", "preprocessor_config.json"):
                             continue
                         raise file_exc
@@ -318,7 +358,6 @@ def download_model(
                     actual_sz = dest_file.stat().st_size if dest_file.exists() else declared_size
                     completed_prior_bytes += actual_sz
 
-                # Ensure preprocessor_config.json is present with the right mel_bins (80 vs 128)
                 if spec:
                     _ensure_preprocessor_config(target_dir, spec.mel_bins)
 
@@ -359,7 +398,7 @@ def import_model_directory(
     ok, missing = verify_model_dir(source_dir)
     if not ok:
         raise ModelError(
-            f"所选文件夹不是完整的 CTranslate2 Whisper 模型目录（缺少 {', '.join(missing)}）。",
+            f"所选文件夹不是完整的 CTranslate2 Whisper 模型目录（缺少或损坏：{', '.join(missing)}）。",
             detail=str(source_dir),
         )
 

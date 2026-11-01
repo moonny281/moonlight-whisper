@@ -387,7 +387,7 @@ class TaskQueue(QObject):
                 item.stage_text = "已取消"
             else:
                 item.status = TaskStatus.FAILED
-                item.stage_text = f"失败: {err.user_message[:28]}"
+                item.stage_text = f"失败: {err.user_message[:64]}"
             item.error_info = err
             self.task_updated.emit(job_id)
 
