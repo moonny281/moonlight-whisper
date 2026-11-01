@@ -136,7 +136,7 @@ class PlaylistExpandWorker(QThread):
             if not src:
                 continue
             probe_job = Job(source=src)
-            if not probe_job.is_local_file and self.cfg.allow_playlist:
+            if not probe_job.is_local_file and self.cfg.allow_playlist and downloader.is_likely_playlist_url(src):
                 try:
                     logger.info("正在检查播放列表/多 P 视频：%s", src)
                     entries = downloader.extract_playlist_or_info(

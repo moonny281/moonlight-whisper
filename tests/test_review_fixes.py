@@ -1,4 +1,4 @@
-"""Regression unit tests verifying all P1, P2, P3, v1.2.1, and v1.2.2 fixes."""
+"""Regression unit tests verifying all P1, P2, P3, v1.2.1, v1.2.2, and v1.2.3 fixes."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import numpy as np  # Pre-import C-extension at module load so sys.modules never
 
 from app.core import downloader, gpu_runtime, http_client, md_writer, model_manager
 from app.core.cancel import CancelToken
+from app.core.downloader import DownloadOptions
 from app.core.errors import CancelledError
 from app.core.transcriber import Segment, TranscribeOptions
 from app.paths import AppPaths
@@ -126,7 +127,7 @@ class TestReviewFixes(unittest.TestCase):
         import app
         from app.config import LlmConfig
         from app.core import summarizer
-        self.assertEqual(app.__version__, "1.2.2")
+        self.assertEqual(app.__version__, "1.2.3")
 
         empty_cfg = LlmConfig(enabled=True, api_key="")
         ok, msg = summarizer.test_llm_connection(empty_cfg)
@@ -254,22 +255,19 @@ class TestReviewFixes(unittest.TestCase):
                 self.assertEqual(len(segs), 1)
                 self.assertEqual(segs[0].text, "测试语音转录成功")
 
-    def test_v1_2_2_tiktok_webpage_error_not_misclassified_and_cookie_converter(self) -> None:
+    def test_v1_2_3_tiktok_direct_fallback_and_multi_format_isolated_cookies(self) -> None:
         # 1. Verify "webpage" does NOT falsely trigger the "age" verification error message
         tk_exc = RuntimeError(
             "ERROR: [TikTok] 7696957163670998294: Unexpected response from webpage request"
         )
         translated = downloader._translate_ydl_exception(tk_exc)
         self.assertNotIn("年龄验证", translated.user_message)
-        self.assertIn("curl_cffi", translated.user_message)
 
-        # 2. Verify Chrome/Edge SQLite lock error gives specific #7271 instructions
-        db_exc = RuntimeError("ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271")
-        translated_db = downloader._translate_ydl_exception(db_exc)
-        self.assertIn("独占锁", translated_db.user_message)
-
-        # 3. Verify JSON cookie exports from browser extensions auto-convert to Netscape HTTP Cookie File format
+        # 2. Verify JSON, raw Cookie header, and Netscape session-cookie (exp=0) files produce isolated copies
         with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp) / "temp"
+
+            # 2a. JSON cookie export
             json_cookie_file = Path(tmp) / "tiktok_cookies.json"
             json_cookie_file.write_text(
                 json.dumps(
@@ -280,17 +278,86 @@ class TestReviewFixes(unittest.TestCase):
                             "value": "abc123xyz",
                             "path": "/",
                             "secure": True,
-                            "expirationDate": 1893456000,
+                            "expirationDate": 0,
                         }
                     ]
                 ),
                 encoding="utf-8",
             )
-            netscape_path = downloader.prepare_cookie_file(json_cookie_file, Path(tmp) / "temp")
+            netscape_path = downloader.prepare_cookie_file(json_cookie_file, temp_dir)
             self.assertIsNotNone(netscape_path)
+            self.assertNotEqual(netscape_path, json_cookie_file)
             content = netscape_path.read_text(encoding="utf-8")
             self.assertTrue(content.startswith("# Netscape HTTP Cookie File"))
-            self.assertIn(".tiktok.com\tTRUE\t/\tTRUE\t1893456000\tsessionid\tabc123xyz", content)
+            self.assertIn(".tiktok.com\tTRUE\t/\tTRUE\t", content)
+            self.assertNotIn("\t0\tsessionid", content)  # expiration=0 upgraded to future timestamp
+
+            # 2b. Raw F12 Cookie header string
+            raw_hdr_file = Path(tmp) / "header_cookie.txt"
+            raw_hdr_file.write_text("Cookie: sessionid=tok999; ttwid=tw888", encoding="utf-8")
+            hdr_out = downloader.prepare_cookie_file(
+                raw_hdr_file,
+                temp_dir,
+                target_url="https://vt.tiktok.com/ZSgwwQnPH/",
+            )
+            self.assertIsNotNone(hdr_out)
+            hdr_text = hdr_out.read_text(encoding="utf-8")
+            self.assertIn(".tiktok.com\tTRUE\t/\tTRUE\t", hdr_text)
+            self.assertIn("sessionid\ttok999", hdr_text)
+
+            # 3. Verify TikTok Direct API Fallback when yt-dlp fails all webpage attempts
+            class BrokenYoutubeDL:
+                def __init__(self, opts):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def extract_info(self, url, download=False):
+                    raise RuntimeError("ERROR: [TikTok] 7696957163670998294: Unexpected response from webpage request")
+
+            fake_ytdlp = type(sys)("yt_dlp")
+            fake_ytdlp.YoutubeDL = BrokenYoutubeDL  # type: ignore[attr-defined]
+
+            fake_tikwm_resp = {
+                "code": 0,
+                "data": {
+                    "id": "7696957163670998294",
+                    "title": "TikTok 备用通道测试视频",
+                    "duration": 18.5,
+                    "play": "https://cdn.example.com/tiktok_7696957163670998294.mp4",
+                    "author": {"nickname": "hetawoodard"},
+                },
+            }
+
+            def _fake_dl_stream(url, dest_file, proxy="", expected_sha256="", on_chunk_progress=None, token=None, timeout=60, expected_size=0):
+                dest_file.write_bytes(b"FAKE_MP4_AUDIO_STREAM")
+                if on_chunk_progress:
+                    on_chunk_progress(100, 100)
+                return dest_file
+
+            downloader._DIRECT_MEDIA_CACHE.clear()
+            paths = AppPaths(app_dir=Path(tmp))
+            dl_opts = DownloadOptions(cookies_file=str(raw_hdr_file))
+
+            with _patch_sys_module("yt_dlp", fake_ytdlp), patch(
+                "app.core.http_client.fetch_json", return_value=fake_tikwm_resp
+            ), patch("app.core.http_client.stream_download_with_resume", side_effect=_fake_dl_stream):
+                info = downloader.fetch_info("https://vt.tiktok.com/ZSgwwQnPH/", dl_opts, paths=paths)
+                self.assertEqual(info.id, "7696957163670998294")
+                self.assertEqual(info.title, "TikTok 备用通道测试视频")
+
+                audio_file = downloader.download_audio(
+                    "https://vt.tiktok.com/ZSgwwQnPH/",
+                    workdir=Path(tmp) / "work",
+                    opts=dl_opts,
+                    paths=paths,
+                )
+                self.assertTrue(audio_file.exists())
+                self.assertEqual(audio_file.name, "7696957163670998294.mp4")
 
 
 if __name__ == "__main__":

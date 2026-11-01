@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from app import __app_name__, __version__
 from app.config import Config
-from app.core import gpu_runtime, model_manager
+from app.core import downloader, gpu_runtime, model_manager
 from app.core.errors import ErrorInfo
 from app.core.gpu_runtime import GpuStatus
 from app.core.pipeline import Job
@@ -509,10 +509,18 @@ class MainWindow(QMainWindow):
     def _open_settings_dialog(self, initial_tab: int = 0) -> None:
         dlg = SettingsDialog(cfg=self.cfg, paths=self.paths, initial_tab=initial_tab, parent=self)
         if dlg.exec() == SettingsDialog.DialogCode.Accepted:
+            self.queue.cfg = self.cfg
             self._refresh_model_combo_labels()
             self._sync_controls_from_config()
             self._refresh_gpu_state(initial=False)
             apply_theme(QApplication.instance(), self.cfg.ui.theme, window=self)
+            from app.logger import get_logger
+            get_logger().info(
+                "已保存偏好设置 (代理=%s, Cookies文件=%s, 浏览器Cookies=%s)",
+                self.cfg.proxy or "自动检测系统代理/直连",
+                self.cfg.cookies_file or "未设置",
+                self.cfg.cookies_from_browser or "未启用",
+            )
 
     def _on_options_changed(self) -> None:
         if self._suppress_option_sync:
@@ -586,7 +594,7 @@ class MainWindow(QMainWindow):
 
         self.input_edit.clear()
 
-        if self.cfg.allow_playlist and any(not Job(source=l).is_local_file for l in lines):
+        if self.cfg.allow_playlist and any(not Job(source=l).is_local_file and downloader.is_likely_playlist_url(l) for l in lines):
             self.btn_start.setEnabled(False)
             self.btn_start.setText("正在解析播放列表...")
             worker = PlaylistExpandWorker(raw_inputs=lines, cfg=self.cfg, paths=self.paths, parent=self)
