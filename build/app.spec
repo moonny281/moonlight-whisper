@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller onedir spec file for Moonlight Whisper (with Qt plugin pruning & pure-Python version resource)."""
+"""PyInstaller onedir spec file for Moonlight Whisper (with Qt plugin pruning, curl_cffi TLS impersonation & pure-Python version resource)."""
 
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ block_cipher = None
 project_root = Path(SPECPATH).resolve().parent
 
 # Generate Windows file_version_info.txt in pure Python (UTF-8 without BOM)
-ver_str = os.environ.get("APP_VERSION", "1.2.1").strip() or "1.2.1"
+ver_str = os.environ.get("APP_VERSION", "1.2.2").strip() or "1.2.2"
 ver_parts = (ver_str.split(".") + ["0", "0", "0", "0"])[:4]
 ver_nums = tuple(int(x) if x.isdigit() else 0 for x in ver_parts)
 version_file = project_root / "build" / "file_version_info.txt"
@@ -53,6 +53,13 @@ datas = [
 binaries = []
 hiddenimports = [
     "yt_dlp",
+    "curl_cffi",
+    "cffi",
+    "_cffi_backend",
+    "certifi",
+    "brotli",
+    "websockets",
+    "mutagen",
     "faster_whisper",
     "ctranslate2",
     "av",
@@ -64,7 +71,18 @@ hiddenimports = [
     "socks",
 ]
 
-for pkg in ("faster_whisper", "ctranslate2", "av", "onnxruntime", "tokenizers", "huggingface_hub", "opencc", "yt_dlp"):
+for pkg in (
+    "faster_whisper",
+    "ctranslate2",
+    "av",
+    "onnxruntime",
+    "tokenizers",
+    "huggingface_hub",
+    "opencc",
+    "yt_dlp",
+    "curl_cffi",
+    "certifi",
+):
     try:
         pkg_datas, pkg_bins, pkg_hidden = collect_all(pkg)
         datas.extend(pkg_datas)

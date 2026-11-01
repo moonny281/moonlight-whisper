@@ -7,6 +7,12 @@ onnxruntime>=1.17.0,<2.0.0
 huggingface_hub>=0.23.0,<1.0.0
 tokenizers>=0.19.0,<1.0.0
 yt-dlp>=2025.1.15
+# TikTok / Instagram 等站点要求 TLS/JA3 浏览器指纹伪装 (impersonation)，锁定 <=0.16.0 规避 yt-dlp#17604/#17942
+curl_cffi>=0.7.0,<=0.16.0
+certifi>=2023.5.7
+brotli>=1.1.0
+websockets>=12.0
+mutagen>=1.47.0
 PySide6-Essentials>=6.6.0
 opencc-python-reimplemented>=0.1.7
 requests>=2.31.0

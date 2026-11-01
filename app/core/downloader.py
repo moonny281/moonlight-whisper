@@ -1,8 +1,10 @@
-"""yt-dlp wrapper for metadata extraction, playlist expansion, audio download, and self-updating."""
+"""yt-dlp wrapper with TLS impersonation fallback, smart Cookie format conversion (Netscape/JSON), browser DB lock fallback, and self-updating."""
 
 from __future__ import annotations
 
+import copy
 import importlib
+import json
 import re
 import shutil
 import sys
@@ -22,6 +24,24 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 
 _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+_AGE_OR_AUTH_PATTERNS = (
+    "sign in to confirm",
+    "sign in to view",
+    "please log in",
+    "login required",
+    "authentication required",
+    "age-restricted",
+    "age restricted",
+    "confirm your age",
+    "age verification",
+    "inappropriate for some users",
+    "members-only",
+    "members only",
+    "private video",
+    "this video is private",
+    "need to log in",
+)
 
 
 @dataclass
@@ -89,6 +109,103 @@ class _YtDlpLogger:
             self._on_log(f"[yt-dlp 错误] {msg}")
 
 
+def prepare_cookie_file(
+    cookie_path: Path,
+    temp_dir: Path,
+    on_log: Optional[LogCallback] = None,
+) -> Optional[Path]:
+    """Validate and normalize a user-supplied Cookies file into Netscape HTTP Cookie File format.
+
+    Supports:
+    1. Standard Netscape `cookies.txt` (with or without `# Netscape HTTP Cookie File` header)
+    2. JSON array exported by browser extensions like *Cookie-Editor* or *EditThisCookie*
+    """
+    if not cookie_path.exists() or not cookie_path.is_file():
+        if on_log:
+            on_log(f"[Cookies 警告] 指定的 Cookies 文件不存在：{cookie_path}")
+        return None
+
+    try:
+        raw_text = cookie_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+    except OSError as exc:
+        if on_log:
+            on_log(f"[Cookies 警告] 无法读取 Cookies 文件 ({cookie_path})：{exc}")
+        return None
+
+    if not raw_text:
+        if on_log:
+            on_log(f"[Cookies 警告] Cookies 文件为空：{cookie_path}")
+        return None
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    normalized_out = temp_dir / "normalized_cookies.txt"
+
+    # Case 1: JSON Cookie export from Cookie-Editor / EditThisCookie
+    if raw_text.startswith("[") or raw_text.startswith("{"):
+        try:
+            parsed = json.loads(raw_text)
+            items = parsed if isinstance(parsed, list) else (parsed.get("cookies") or [])
+            if isinstance(items, list) and items:
+                lines = ["# Netscape HTTP Cookie File", "# Auto-converted from JSON by Moonlight Whisper", ""]
+                valid_count = 0
+                for c in items:
+                    if not isinstance(c, dict):
+                        continue
+                    domain = str(c.get("domain") or "").strip()
+                    name = str(c.get("name") or "").strip()
+                    value = str(c.get("value") or "").strip()
+                    if not domain or not name:
+                        continue
+                    include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+                    path_str = str(c.get("path") or "/").strip() or "/"
+                    secure_str = "TRUE" if c.get("secure") else "FALSE"
+                    exp_raw = c.get("expirationDate") or c.get("expires") or c.get("expiry") or 0
+                    try:
+                        exp_int = max(0, int(float(exp_raw)))
+                    except (ValueError, TypeError):
+                        exp_int = 0
+                    lines.append(f"{domain}\t{include_sub}\t{path_str}\t{secure_str}\t{exp_int}\t{name}\t{value}")
+                    valid_count += 1
+
+                if valid_count > 0:
+                    normalized_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    if on_log:
+                        on_log(f"[Cookies] 已自动将 JSON 格式 Cookies 转换为 Netscape 格式（共 {valid_count} 条记录）")
+                    return normalized_out
+        except Exception as exc:
+            if on_log:
+                on_log(f"[Cookies 警告] 解析 JSON 格式 Cookies 失败：{exc}")
+            return None
+
+    # Case 2: Netscape tab-separated format
+    raw_lines = raw_text.splitlines()
+    cookie_rows = [
+        ln for ln in raw_lines
+        if ln.strip() and (not ln.lstrip().startswith("#") or ln.lstrip().startswith("#HttpOnly_"))
+        and len(ln.split("\t")) >= 7
+    ]
+    if cookie_rows:
+        has_magic_header = any(
+            ln.startswith("# Netscape HTTP Cookie File") or ln.startswith("# HTTP Cookie File")
+            for ln in raw_lines[:3]
+        )
+        if not has_magic_header:
+            normalized_out.write_text("# Netscape HTTP Cookie File\n" + raw_text + "\n", encoding="utf-8")
+            if on_log:
+                on_log(f"[Cookies] 已加载并补全 Netscape 头部：{cookie_path.name}（共 {len(cookie_rows)} 条记录）")
+            return normalized_out
+
+        if on_log:
+            on_log(f"[Cookies] 已加载 Cookies 文件：{cookie_path.name}（共 {len(cookie_rows)} 条记录）")
+        return cookie_path
+
+    if on_log:
+        on_log(
+            f"[Cookies 警告] 文件 {cookie_path.name} 不是有效的 Netscape 7 列制表符格式或 JSON 格式，建议使用 Get cookies.txt LOCALLY 插件重新导出。"
+        )
+    return cookie_path
+
+
 def _build_common_ydl_opts(
     opts: DownloadOptions,
     on_log: Optional[LogCallback] = None,
@@ -115,36 +232,133 @@ def _build_common_ydl_opts(
     if opts.proxy.strip():
         ydl_opts["proxy"] = opts.proxy.strip()
 
+    loaded_cookiefile = False
     if opts.cookies_file.strip():
         cookie_path = Path(opts.cookies_file.strip()).expanduser()
-        if cookie_path.exists():
-            ydl_opts["cookiefile"] = str(cookie_path)
+        prepared = prepare_cookie_file(cookie_path, paths.temp_dir, on_log=on_log)
+        if prepared is not None and prepared.exists():
+            ydl_opts["cookiefile"] = str(prepared)
+            loaded_cookiefile = True
 
-    if opts.cookies_from_browser.strip():
+    # Only use `cookiesfrombrowser` when a valid `cookiefile` is not already active,
+    # preventing running Edge/Chrome SQLite exclusive locks (#7271) from aborting downloads when cookies.txt is provided.
+    if opts.cookies_from_browser.strip() and not loaded_cookiefile:
         browser_name = opts.cookies_from_browser.strip().lower()
         ydl_opts["cookiesfrombrowser"] = (browser_name,)
 
     return ydl_opts
 
 
+def _is_tiktok_url(url: str) -> bool:
+    u = url.lower()
+    return "tiktok.com" in u
+
+
+def _run_ydl_extract_with_fallbacks(
+    yt_dlp: Any,
+    ydl_opts: Dict[str, Any],
+    url: str,
+    download: bool,
+    on_log: Optional[LogCallback] = None,
+) -> Tuple[Any, Optional[Any]]:
+    """Run `ydl.extract_info(url, download=download)` with automatic fallbacks for:
+    1. Windows Edge/Chrome SQLite cookie database exclusive lock (`Could not copy Chrome cookie database`)
+    2. TikTok anti-bot webpage challenge (`Unexpected response from webpage request`)
+    Returns `(info, ydl_instance)`.
+    """
+    current_opts = copy.copy(ydl_opts)
+
+    try:
+        with yt_dlp.YoutubeDL(current_opts) as ydl:
+            return ydl.extract_info(url, download=download), ydl
+    except CancelledError:
+        raise
+    except Exception as first_exc:
+        err_str = str(first_exc)
+        err_lower = err_str.lower()
+
+        # Fallback 1: Running Edge/Chrome on Windows locks the Cookie database (yt-dlp#7271)
+        if "could not copy" in err_lower and "cookie database" in err_lower and "cookiesfrombrowser" in current_opts:
+            if on_log:
+                on_log(
+                    "[Cookies 回退] Windows 下 Edge/Chrome 运行期间独占锁定了 Cookie 数据库 (#7271)，"
+                    "正在自动切换为免浏览器数据库模式重试..."
+                )
+            current_opts.pop("cookiesfrombrowser", None)
+            try:
+                with yt_dlp.YoutubeDL(current_opts) as ydl:
+                    return ydl.extract_info(url, download=download), ydl
+            except CancelledError:
+                raise
+            except Exception as retry_exc:
+                first_exc = retry_exc
+                err_str = str(first_exc)
+                err_lower = err_str.lower()
+
+        # Fallback 2: TikTok webpage anti-bot challenge (`Unexpected response from webpage request`)
+        if _is_tiktok_url(url) and (
+            "unexpected response from webpage request" in err_lower
+            or "unable to extract webpage video data" in err_lower
+            or "impersonate" in err_lower
+        ):
+            fallback_uas = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "abc",  # yt-dlp#15629 maintainer workaround to skip TikTok JS challenge page
+            ]
+            for idx, ua in enumerate(fallback_uas, start=1):
+                if on_log:
+                    on_log(f"[TikTok 兼容重试 {idx}/{len(fallback_uas)}] 检测到网页反爬响应，尝试备用请求头策略...")
+                retry_opts = copy.copy(current_opts)
+                headers = dict(retry_opts.get("http_headers") or {})
+                headers["User-Agent"] = ua
+                retry_opts["http_headers"] = headers
+                try:
+                    with yt_dlp.YoutubeDL(retry_opts) as ydl:
+                        return ydl.extract_info(url, download=download), ydl
+                except CancelledError:
+                    raise
+                except Exception as tk_exc:
+                    first_exc = tk_exc
+
+        raise first_exc
+
+
 def _translate_ydl_exception(exc: BaseException) -> DownloadError:
     text = str(exc)
     lower = text.lower()
-    if "sign in" in lower or "login" in lower or "cookies" in lower or "age" in lower or "members-only" in lower:
+
+    if "could not copy" in lower and "cookie database" in lower:
         return DownloadError(
-            "该视频需要登录或年龄验证，请在「设置」中导入 Cookies 或选择从浏览器读取 Cookies。",
+            "无法直接读取正在运行的 Edge/Chrome 浏览器 Cookies（Windows 系统文件独占锁限制）。"
+            "请完全关闭浏览器（含后台驻留进程）后重试，或使用浏览器插件（如 Get cookies.txt LOCALLY）导出 cookies.txt 文件并在设置中导入。",
             detail=text,
         )
+
+    if "unexpected response from webpage request" in lower or "impersonate target is available" in lower:
+        return DownloadError(
+            "目标站点（如 TikTok / Instagram）触发了 TLS 指纹或网页反爬拦截。"
+            "请确认已使用包含 curl_cffi 指纹伪装组件的最新构建版本（v1.2.2+），并在设置中配置可用代理或导入 Netscape 格式 cookies.txt。",
+            detail=text,
+        )
+
+    if any(pat in lower for pat in _AGE_OR_AUTH_PATTERNS):
+        return DownloadError(
+            "该视频需要登录或年龄验证，请在「偏好设置 -> 网络与认证」中导入有效的 cookies.txt 文件（或先关闭浏览器再启用浏览器读取）。",
+            detail=text,
+        )
+
     if "timed out" in lower or "proxy" in lower or "connection" in lower or "ssl" in lower:
         return DownloadError(
             "网络连接超时或代理错误，请检查网络与代理设置后重试。",
             detail=text,
         )
-    if "unsupported url" in lower or "no suitable InfoExtractor" in text:
+
+    if "unsupported url" in lower or "no suitable infoextractor" in lower:
         return DownloadError(
-            "不支持该链接或站点规则已变更，请检查链接或在设置中点击「更新 yt-dlp」。",
+            "不支持该链接或站点规则已变更，请检查链接或在底部点击「更新 yt-dlp」。",
             detail=text,
         )
+
     return DownloadError(f"视频解析或下载失败：{text}", detail=text)
 
 
@@ -171,7 +385,6 @@ def normalize_entry_url(
     else:
         resolved = fallback_url
 
-    # Handle Bilibili multi-part (?p=N) videos when flat entry shares base URL
     if playlist_index is not None and "bilibili.com/video/" in resolved:
         parsed = urllib.parse.urlparse(resolved)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -243,8 +456,13 @@ def extract_playlist_or_info(
     ydl_opts["extract_flat"] = "in_playlist" if opts.allow_playlist else False
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info, _ = _run_ydl_extract_with_fallbacks(
+            yt_dlp=yt_dlp,
+            ydl_opts=ydl_opts,
+            url=url,
+            download=False,
+            on_log=on_log,
+        )
     except CancelledError:
         raise
     except Exception as exc:
@@ -324,12 +542,17 @@ def download_audio(
     ydl_opts["progress_hooks"] = [_progress_hook]
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not downloaded_files and info:
-                prepared = Path(ydl.prepare_filename(info)).resolve()
-                if prepared.exists():
-                    downloaded_files.append(prepared)
+        info, ydl = _run_ydl_extract_with_fallbacks(
+            yt_dlp=yt_dlp,
+            ydl_opts=ydl_opts,
+            url=url,
+            download=True,
+            on_log=on_log,
+        )
+        if not downloaded_files and info and ydl is not None:
+            prepared = Path(ydl.prepare_filename(info)).resolve()
+            if prepared.exists():
+                downloaded_files.append(prepared)
     except CancelledError:
         raise
     except Exception as exc:

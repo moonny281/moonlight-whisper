@@ -1,8 +1,9 @@
-"""Regression unit tests verifying all P1, P2, P3, and v1.2.1 fixes."""
+"""Regression unit tests verifying all P1, P2, P3, v1.2.1, and v1.2.2 fixes."""
 
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import struct
 import sys
@@ -125,7 +126,7 @@ class TestReviewFixes(unittest.TestCase):
         import app
         from app.config import LlmConfig
         from app.core import summarizer
-        self.assertEqual(app.__version__, "1.2.1")
+        self.assertEqual(app.__version__, "1.2.2")
 
         empty_cfg = LlmConfig(enabled=True, api_key="")
         ok, msg = summarizer.test_llm_connection(empty_cfg)
@@ -186,7 +187,6 @@ class TestReviewFixes(unittest.TestCase):
     def test_v1_2_1_pyav19_metadata_errors_compat_and_pure_python_wav_loader(self) -> None:
         from app.core import transcriber
 
-        # 1. Verify _patch_runtime_compat strips `metadata_errors` when PyAV 18/19 av.open lacks it
         fake_av = type(sys)("av")
         called_kwargs = []
 
@@ -201,7 +201,6 @@ class TestReviewFixes(unittest.TestCase):
             self.assertEqual(res, "CONTAINER_OK")
             self.assertEqual(called_kwargs, [("test.wav", "r")])
 
-        # 2. Verify load_wav_as_float32_array decodes 16kHz 16-bit mono WAV directly into float32 ndarray
         with tempfile.TemporaryDirectory() as tmp:
             wav_file = Path(tmp) / "中文音频_16k.wav"
             with wave.open(str(wav_file), "wb") as wf:
@@ -216,7 +215,6 @@ class TestReviewFixes(unittest.TestCase):
             self.assertEqual(arr.shape, (1600,))
             self.assertEqual(str(arr.dtype), "float32")
 
-            # 3. Verify automatic VAD fallback when VAD raises an onnxruntime error
             model_dir = Path(tmp) / "models" / "small"
             model_dir.mkdir(parents=True)
             (model_dir / "model.bin").write_bytes(b"VALID_BIN_WEIGHTS")
@@ -255,6 +253,44 @@ class TestReviewFixes(unittest.TestCase):
                 self.assertEqual(vad_calls, [True, False])
                 self.assertEqual(len(segs), 1)
                 self.assertEqual(segs[0].text, "测试语音转录成功")
+
+    def test_v1_2_2_tiktok_webpage_error_not_misclassified_and_cookie_converter(self) -> None:
+        # 1. Verify "webpage" does NOT falsely trigger the "age" verification error message
+        tk_exc = RuntimeError(
+            "ERROR: [TikTok] 7696957163670998294: Unexpected response from webpage request"
+        )
+        translated = downloader._translate_ydl_exception(tk_exc)
+        self.assertNotIn("年龄验证", translated.user_message)
+        self.assertIn("curl_cffi", translated.user_message)
+
+        # 2. Verify Chrome/Edge SQLite lock error gives specific #7271 instructions
+        db_exc = RuntimeError("ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271")
+        translated_db = downloader._translate_ydl_exception(db_exc)
+        self.assertIn("独占锁", translated_db.user_message)
+
+        # 3. Verify JSON cookie exports from browser extensions auto-convert to Netscape HTTP Cookie File format
+        with tempfile.TemporaryDirectory() as tmp:
+            json_cookie_file = Path(tmp) / "tiktok_cookies.json"
+            json_cookie_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "domain": ".tiktok.com",
+                            "name": "sessionid",
+                            "value": "abc123xyz",
+                            "path": "/",
+                            "secure": True,
+                            "expirationDate": 1893456000,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            netscape_path = downloader.prepare_cookie_file(json_cookie_file, Path(tmp) / "temp")
+            self.assertIsNotNone(netscape_path)
+            content = netscape_path.read_text(encoding="utf-8")
+            self.assertTrue(content.startswith("# Netscape HTTP Cookie File"))
+            self.assertIn(".tiktok.com\tTRUE\t/\tTRUE\t1893456000\tsessionid\tabc123xyz", content)
 
 
 if __name__ == "__main__":
