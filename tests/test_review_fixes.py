@@ -164,10 +164,14 @@ class TestReviewFixes(unittest.TestCase):
                 )
                 self.assertEqual(len(recorded_args), 1)
                 passed_arg, cwd_during_init, kw = recorded_args[0]
-                self.assertEqual(passed_arg, ".")
+                # On Windows with 8.3 short names enabled, passed_arg is the ASCII 8.3 path (e.g. ...\_8BE8~1\LARGE-~1);
+                # when 8.3 short names are unavailable (or on non-Windows), passed_arg is "." with cwd == incomplete_dir.
                 self.assertTrue(passed_arg.isascii())
-                self.assertEqual(Path(cwd_during_init).resolve(), incomplete_dir.resolve())
                 self.assertTrue(kw.get("local_files_only"))
+                if passed_arg == ".":
+                    self.assertEqual(Path(cwd_during_init).resolve(), incomplete_dir.resolve())
+                else:
+                    self.assertTrue(Path(passed_arg).exists())
 
 
 if __name__ == "__main__":
