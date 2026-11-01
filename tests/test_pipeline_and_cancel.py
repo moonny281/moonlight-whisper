@@ -50,8 +50,9 @@ class TestPipelineAndCancel(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("model.bin", missing)
 
-            (m_dir / "model.bin").write_bytes(b"MODEL")
+            (m_dir / "model.bin").write_bytes(b"MODEL_BINARY_DATA")
             (m_dir / "config.json").write_text("{}", encoding="utf-8")
+            (m_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
             (m_dir / "vocabulary.txt").write_text("a\nb\n", encoding="utf-8")
             ok2, missing2 = model_manager.verify_model_dir(m_dir)
             self.assertTrue(ok2)
@@ -65,9 +66,10 @@ class TestPipelineAndCancel(unittest.TestCase):
             # Pre-create valid model dir so download_model is skipped
             model_dir = paths.models_dir / "small"
             model_dir.mkdir(parents=True)
-            (model_dir / "model.bin").write_bytes(b"MODEL")
+            (model_dir / "model.bin").write_bytes(b"MODEL_BINARY_DATA")
             (model_dir / "config.json").write_text("{}", encoding="utf-8")
             (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (model_dir / "vocabulary.json").write_text("{}", encoding="utf-8")
 
             fake_info = MediaInfo(
                 url="https://example.com/watch?v=123",

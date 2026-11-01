@@ -1,17 +1,16 @@
-"""Settings dialog covering network/proxy, cookies, directories with file migration, LLM summary, and yt-dlp update."""
+"""Windows 11 Mica-styled Settings Dialog (using non-overlapping Mica section cards)."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -24,15 +23,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import Config
-from app.core import downloader
+from app.config import Config, LlmConfig
+from app.core import downloader, summarizer
 from app.core.errors import ErrorInfo
 from app.paths import PATHS, AppPaths
+from app.ui.theme import apply_win11_mica_window_attributes, resolve_effective_theme
+from app.ui.widgets import make_mica_section
 from app.workers import YtDlpUpdateWorker
 
 
 class SettingsDialog(QDialog):
-    """Comprehensive settings dialog implementing §6.3 + playlist & OpenAI summary hooks."""
+    """Comprehensive Mica-styled settings dialog with zero title/row overlap."""
 
     def __init__(
         self,
@@ -46,21 +47,27 @@ class SettingsDialog(QDialog):
         self.paths = paths
         self._ytdlp_worker: Optional[YtDlpUpdateWorker] = None
 
-        self.setWindowTitle("设置 - Moonlight Whisper")
-        self.setMinimumSize(660, 540)
+        self.setWindowTitle("偏好设置 - Moonlight Whisper")
+        self.setMinimumSize(680, 560)
         self._build_ui()
         self._load_from_config()
         if 0 <= initial_tab < self.tabs.count():
             self.tabs.setCurrentIndex(initial_tab)
 
+        eff = resolve_effective_theme(self.cfg.ui.theme)
+        apply_win11_mica_window_attributes(self, is_dark=(eff == "dark"))
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
 
         self.tabs.addTab(self._build_network_tab(), "网络与认证")
-        self.tabs.addTab(self._build_transcribe_tab(), "转录与参数")
-        self.tabs.addTab(self._build_llm_tab(), "LLM 自动摘要")
+        self.tabs.addTab(self._build_transcribe_tab(), "转录与外观")
+        self.tabs.addTab(self._build_llm_tab(), "AI 自动摘要")
         self.tabs.addTab(self._build_storage_tab(), "存储目录")
 
         btn_row = QHBoxLayout()
@@ -74,14 +81,24 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(self.btn_cancel)
         root.addLayout(btn_row)
 
+    @staticmethod
+    def _configure_form(form: QFormLayout) -> None:
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+
     def _build_network_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
 
-        proxy_group = QGroupBox("代理与镜像设置")
-        proxy_form = QFormLayout(proxy_group)
+        proxy_card, proxy_box = make_mica_section("代理与国内镜像源", "支持 HTTP / HTTPS / SOCKS5 代理及国内高速镜像")
+        proxy_form = QFormLayout()
+        self._configure_form(proxy_form)
+
         self.edit_proxy = QLineEdit()
-        self.edit_proxy.setPlaceholderText("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（留空则直连）")
+        self.edit_proxy.setPlaceholderText("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（留空直连）")
         proxy_form.addRow("代理地址：", self.edit_proxy)
 
         self.chk_hf_mirror = QCheckBox("启用 HuggingFace 国内镜像 (https://hf-mirror.com)")
@@ -92,10 +109,12 @@ class SettingsDialog(QDialog):
         self.combo_pypi.addItem("阿里云开源镜像 (aliyun)", "aliyun")
         self.combo_pypi.addItem("PyPI 官方源 (official)", "official")
         proxy_form.addRow("PyPI 镜像源：", self.combo_pypi)
-        layout.addWidget(proxy_group)
+        proxy_box.addLayout(proxy_form)
+        layout.addWidget(proxy_card)
 
-        cookie_group = QGroupBox("站点登录与 Cookies（用于需要登录/年龄验证的视频）")
-        cookie_form = QFormLayout(cookie_group)
+        cookie_card, cookie_box = make_mica_section("站点登录与 Cookies", "用于需要登录、会员或年龄验证的在线视频")
+        cookie_form = QFormLayout()
+        self._configure_form(cookie_form)
 
         cookie_file_row = QHBoxLayout()
         self.edit_cookies_file = QLineEdit()
@@ -112,17 +131,19 @@ class SettingsDialog(QDialog):
         self.combo_browser_cookies.addItem("Edge", "edge")
         self.combo_browser_cookies.addItem("Firefox", "firefox")
         cookie_form.addRow("从浏览器读取：", self.combo_browser_cookies)
-        layout.addWidget(cookie_group)
+        cookie_box.addLayout(cookie_form)
+        layout.addWidget(cookie_card)
 
-        ytdlp_group = QGroupBox("yt-dlp 下载组件维护")
-        ytdlp_row = QHBoxLayout(ytdlp_group)
+        ytdlp_card, ytdlp_box = make_mica_section("yt-dlp 下载引擎维护")
+        ytdlp_row = QHBoxLayout()
         self.lbl_ytdlp_ver = QLabel(f"当前版本：{downloader.get_yt_dlp_version(self.paths)}")
-        self.btn_update_ytdlp = QPushButton("一键更新 yt-dlp")
+        self.btn_update_ytdlp = QPushButton("一键热更新 yt-dlp")
         self.btn_update_ytdlp.clicked.connect(self._start_update_ytdlp)
         ytdlp_row.addWidget(self.lbl_ytdlp_ver)
         ytdlp_row.addStretch(1)
         ytdlp_row.addWidget(self.btn_update_ytdlp)
-        layout.addWidget(ytdlp_group)
+        ytdlp_box.addLayout(ytdlp_row)
+        layout.addWidget(ytdlp_card)
 
         layout.addStretch(1)
         return page
@@ -130,14 +151,17 @@ class SettingsDialog(QDialog):
     def _build_transcribe_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
 
-        tr_group = QGroupBox("转录与输出规则")
-        tr_form = QFormLayout(tr_group)
+        tr_card, tr_box = make_mica_section("转录参数与外观主题")
+        tr_form = QFormLayout()
+        self._configure_form(tr_form)
 
-        self.chk_allow_playlist = QCheckBox("允许解析播放列表 / 多 P 视频（自动展开加入队列）")
+        self.chk_allow_playlist = QCheckBox("允许解析播放列表 / 多 P 视频（自动展开加入任务队列）")
         tr_form.addRow("播放列表：", self.chk_allow_playlist)
 
-        self.chk_vad = QCheckBox("开启 VAD 静音过滤（减少静音段幻觉与重复）")
+        self.chk_vad = QCheckBox("开启 VAD 静音过滤（有效减少静音段幻觉与重复循环）")
         tr_form.addRow("静音过滤：", self.chk_vad)
 
         self.spin_vad_ms = QSpinBox()
@@ -156,9 +180,9 @@ class SettingsDialog(QDialog):
         tr_form.addRow("文件名模板：", self.edit_filename_tpl)
 
         self.combo_theme = QComboBox()
-        self.combo_theme.addItem("跟随系统 (system)", "system")
-        self.combo_theme.addItem("深色模式 (dark)", "dark")
-        self.combo_theme.addItem("浅色模式 (light)", "light")
+        self.combo_theme.addItem("跟随系统 (System Mica)", "system")
+        self.combo_theme.addItem("深色云母 (Dark Mica)", "dark")
+        self.combo_theme.addItem("浅色云母 (Light Mica)", "light")
         tr_form.addRow("界面主题：", self.combo_theme)
 
         self.combo_log_level = QComboBox()
@@ -166,22 +190,29 @@ class SettingsDialog(QDialog):
             self.combo_log_level.addItem(lv, lv)
         tr_form.addRow("日志级别：", self.combo_log_level)
 
-        layout.addWidget(tr_group)
+        tr_box.addLayout(tr_form)
+        layout.addWidget(tr_card)
         layout.addStretch(1)
         return page
 
     def _build_llm_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
 
-        llm_group = QGroupBox("OpenAI 兼容接口（自动生成 Markdown 摘要）")
-        llm_form = QFormLayout(llm_group)
+        llm_card, llm_box = make_mica_section(
+            "OpenAI 兼容接口（自动生成 Markdown 摘要）",
+            "支持 OpenAI、DeepSeek、通义千问、Moonshot 或本地 Ollama 端点；若未启用则保留 `> （待填写）` 占位。",
+        )
+        llm_form = QFormLayout()
+        self._configure_form(llm_form)
 
         self.chk_llm_enabled = QCheckBox("转录完成后自动调用 LLM 生成「## 摘要」章节")
         llm_form.addRow("启用摘要：", self.chk_llm_enabled)
 
         self.edit_llm_base_url = QLineEdit()
-        self.edit_llm_base_url.setPlaceholderText("https://api.openai.com/v1 或 DeepSeek / 本地 Ollama 地址")
+        self.edit_llm_base_url.setPlaceholderText("https://api.openai.com/v1 或 https://api.deepseek.com/v1")
         llm_form.addRow("API Base URL：", self.edit_llm_base_url)
 
         self.edit_llm_api_key = QLineEdit()
@@ -194,46 +225,53 @@ class SettingsDialog(QDialog):
         llm_form.addRow("模型名称：", self.edit_llm_model)
 
         self.edit_llm_prompt = QPlainTextEdit()
-        self.edit_llm_prompt.setMaximumHeight(110)
+        self.edit_llm_prompt.setMinimumHeight(90)
+        self.edit_llm_prompt.setMaximumHeight(120)
         llm_form.addRow("系统提示词：", self.edit_llm_prompt)
 
         test_row = QHBoxLayout()
         self.btn_test_llm = QPushButton("测试 API 连接")
         self.btn_test_llm.clicked.connect(self._test_llm_api)
-        self.lbl_llm_test_result = QLabel("可点击左侧按钮验证 Base URL 与 API Key 是否可用")
+        self.lbl_llm_test_result = QLabel("点击左侧按钮可验证接口与 Key 是否可用")
         self.lbl_llm_test_result.setObjectName("MutedLabel")
         test_row.addWidget(self.btn_test_llm)
         test_row.addWidget(self.lbl_llm_test_result, 1)
         llm_form.addRow("连通性测试：", test_row)
 
-        layout.addWidget(llm_group)
-        hint = QLabel("说明：若未启用或接口调用失败，文档中的「## 摘要」将自动保留 `> （待填写）` 占位，不影响转录正文。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        llm_box.addLayout(llm_form)
+        layout.addWidget(llm_card)
         layout.addStretch(1)
         return page
 
     def _build_storage_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
 
-        dir_group = QGroupBox("自定义存储目录（留空则使用默认同目录/回退策略）")
-        dir_form = QFormLayout(dir_group)
+        dir_card, dir_box = make_mica_section(
+            "自定义存储目录",
+            "留空则默认跟随安装目录（若安装目录无写权限则自动回退至 %LOCALAPPDATA%\\MoonlightWhisper）。",
+        )
+        dir_form = QFormLayout()
+        self._configure_form(dir_form)
 
         self.edit_data_dir = self._make_dir_picker_row(dir_form, "数据根目录：")
         self.edit_gpu_dir = self._make_dir_picker_row(dir_form, "GPU 运行库目录：")
         self.edit_models_dir = self._make_dir_picker_row(dir_form, "Whisper 模型目录：")
         self.edit_temp_dir = self._make_dir_picker_row(dir_form, "临时缓存目录：")
+        dir_box.addLayout(dir_form)
+        layout.addWidget(dir_card)
 
-        layout.addWidget(dir_group)
-
-        resolved_group = QGroupBox("当前实际生效路径")
-        res_form = QFormLayout(resolved_group)
-        res_form.addRow("数据目录：", QLabel(str(self.paths.data_root)))
+        res_card, res_box = make_mica_section("当前实际生效路径")
+        res_form = QFormLayout()
+        self._configure_form(res_form)
+        res_form.addRow("数据根目录：", QLabel(str(self.paths.data_root)))
         res_form.addRow("GPU 运行库：", QLabel(str(self.paths.gpu_runtime_dir)))
         res_form.addRow("模型缓存：", QLabel(str(self.paths.models_dir)))
         res_form.addRow("输出目录：", QLabel(str(self.paths.output_dir)))
-        layout.addWidget(resolved_group)
+        res_box.addLayout(res_form)
+        layout.addWidget(res_card)
 
         layout.addStretch(1)
         return page
@@ -329,8 +367,6 @@ class SettingsDialog(QDialog):
         QMessageBox.warning(self, "更新失败", f"{err.user_message}\n\n{err.detail}")
 
     def _test_llm_api(self) -> None:
-        from app.config import LlmConfig
-        from app.core import summarizer
         temp_llm = LlmConfig(
             enabled=True,
             base_url=self.edit_llm_base_url.text().strip() or "https://api.openai.com/v1",
@@ -341,9 +377,7 @@ class SettingsDialog(QDialog):
         )
         self.btn_test_llm.setEnabled(False)
         self.lbl_llm_test_result.setText("正在请求接口...")
-        QApplication_process = getattr(__import__("PySide6.QtWidgets", fromlist=["QApplication"]).QApplication, "processEvents", None)
-        if callable(QApplication_process):
-            QApplication_process()
+        QApplication.processEvents()
         ok, msg = summarizer.test_llm_connection(temp_llm, proxy=self.edit_proxy.text().strip())
         self.btn_test_llm.setEnabled(True)
         self.lbl_llm_test_result.setText(msg)
@@ -387,7 +421,6 @@ class SettingsDialog(QDialog):
         new_gpu_dir = self.paths.gpu_runtime_dir
         new_models_dir = self.paths.models_dir
 
-        # Prompt to migrate existing GPU runtime or models if user changed their directories (§4)
         if new_gpu_dir != old_gpu_dir and old_gpu_dir.exists() and any(old_gpu_dir.iterdir()):
             ans = QMessageBox.question(
                 self,

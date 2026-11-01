@@ -1,15 +1,19 @@
-"""faster-whisper transcription engine with model caching, progress streaming, and GPU->CPU fallback."""
+"""faster-whisper transcription engine with Chinese-path-safe CTranslate2 loading, model caching, and GPU->CPU fallback."""
 
 from __future__ import annotations
 
+import ctypes
 import gc
+import os
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from app.core import model_manager
 from app.core.cancel import CancelToken
-from app.core.errors import CancelledError, ModelError, TranscribeError
+from app.core.errors import CancelledError, TranscribeError
 from app.paths import PATHS, AppPaths
 
 ProgressCallback = Callable[[float, str], None]
@@ -60,6 +64,20 @@ def _convert_to_simplified(text: str) -> str:
         return text
 
 
+def _try_windows_short_path(path: Path) -> Optional[str]:
+    """Attempt to convert a non-ASCII Windows path to its 8.3 ASCII short path via Win32 API."""
+    if sys.platform != "win32":
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        res = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024)
+        if res > 0 and buf.value and buf.value.isascii():
+            return buf.value
+    except Exception:
+        pass
+    return None
+
+
 class _ModelCache:
     """Singleton cache keeping at most one loaded WhisperModel in memory."""
 
@@ -84,7 +102,6 @@ class _ModelCache:
                     on_log(f"复用已加载模型：{model_path_or_size} ({device}/{compute_type})")
                 return self._model
 
-            # Release previous model before loading a new one
             if self._model is not None:
                 if on_log:
                     on_log("释放旧模型缓存...")
@@ -96,27 +113,69 @@ class _ModelCache:
                 from faster_whisper import WhisperModel  # type: ignore
             except ImportError as exc:
                 raise TranscribeError(
-                    "未安装 faster-whisper 组件，无法执行语音转录。",
-                    detail=str(exc),
+                    "加载 faster-whisper 组件失败，请检查运行环境依赖。",
+                    detail=repr(exc),
                 ) from exc
+
+            download_root.mkdir(parents=True, exist_ok=True)
+            local_dir = (download_root / model_path_or_size).resolve()
+            spec = model_manager.MODEL_SPEC_MAP.get(model_path_or_size)
+            if spec and local_dir.exists():
+                model_manager._ensure_preprocessor_config(local_dir, spec.mel_bins)
+
+            is_valid_local, missing_files = model_manager.verify_model_dir(local_dir)
+            if local_dir.exists() and not is_valid_local and on_log:
+                on_log(f"[模型校验警告] 本地模型目录 {local_dir} 缺少文件：{', '.join(missing_files)}")
 
             if on_log:
                 on_log(f"正在加载模型：{model_path_or_size} (设备={device}, 精度={compute_type})...")
 
-            download_root.mkdir(parents=True, exist_ok=True)
-            local_dir = download_root / model_path_or_size
-            target = str(local_dir) if (local_dir / "model.bin").exists() else model_path_or_size
+            # Workaround for CTranslate2 Windows C++ std::ifstream failing on Chinese / non-ASCII directory paths:
+            # When loading from `local_dir` whose path contains non-ASCII characters, temporarily chdir into `local_dir`
+            # and pass `"."` (pure ASCII) so CTranslate2 opens `"./model.bin"`, `"./config.json"`, `"./vocabulary.json"`.
+            prev_cwd: Optional[str] = None
+            try:
+                if is_valid_local:
+                    resolved_str = str(local_dir)
+                    if not resolved_str.isascii():
+                        short_p = _try_windows_short_path(local_dir)
+                        if short_p:
+                            target_arg = short_p
+                        else:
+                            prev_cwd = os.getcwd()
+                            os.chdir(local_dir)
+                            target_arg = "."
+                    else:
+                        target_arg = resolved_str
 
-            model = WhisperModel(
-                target,
-                device=device,
-                device_index=0,
-                compute_type=compute_type,
-                cpu_threads=cpu_threads,
-                download_root=str(download_root),
-            )
+                    model = WhisperModel(
+                        target_arg,
+                        device=device,
+                        device_index=0,
+                        compute_type=compute_type,
+                        cpu_threads=cpu_threads,
+                        local_files_only=True,
+                    )
+                else:
+                    model = WhisperModel(
+                        model_path_or_size,
+                        device=device,
+                        device_index=0,
+                        compute_type=compute_type,
+                        cpu_threads=cpu_threads,
+                        download_root=str(download_root),
+                    )
+            finally:
+                if prev_cwd is not None:
+                    try:
+                        os.chdir(prev_cwd)
+                    except OSError:
+                        pass
+
             self._model = model
             self._key = key
+            if on_log:
+                on_log(f"模型加载成功：{model_path_or_size} ({device}/{compute_type})")
             return model
 
     def clear(self) -> None:
@@ -174,14 +233,14 @@ def _run_single_attempt(
     if opts.language in (None, "zh") and opts.to_simplified:
         initial_prompt = "以下是普通话的句子。"
 
-    vad_Params = {"min_silence_duration_ms": opts.min_silence_duration_ms} if opts.vad else None
+    vad_params = {"min_silence_duration_ms": opts.min_silence_duration_ms} if opts.vad else None
 
     segments_gen, info = model.transcribe(
         str(wav_path),
         language=opts.language,
         beam_size=beam_size,
         vad_filter=opts.vad,
-        vad_parameters=vad_Params,
+        vad_parameters=vad_params,
         condition_on_previous_text=False,
         initial_prompt=initial_prompt,
         word_timestamps=False,
@@ -207,7 +266,7 @@ def _run_single_attempt(
             continue
         if opts.to_simplified:
             text = _convert_to_simplified(text)
-        collected.append(Segment(start=start, end=end, text=text))
+        collected.append(Segment(start=start, end=seg_end if (seg_end := end) else end, text=text))
 
         if on_progress and duration > 0:
             ratio = min(1.0, max(0.0, end / duration))
@@ -268,9 +327,11 @@ def transcribe(
                         f"自动降级至 {next_dev}/{next_ct} 重试..."
                     )
             else:
+                if on_log:
+                    on_log(f"[转录错误] {device}/{compute_type} 最终执行失败：{exc!r}")
                 break
 
     raise TranscribeError(
-        f"语音转录失败：{last_exc}",
+        f"模型加载或语音转录失败：{last_exc}",
         detail=repr(last_exc),
     )

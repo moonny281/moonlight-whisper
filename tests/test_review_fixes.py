@@ -108,7 +108,7 @@ class TestReviewFixes(unittest.TestCase):
         import app
         from app.config import LlmConfig
         from app.core import summarizer
-        self.assertEqual(app.__version__, "1.1.0")
+        self.assertEqual(app.__version__, "1.2.0")
 
         empty_cfg = LlmConfig(enabled=True, api_key="")
         ok, msg = summarizer.test_llm_connection(empty_cfg)
@@ -120,6 +120,54 @@ class TestReviewFixes(unittest.TestCase):
             ok2, msg2 = summarizer.test_llm_connection(valid_cfg)
             self.assertTrue(ok2)
             self.assertIn("OK", msg2)
+
+
+
+    def test_v1_1_1_strict_vocab_check_and_chinese_path_model_loading(self) -> None:
+        import os, sys
+        from app.core import transcriber
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Directory with tokenizer.json but NO vocabulary.json/vocabulary.txt must fail verify_model_dir
+            incomplete_dir = Path(tmp) / "中文路径_模型测试" / "large-v3-turbo"
+            incomplete_dir.mkdir(parents=True)
+            (incomplete_dir / "model.bin").write_bytes(b"REAL_MODEL_WEIGHTS_HEADER")
+            (incomplete_dir / "config.json").write_text("{}", encoding="utf-8")
+            (incomplete_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            ok, missing = model_manager.verify_model_dir(incomplete_dir)
+            self.assertFalse(ok)
+            self.assertIn("vocabulary.json / vocabulary.txt", missing)
+
+            # 2. Adding vocabulary.json passes verification and auto-generates 128-mel preprocessor_config.json
+            (incomplete_dir / "vocabulary.json").write_text("{}", encoding="utf-8")
+            paths = AppPaths(app_dir=Path(tmp) / "中文路径_模型测试", custom_models_dir=str(incomplete_dir.parent))
+            self.assertTrue(model_manager.is_model_installed("large-v3-turbo", paths=paths))
+            self.assertTrue((incomplete_dir / "preprocessor_config.json").exists())
+
+            # 3. Verify _ModelCache passes pure ASCII "." via chdir when path contains Chinese characters
+            recorded_args = []
+
+            class DummyWhisperModel:
+                def __init__(self, model_size_or_path, **kwargs):
+                    recorded_args.append((model_size_or_path, os.getcwd(), kwargs))
+
+            fake_fw = type(sys)("faster_whisper")
+            fake_fw.WhisperModel = DummyWhisperModel  # type: ignore[attr-defined]
+            with patch.dict("sys.modules", {"faster_whisper": fake_fw}):
+                transcriber.MODEL_CACHE.clear()
+                transcriber.MODEL_CACHE.get_or_create(
+                    model_path_or_size="large-v3-turbo",
+                    device="cpu",
+                    compute_type="int8",
+                    cpu_threads=0,
+                    download_root=incomplete_dir.parent,
+                )
+                self.assertEqual(len(recorded_args), 1)
+                passed_arg, cwd_during_init, kw = recorded_args[0]
+                self.assertEqual(passed_arg, ".")
+                self.assertTrue(passed_arg.isascii())
+                self.assertEqual(Path(cwd_during_init).resolve(), incomplete_dir.resolve())
+                self.assertTrue(kw.get("local_files_only"))
 
 
 if __name__ == "__main__":

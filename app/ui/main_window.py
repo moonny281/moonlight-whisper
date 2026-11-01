@@ -1,4 +1,4 @@
-"""Modern Open-Source Studio MainWindow for Moonlight Whisper v1.1.0."""
+"""Windows 11 Mica Style MainWindow for Moonlight Whisper v1.2.0 (overlap-proof layout)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -36,7 +37,7 @@ from app.paths import PATHS, AppPaths
 from app.ui.gpu_dialog import GpuRuntimeDialog
 from app.ui.model_dialog import ModelManagerDialog
 from app.ui.settings_dialog import SettingsDialog
-from app.ui.theme import apply_theme, resolve_effective_theme
+from app.ui.theme import apply_theme, apply_win11_mica_window_attributes, resolve_effective_theme
 from app.ui.widgets import (
     DropInputTextEdit,
     GpuStatusIndicator,
@@ -60,7 +61,7 @@ LANGUAGE_OPTIONS = [
 
 
 class MainWindow(QMainWindow):
-    """Modern card-based main window for Moonlight Whisper v1.1.0."""
+    """Windows 11 Mica-styled main window with spacious, DPI-safe non-overlapping layout."""
 
     _log_signal = Signal(str)
 
@@ -74,7 +75,7 @@ class MainWindow(QMainWindow):
         self._suppress_option_sync = False
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
-        self.setMinimumSize(880, 660)
+        self.setMinimumSize(920, 700)
         self.setAcceptDrops(True)
 
         self._build_ui()
@@ -87,27 +88,30 @@ class MainWindow(QMainWindow):
         self._log_signal.connect(self._append_log_on_main_thread, Qt.ConnectionType.QueuedConnection)
         LOG_MANAGER.register_ui_callback(self._emit_log_from_any_thread)
 
+        eff = resolve_effective_theme(self.cfg.ui.theme)
+        apply_win11_mica_window_attributes(self, is_dark=(eff == "dark"))
+
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(18, 16, 18, 16)
+        root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(12)
 
-        # === 1. Modern Header Bar ===
+        # === 1. Top Mica Header Bar ===
         header_row = QHBoxLayout()
-        header_row.setSpacing(10)
+        header_row.setSpacing(12)
 
         self.logo_label = QLabel()
         logo_png = self.paths.assets_dir / "moon-512.png"
         logo_ico = self.paths.assets_dir / "app.ico"
         if logo_png.exists():
             pix = QPixmap(str(logo_png)).scaled(
-                34, 34, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                36, 36, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
             )
             self.logo_label.setPixmap(pix)
         elif logo_ico.exists():
-            self.logo_label.setPixmap(QIcon(str(logo_ico)).pixmap(34, 34))
+            self.logo_label.setPixmap(QIcon(str(logo_ico)).pixmap(36, 36))
         header_row.addWidget(self.logo_label)
 
         title_col = QVBoxLayout()
@@ -122,7 +126,7 @@ class MainWindow(QMainWindow):
         title_line.addWidget(lbl_ver)
         title_line.addStretch(1)
 
-        lbl_sub = QLabel("yt-dlp + faster-whisper 音视频智能转录与 Markdown 笔记工作台")
+        lbl_sub = QLabel("基于 yt-dlp 与 faster-whisper 的音视频智能转录工作台")
         lbl_sub.setObjectName("AppSubtitle")
         title_col.addLayout(title_line)
         title_col.addWidget(lbl_sub)
@@ -134,10 +138,9 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.gpu_indicator)
 
         self.btn_theme = QPushButton("切换主题")
-        self.btn_theme.setObjectName("GhostButton")
-        self.btn_theme.setToolTip("在深色月夜与浅色晨曦主题间切换")
-        self.btn_models_top = QPushButton("模型库")
-        self.btn_settings_top = QPushButton("设置")
+        self.btn_theme.setToolTip("在深色云母与浅色云母主题之间切换")
+        self.btn_models_top = QPushButton("模型管理")
+        self.btn_settings_top = QPushButton("偏好设置")
         self.btn_about_top = QPushButton("关于")
         self.btn_about_top.setObjectName("GhostButton")
 
@@ -150,112 +153,124 @@ class MainWindow(QMainWindow):
         # === 2. Card 1: Input & Drag-and-Drop Zone ===
         input_card = make_card_frame(self)
         input_card_layout = QVBoxLayout(input_card)
-        input_card_layout.setContentsMargins(14, 12, 14, 12)
-        input_card_layout.setSpacing(8)
+        input_card_layout.setContentsMargins(16, 14, 16, 14)
+        input_card_layout.setSpacing(10)
 
         input_top_bar = QHBoxLayout()
-        lbl_input_title = QLabel("输入视频链接或本地音视频文件")
+        input_top_bar.setSpacing(10)
+        lbl_input_title = QLabel("添加视频链接或本地音视频")
         lbl_input_title.setObjectName("SectionTitle")
-        self.lbl_line_count = QLabel("已输入 0 条")
+        self.lbl_line_count = QLabel("待添加 0 项")
         self.lbl_line_count.setObjectName("StatPill")
 
         self.btn_paste = QPushButton("粘贴剪贴板")
-        self.btn_add_files = QPushButton("+ 选择本地文件")
-        self.btn_clear = QPushButton("清空")
+        self.btn_add_files = QPushButton("选择本地文件...")
+        self.btn_clear = QPushButton("清空输入")
+        self.btn_start = QPushButton("▶ 加入队列并开始转录")
+        self.btn_start.setObjectName("PrimaryButton")
 
         input_top_bar.addWidget(lbl_input_title)
-        input_top_bar.addSpacing(6)
         input_top_bar.addWidget(self.lbl_line_count)
         input_top_bar.addStretch(1)
         input_top_bar.addWidget(self.btn_paste)
         input_top_bar.addWidget(self.btn_add_files)
         input_top_bar.addWidget(self.btn_clear)
+        input_top_bar.addWidget(self.btn_start)
         input_card_layout.addLayout(input_top_bar)
 
-        editor_row = QHBoxLayout()
-        editor_row.setSpacing(10)
         self.input_edit = DropInputTextEdit()
-        editor_row.addWidget(self.input_edit, 1)
-
-        self.btn_start = QPushButton("▶ 加入队列\n   开始转录")
-        self.btn_start.setObjectName("PrimaryButton")
-        self.btn_start.setMinimumSize(128, 88)
-        editor_row.addWidget(self.btn_start)
-        input_card_layout.addLayout(editor_row)
+        input_card_layout.addWidget(self.input_edit)
         root.addWidget(input_card)
 
-        # === 3. Card 2: Quick Configuration Bar ===
+        # === 3. Card 2: Spacious Configuration Panel (2 distinct rows + 3x2 checkbox grid) ===
         cfg_card = make_card_frame(self)
         cfg_layout = QVBoxLayout(cfg_card)
-        cfg_layout.setContentsMargins(14, 10, 14, 10)
-        cfg_layout.setSpacing(8)
+        cfg_layout.setContentsMargins(16, 14, 16, 14)
+        cfg_layout.setSpacing(12)
 
-        row_cfg1 = QHBoxLayout()
-        row_cfg1.setSpacing(10)
-        row_cfg1.addWidget(QLabel("转录模型"))
+        # Row A: Model + Language + Output Directory
+        row_selectors = QHBoxLayout()
+        row_selectors.setSpacing(10)
+
+        lbl_m = QLabel("转录模型")
+        lbl_m.setObjectName("FieldLabel")
         self.combo_model = QComboBox()
-        self.combo_model.setMinimumWidth(165)
+        self.combo_model.setMinimumWidth(190)
         for spec in model_manager.SUPPORTED_MODELS:
             self.combo_model.addItem(spec.name, spec.name)
-        row_cfg1.addWidget(self.combo_model)
 
-        row_cfg1.addSpacing(6)
-        row_cfg1.addWidget(QLabel("语言"))
+        lbl_l = QLabel("识别语言")
+        lbl_l.setObjectName("FieldLabel")
         self.combo_lang = QComboBox()
-        self.combo_lang.setMinimumWidth(125)
+        self.combo_lang.setMinimumWidth(135)
         for label, code in LANGUAGE_OPTIONS:
             self.combo_lang.addItem(label, code)
-        row_cfg1.addWidget(self.combo_lang)
 
-        row_cfg1.addSpacing(10)
-        self.chk_gpu = QCheckBox("NVIDIA GPU 加速")
-        self.chk_to_simplified = QCheckBox("繁体转简体")
-        self.chk_write_srt = QCheckBox("同时导出 SRT")
-        self.chk_keep_audio = QCheckBox("保留音频")
-        self.chk_allow_playlist = QCheckBox("展开播放列表/多 P")
-        self.chk_llm_summary = QCheckBox("AI 自动摘要")
-
-        row_cfg1.addWidget(self.chk_gpu)
-        row_cfg1.addWidget(self.chk_to_simplified)
-        row_cfg1.addWidget(self.chk_write_srt)
-        row_cfg1.addWidget(self.chk_keep_audio)
-        row_cfg1.addWidget(self.chk_allow_playlist)
-        row_cfg1.addWidget(self.chk_llm_summary)
-        row_cfg1.addStretch(1)
-        cfg_layout.addLayout(row_cfg1)
-
-        row_cfg2 = QHBoxLayout()
-        row_cfg2.setSpacing(8)
-        row_cfg2.addWidget(QLabel("输出目录"))
+        lbl_out = QLabel("输出目录")
+        lbl_out.setObjectName("FieldLabel")
         self.edit_output_dir = QLineEdit()
         self.btn_browse_out = QPushButton("浏览...")
-        self.btn_open_out = QPushButton("打开文件夹")
-        row_cfg2.addWidget(self.edit_output_dir, 1)
-        row_cfg2.addWidget(self.btn_browse_out)
-        row_cfg2.addWidget(self.btn_open_out)
-        cfg_layout.addLayout(row_cfg2)
+        self.btn_open_out = QPushButton("打开目录")
+
+        row_selectors.addWidget(lbl_m)
+        row_selectors.addWidget(self.combo_model)
+        row_selectors.addSpacing(8)
+        row_selectors.addWidget(lbl_l)
+        row_selectors.addWidget(self.combo_lang)
+        row_selectors.addSpacing(8)
+        row_selectors.addWidget(lbl_out)
+        row_selectors.addWidget(self.edit_output_dir, 1)
+        row_selectors.addWidget(self.btn_browse_out)
+        row_selectors.addWidget(self.btn_open_out)
+        cfg_layout.addLayout(row_selectors)
+
+        # Row B: Sub-card with a spacious 3x2 Grid of feature toggles (zero crowding/overlap)
+        toggles_subcard = make_card_frame(cfg_card, sub_card=True)
+        toggles_grid = QGridLayout(toggles_subcard)
+        toggles_grid.setContentsMargins(14, 10, 14, 10)
+        toggles_grid.setHorizontalSpacing(28)
+        toggles_grid.setVerticalSpacing(8)
+
+        self.chk_gpu = QCheckBox("启用 NVIDIA GPU 加速 (CUDA 12)")
+        self.chk_to_simplified = QCheckBox("繁体中文自动转简体 (OpenCC)")
+        self.chk_write_srt = QCheckBox("同时导出 SRT 字幕文件 (.srt)")
+        self.chk_keep_audio = QCheckBox("保留下载的原始音频文件")
+        self.chk_allow_playlist = QCheckBox("允许解析播放列表 / 多 P 视频")
+        self.chk_llm_summary = QCheckBox("启用 AI 自动生成摘要 (OpenAI 兼容)")
+
+        toggles_grid.addWidget(self.chk_gpu, 0, 0)
+        toggles_grid.addWidget(self.chk_to_simplified, 0, 1)
+        toggles_grid.addWidget(self.chk_write_srt, 0, 2)
+        toggles_grid.addWidget(self.chk_keep_audio, 1, 0)
+        toggles_grid.addWidget(self.chk_allow_playlist, 1, 1)
+        toggles_grid.addWidget(self.chk_llm_summary, 1, 2)
+        toggles_grid.setColumnStretch(0, 1)
+        toggles_grid.setColumnStretch(1, 1)
+        toggles_grid.setColumnStretch(2, 1)
+
+        cfg_layout.addWidget(toggles_subcard)
         root.addWidget(cfg_card)
 
         # === 4. Card 3: Task Queue & Batch Controls ===
         queue_card = make_card_frame(self)
         queue_layout = QVBoxLayout(queue_card)
-        queue_layout.setContentsMargins(14, 12, 14, 12)
-        queue_layout.setSpacing(8)
+        queue_layout.setContentsMargins(16, 14, 16, 14)
+        queue_layout.setSpacing(10)
 
         queue_top = QHBoxLayout()
-        lbl_q_title = QLabel("转录任务队列")
+        queue_top.setSpacing(8)
+        lbl_q_title = QLabel("任务队列")
         lbl_q_title.setObjectName("SectionTitle")
-        self.lbl_queue_stats = QLabel("总计 0  |  进行中 0  |  等待 0  |  已完成 0")
+        self.lbl_queue_stats = QLabel("总计 0  ·  进行中 0  ·  等待 0  ·  已完成 0")
         self.lbl_queue_stats.setObjectName("StatPill")
 
+        self.btn_retry_failed = QPushButton("重试失败项")
+        self.btn_clear_inactive = QPushButton("清理已结束")
         self.btn_cancel_current = QPushButton("取消当前")
         self.btn_cancel_all = QPushButton("取消全部")
         self.btn_cancel_all.setObjectName("DangerButton")
-        self.btn_retry_failed = QPushButton("重试失败项")
-        self.btn_clear_inactive = QPushButton("清理已结束")
 
         queue_top.addWidget(lbl_q_title)
-        queue_top.addSpacing(6)
         queue_top.addWidget(self.lbl_queue_stats)
         queue_top.addStretch(1)
         queue_top.addWidget(self.btn_retry_failed)
@@ -270,6 +285,7 @@ class MainWindow(QMainWindow):
 
         # === 5. Bottom Collapsible Console Log & Maintenance Bar ===
         bottom_bar = QHBoxLayout()
+        bottom_bar.setSpacing(8)
         self.btn_toggle_log = QToolButton()
         self.btn_toggle_log.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.btn_toggle_log.setArrowType(Qt.ArrowType.RightArrow)
@@ -280,7 +296,7 @@ class MainWindow(QMainWindow):
         self.btn_copy_log.setObjectName("GhostButton")
         self.btn_clear_log = QPushButton("清空日志")
         self.btn_clear_log.setObjectName("GhostButton")
-        self.btn_open_logs_dir = QPushButton("日志目录")
+        self.btn_open_logs_dir = QPushButton("日志文件夹")
         self.btn_open_logs_dir.setObjectName("GhostButton")
         self.btn_update_ytdlp = QPushButton("更新 yt-dlp")
 
@@ -296,7 +312,7 @@ class MainWindow(QMainWindow):
         self.log_view.setObjectName("ConsoleLogView")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(2000)
-        self.log_view.setFixedHeight(145)
+        self.log_view.setFixedHeight(140)
         self.log_view.setVisible(False)
         root.addWidget(self.log_view)
 
@@ -310,7 +326,7 @@ class MainWindow(QMainWindow):
         self.btn_add_files.clicked.connect(self._on_add_local_files)
         self.btn_clear.clicked.connect(self.input_edit.clear)
         self.input_edit.line_count_changed.connect(
-            lambda n: self.lbl_line_count.setText(f"已输入 {n} 条")
+            lambda n: self.lbl_line_count.setText(f"待添加 {n} 项")
         )
 
         self.btn_theme.clicked.connect(self._toggle_theme_quick)
@@ -378,7 +394,7 @@ class MainWindow(QMainWindow):
             self.chk_llm_summary.setChecked(self.cfg.llm.enabled)
 
             effective = resolve_effective_theme(self.cfg.ui.theme)
-            self.btn_theme.setText("☀ 浅色" if effective == "dark" else "🌙 深色")
+            self.btn_theme.setText("☀ 浅色云母" if effective == "dark" else "🌙 深色云母")
 
             self.btn_toggle_log.setChecked(self.cfg.ui.log_expanded)
             self._on_toggle_log(self.cfg.ui.log_expanded)
@@ -390,8 +406,8 @@ class MainWindow(QMainWindow):
         new_theme = "light" if current_eff == "dark" else "dark"
         self.cfg.ui.theme = new_theme
         self.cfg.save(paths=self.paths)
-        apply_theme(QApplication.instance(), new_theme)
-        self.btn_theme.setText("☀ 浅色" if new_theme == "dark" else "🌙 深色")
+        apply_theme(QApplication.instance(), new_theme, window=self)
+        self.btn_theme.setText("☀ 浅色云母" if new_theme == "dark" else "🌙 深色云母")
 
     def _refresh_gpu_state(self, initial: bool = False) -> None:
         info = gpu_runtime.detect(self.paths)
@@ -405,8 +421,8 @@ class MainWindow(QMainWindow):
     def _refresh_queue_stats(self) -> None:
         st = self.queue.stats()
         self.lbl_queue_stats.setText(
-            f"总计 {st['total']}  |  进行中 {st['running']}  |  等待 {st['waiting']}  |  "
-            f"已完成 {st['completed']}  |  失败/取消 {st['failed']}"
+            f"总计 {st['total']}  ·  进行中 {st['running']}  ·  等待 {st['waiting']}  ·  "
+            f"已完成 {st['completed']}  ·  失败/取消 {st['failed']}"
         )
 
     @Slot(bool)
@@ -496,7 +512,7 @@ class MainWindow(QMainWindow):
             self._refresh_model_combo_labels()
             self._sync_controls_from_config()
             self._refresh_gpu_state(initial=False)
-            apply_theme(QApplication.instance(), self.cfg.ui.theme)
+            apply_theme(QApplication.instance(), self.cfg.ui.theme, window=self)
 
     def _on_options_changed(self) -> None:
         if self._suppress_option_sync:
@@ -572,7 +588,7 @@ class MainWindow(QMainWindow):
 
         if self.cfg.allow_playlist and any(not Job(source=l).is_local_file for l in lines):
             self.btn_start.setEnabled(False)
-            self.btn_start.setText("正在解析\n播放列表...")
+            self.btn_start.setText("正在解析播放列表...")
             worker = PlaylistExpandWorker(raw_inputs=lines, cfg=self.cfg, paths=self.paths, parent=self)
             worker.jobs_ready.connect(self._on_expanded_jobs_ready)
             self._expand_worker = worker
@@ -584,7 +600,7 @@ class MainWindow(QMainWindow):
     def _on_expanded_jobs_ready(self, jobs: List[Job]) -> None:
         self._expand_worker = None
         self.btn_start.setEnabled(True)
-        self.btn_start.setText("▶ 加入队列\n   开始转录")
+        self.btn_start.setText("▶ 加入队列并开始转录")
         if jobs:
             self.queue.enqueue_jobs(jobs)
 
@@ -660,7 +676,7 @@ class MainWindow(QMainWindow):
             self,
             f"关于 {__app_name__}",
             f"<h3>{__app_name__} v{__version__}</h3>"
-            "<p>基于 <b>yt-dlp</b> 与 <b>faster-whisper (CTranslate2)</b> 的现代化开源桌面端视频转录工作台。</p>"
+            "<p>基于 <b>yt-dlp</b> 与 <b>faster-whisper (CTranslate2)</b> 的 Windows 11 云母风格桌面端视频转录工作台。</p>"
             "<ul>"
             "<li>支持粘贴单个/批量链接、播放列表自动展开与本地音视频文件拖拽入队</li>"
             "<li>支持 NVIDIA CUDA 12 运行库按需流式下载、离线导入与 CPU 智能回退</li>"

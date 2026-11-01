@@ -1,4 +1,4 @@
-"""Dialog for downloading, resuming, or manually importing CUDA 12 / cuDNN 9 runtime DLLs."""
+"""Windows 11 Mica-styled dialog for downloading or importing CUDA 12 / cuDNN 9 runtime DLLs."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -25,11 +24,13 @@ from app.core import gpu_runtime
 from app.core.errors import ErrorInfo
 from app.core.gpu_runtime import GpuInfo, GpuStatus
 from app.paths import PATHS, AppPaths
+from app.ui.theme import apply_win11_mica_window_attributes, resolve_effective_theme
+from app.ui.widgets import make_mica_section
 from app.workers import GpuInstallWorker
 
 
 class GpuRuntimeDialog(QDialog):
-    """Interactive wizard for installing or importing CUDA 12 runtime DLLs into `gpu_runtime/`."""
+    """Interactive Mica wizard for installing or importing CUDA 12 runtime DLLs into `gpu_runtime/`."""
 
     def __init__(
         self,
@@ -45,24 +46,25 @@ class GpuRuntimeDialog(QDialog):
         self._worker: Optional[GpuInstallWorker] = None
 
         self.setWindowTitle("NVIDIA GPU 加速运行库安装向导")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
         self._build_ui()
         self._refresh_info_labels()
 
+        eff = resolve_effective_theme(self.cfg.ui.theme)
+        apply_win11_mica_window_attributes(self, is_dark=(eff == "dark"))
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
 
-        intro = QLabel(
-            "启用 NVIDIA GPU 加速需要下载 CUDA 12 (cuBLAS 12 + cuDNN 9) 运行库（约 1GB）。\n"
-            "• 一次下载，永久存放在本地 gpu_runtime/ 目录中复用\n"
-            "• 支持断点续传、国内 PyPI 镜像加速与本地离线导入"
+        hw_card, hw_box = make_mica_section(
+            "硬件与环境检测",
+            "启用 NVIDIA GPU 加速需下载 CUDA 12 (cuBLAS 12 + cuDNN 9) 运行库（约 1GB，一次下载永久复用）。",
         )
-        intro.setWordWrap(True)
-        root.addWidget(intro)
-
-        hw_group = QGroupBox("当前硬件与环境状态")
-        hw_form = QFormLayout(hw_group)
+        hw_form = QFormLayout()
+        hw_form.setHorizontalSpacing(14)
+        hw_form.setVerticalSpacing(8)
         self.lbl_device = QLabel()
         self.lbl_driver = QLabel()
         self.lbl_status = QLabel()
@@ -72,11 +74,10 @@ class GpuRuntimeDialog(QDialog):
         hw_form.addRow("驱动版本：", self.lbl_driver)
         hw_form.addRow("当前状态：", self.lbl_status)
         hw_form.addRow("缺失组件：", self.lbl_missing)
-        root.addWidget(hw_group)
+        hw_box.addLayout(hw_form)
+        root.addWidget(hw_card)
 
-        dl_group = QGroupBox("安装选项")
-        dl_layout = QVBoxLayout(dl_group)
-
+        dl_card, dl_box = make_mica_section("下载与离线导入")
         mirror_row = QHBoxLayout()
         mirror_row.addWidget(QLabel("下载镜像源："))
         self.combo_mirror = QComboBox()
@@ -87,25 +88,25 @@ class GpuRuntimeDialog(QDialog):
         if idx >= 0:
             self.combo_mirror.setCurrentIndex(idx)
         mirror_row.addWidget(self.combo_mirror, 1)
-        dl_layout.addLayout(mirror_row)
+        dl_box.addLayout(mirror_row)
 
         self.pbar = QProgressBar()
         self.pbar.setRange(0, 100)
         self.pbar.setValue(0)
-        dl_layout.addWidget(self.pbar)
+        dl_box.addWidget(self.pbar)
 
-        self.lbl_progress_detail = QLabel("准备就绪")
+        self.lbl_progress_detail = QLabel("准备就绪（支持断点续传与 SHA-256 校验）")
+        self.lbl_progress_detail.setObjectName("MutedLabel")
         self.lbl_progress_detail.setWordWrap(True)
-        dl_layout.addWidget(self.lbl_progress_detail)
-
-        root.addWidget(dl_group)
+        dl_box.addWidget(self.lbl_progress_detail)
+        root.addWidget(dl_card)
 
         btn_row = QHBoxLayout()
         self.btn_download = QPushButton("在线下载并安装")
         self.btn_download.setObjectName("PrimaryButton")
-        self.btn_import_zip = QPushButton("导入本地压缩包 (.zip/.whl)...")
+        self.btn_import_zip = QPushButton("导入压缩包 (.zip/.whl)...")
         self.btn_import_dir = QPushButton("导入本地文件夹...")
-        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel = QPushButton("关闭")
 
         self.btn_download.clicked.connect(self._start_download)
         self.btn_import_zip.clicked.connect(self._import_archive)
@@ -129,7 +130,7 @@ class GpuRuntimeDialog(QDialog):
         if info.missing_files:
             self.lbl_missing.setText(", ".join(info.missing_files))
         else:
-            self.lbl_missing.setText("无（所需 DLL 已齐全）")
+            self.lbl_missing.setText("无（所需 10 个核心与引擎 DLL 已齐全）")
 
     def _set_busy(self, busy: bool) -> None:
         self.btn_download.setEnabled(not busy)

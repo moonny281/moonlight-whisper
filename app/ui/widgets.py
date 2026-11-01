@@ -1,4 +1,4 @@
-"""Modern reusable PySide6 widgets: drag-drop input editor, GPU pill badge, and 4-column task queue table."""
+"""Windows 11 Mica style PySide6 widgets: drag-drop input editor, GPU pill badge, and 4-column task queue table."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -33,12 +34,36 @@ SUPPORTED_MEDIA_EXTS = {
 }
 
 
-def make_card_frame(parent: Optional[QWidget] = None) -> QFrame:
-    """Create a styled rounded card container (`QFrame#CardFrame`)."""
+def make_card_frame(parent: Optional[QWidget] = None, sub_card: bool = False) -> QFrame:
+    """Create a styled Windows 11 Mica rounded card container."""
     frame = QFrame(parent)
-    frame.setObjectName("CardFrame")
+    frame.setObjectName("SubCardFrame" if sub_card else "CardFrame")
     frame.setFrameShape(QFrame.Shape.StyledPanel)
     return frame
+
+
+def make_mica_section(
+    title: str,
+    subtitle: str = "",
+    parent: Optional[QWidget] = None,
+) -> Tuple[QFrame, QVBoxLayout]:
+    """Create a Mica card with a non-overlapping header label and return `(card, content_layout)`."""
+    card = make_card_frame(parent)
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+
+    lbl_title = QLabel(title)
+    lbl_title.setObjectName("SectionTitle")
+    layout.addWidget(lbl_title)
+
+    if subtitle:
+        lbl_sub = QLabel(subtitle)
+        lbl_sub.setObjectName("MutedLabel")
+        lbl_sub.setWordWrap(True)
+        layout.addWidget(lbl_sub)
+
+    return card, layout
 
 
 def open_path_in_os(path: Path, reveal_in_folder: bool = False) -> None:
@@ -72,9 +97,10 @@ class DropInputTextEdit(QPlainTextEdit):
         self.setObjectName("DropInputEdit")
         self.setAcceptDrops(True)
         self.setPlaceholderText(
-            "在此粘贴视频链接（每行一个，支持 YouTube / Bilibili / 播客等），或将本地音视频文件/文件夹直接拖入窗口任意位置..."
+            "在此粘贴视频链接（每行一个，支持 YouTube / Bilibili / 播客等），或将本地音视频文件/文件夹直接拖入窗口..."
         )
-        self.setFixedHeight(88)
+        self.setMinimumHeight(82)
+        self.setMaximumHeight(110)
         self.textChanged.connect(self._emit_line_count)
 
     def _emit_line_count(self) -> None:
@@ -119,7 +145,7 @@ class DropInputTextEdit(QPlainTextEdit):
 
 
 class GpuStatusIndicator(QWidget):
-    """Modern pill badge displaying GPU readiness and a one-click install/repair button."""
+    """Mica pill badge displaying GPU readiness and a one-click install/repair button."""
 
     install_clicked = Signal()
 
@@ -127,15 +153,15 @@ class GpuStatusIndicator(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
         self.badge_label = QLabel("○ GPU 未检测")
         self.badge_label.setStyleSheet(
-            "background-color: rgba(148, 163, 184, 0.15); color: #94A3B8; "
-            "border: 1px solid rgba(148, 163, 184, 0.3); border-radius: 10px; padding: 3px 10px; font-size: 12px;"
+            "background-color: rgba(148, 163, 184, 0.14); color: #94A3B8; "
+            "border: 1px solid rgba(148, 163, 184, 0.3); border-radius: 11px; padding: 4px 12px; font-size: 12px;"
         )
         self.action_btn = QPushButton("安装运行库")
-        self.action_btn.setFixedHeight(26)
+        self.action_btn.setObjectName("TableActionButton")
         self.action_btn.clicked.connect(self.install_clicked.emit)
 
         layout.addWidget(self.badge_label)
@@ -146,45 +172,45 @@ class GpuStatusIndicator(QWidget):
             short_dev = info.device_name.replace("NVIDIA GeForce ", "").strip() or "CUDA"
             self.badge_label.setText(f"● {short_dev} ({info.vram_gb:.0f}GB) 就绪")
             self.badge_label.setStyleSheet(
-                "background-color: rgba(16, 185, 129, 0.15); color: #34D399; "
-                "border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 10px; padding: 3px 10px; font-weight: 600; font-size: 12px;"
+                "background-color: rgba(16, 185, 129, 0.15); color: #10B981; "
+                "border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 11px; padding: 4px 12px; font-weight: 600; font-size: 12px;"
             )
             self.action_btn.setVisible(False)
         elif info.status == GpuStatus.RUNTIME_MISSING:
             self.badge_label.setText("○ 缺少 CUDA 运行库")
             self.badge_label.setStyleSheet(
-                "background-color: rgba(245, 158, 11, 0.15); color: #FBBF24; "
-                "border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 10px; padding: 3px 10px; font-weight: 600; font-size: 12px;"
+                "background-color: rgba(245, 158, 11, 0.15); color: #F59E0B; "
+                "border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 11px; padding: 4px 12px; font-weight: 600; font-size: 12px;"
             )
             self.action_btn.setText("一键安装")
             self.action_btn.setVisible(True)
         elif info.status == GpuStatus.LOAD_FAILED:
             self.badge_label.setText("● 运行库加载异常")
             self.badge_label.setStyleSheet(
-                "background-color: rgba(249, 115, 22, 0.15); color: #FB923C; "
-                "border: 1px solid rgba(249, 115, 22, 0.4); border-radius: 10px; padding: 3px 10px; font-weight: 600; font-size: 12px;"
+                "background-color: rgba(249, 115, 22, 0.15); color: #F97316; "
+                "border: 1px solid rgba(249, 115, 22, 0.4); border-radius: 11px; padding: 4px 12px; font-weight: 600; font-size: 12px;"
             )
             self.action_btn.setText("修复运行库")
             self.action_btn.setVisible(True)
         elif info.status == GpuStatus.DRIVER_TOO_OLD:
             self.badge_label.setText(f"● 驱动过旧 ({info.driver_version})")
             self.badge_label.setStyleSheet(
-                "background-color: rgba(239, 68, 68, 0.15); color: #F87171; "
-                "border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 10px; padding: 3px 10px; font-weight: 600; font-size: 12px;"
+                "background-color: rgba(239, 68, 68, 0.15); color: #EF4444; "
+                "border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 11px; padding: 4px 12px; font-weight: 600; font-size: 12px;"
             )
             self.action_btn.setVisible(False)
         else:
-            self.badge_label.setText("○ CPU 模式 (未检测到 N 卡)")
+            self.badge_label.setText("○ CPU 模式")
             self.badge_label.setStyleSheet(
-                "background-color: rgba(148, 163, 184, 0.12); color: #94A3B8; "
-                "border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 10px; padding: 3px 10px; font-size: 12px;"
+                "background-color: rgba(148, 163, 184, 0.14); color: #8A94A6; "
+                "border: 1px solid rgba(148, 163, 184, 0.28); border-radius: 11px; padding: 4px 12px; font-size: 12px;"
             )
             self.action_btn.setVisible(False)
         self.setToolTip(info.message + (f"\n{info.detail}" if info.detail else ""))
 
 
 class TaskQueueTable(QTableWidget):
-    """Modern 4-column task queue table with status badges, smooth progress bars, and inline quick actions."""
+    """Spacious 4-column task queue table with non-overlapping inline action buttons."""
 
     retry_requested = Signal(str)       # job_id
     cancel_requested = Signal(str)      # job_id
@@ -194,18 +220,19 @@ class TaskQueueTable(QTableWidget):
         self.setHorizontalHeaderLabels(["视频标题 / 输入源", "当前阶段", "进度", "快捷操作"])
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.setColumnWidth(2, 165)
-        self.setColumnWidth(3, 150)
+        self.setColumnWidth(1, 160)
+        self.setColumnWidth(2, 175)
+        self.setColumnWidth(3, 165)
 
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setAlternatingRowColors(True)
         self.setShowGrid(False)
         self.verticalHeader().setVisible(False)
-        self.verticalHeader().setDefaultSectionSize(40)
+        self.verticalHeader().setDefaultSectionSize(44)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         self.customContextMenuRequested.connect(self._show_context_menu)
@@ -217,6 +244,7 @@ class TaskQueueTable(QTableWidget):
     def add_task_row(self, item: TaskItem) -> None:
         row = self.rowCount()
         self.insertRow(row)
+        self.setRowHeight(row, 44)
         job_id = item.job.job_id
         self._row_by_job_id[job_id] = row
         self._items_by_job_id[job_id] = item
@@ -236,8 +264,9 @@ class TaskQueueTable(QTableWidget):
         pbar.setTextVisible(True)
         pbar.setFormat("%p%")
         pbar_wrap = QWidget()
+        pbar_wrap.setStyleSheet("background: transparent;")
         pbar_layout = QHBoxLayout(pbar_wrap)
-        pbar_layout.setContentsMargins(6, 6, 6, 6)
+        pbar_layout.setContentsMargins(8, 8, 8, 8)
         pbar_layout.addWidget(pbar)
         self.setCellWidget(row, 2, pbar_wrap)
 
@@ -260,17 +289,17 @@ class TaskQueueTable(QTableWidget):
 
         status_cell = self.item(row, 1)
         if status_cell:
-            status_cell.setText(f"  {item.stage_text}  ")
+            status_cell.setText(item.stage_text)
             if item.status == TaskStatus.COMPLETED:
                 status_cell.setForeground(QColor("#10B981"))
             elif item.status == TaskStatus.RUNNING:
-                status_cell.setForeground(QColor("#6366F1"))
+                status_cell.setForeground(QColor("#0078D4"))
             elif item.status == TaskStatus.FAILED:
                 status_cell.setForeground(QColor("#EF4444"))
             elif item.status == TaskStatus.CANCELLED:
                 status_cell.setForeground(QColor("#F59E0B"))
             else:
-                status_cell.setForeground(QColor("#94A3B8"))
+                status_cell.setForeground(QColor("#8A94A6"))
 
             if item.error_info:
                 tip = item.error_info.user_message
@@ -284,32 +313,31 @@ class TaskQueueTable(QTableWidget):
             if pbar:
                 pbar.setValue(item.progress)
 
-        # Inline action buttons in column 3
         action_wrap = QWidget()
+        action_wrap.setStyleSheet("background: transparent;")
         action_layout = QHBoxLayout(action_wrap)
-        action_layout.setContentsMargins(4, 4, 4, 4)
-        action_layout.setSpacing(4)
+        action_layout.setContentsMargins(6, 5, 6, 5)
+        action_layout.setSpacing(6)
 
         job_id = item.job.job_id
         if item.status == TaskStatus.COMPLETED and item.result and item.result.md_path.exists():
             md_path = item.result.md_path
             btn_open = QPushButton("打开")
-            btn_open.setFixedHeight(26)
+            btn_open.setObjectName("TableActionButton")
             btn_open.clicked.connect(lambda _=False, p=md_path: open_path_in_os(p, False))
-            btn_dir = QPushButton("目录")
-            btn_dir.setFixedHeight(26)
+            btn_dir = QPushButton("文件夹")
+            btn_dir.setObjectName("TableActionButton")
             btn_dir.clicked.connect(lambda _=False, p=md_path: open_path_in_os(p, True))
             action_layout.addWidget(btn_open)
             action_layout.addWidget(btn_dir)
         elif item.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             btn_retry = QPushButton("重试")
-            btn_retry.setFixedHeight(26)
+            btn_retry.setObjectName("TableActionButton")
             btn_retry.clicked.connect(lambda _=False, j=job_id: self.retry_requested.emit(j))
             action_layout.addWidget(btn_retry)
         elif item.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
             btn_cancel = QPushButton("取消")
-            btn_cancel.setObjectName("DangerButton")
-            btn_cancel.setFixedHeight(26)
+            btn_cancel.setObjectName("TableDangerButton")
             btn_cancel.clicked.connect(lambda _=False, j=job_id: self.cancel_requested.emit(j))
             action_layout.addWidget(btn_cancel)
 

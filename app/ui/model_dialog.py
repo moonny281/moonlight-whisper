@@ -1,4 +1,4 @@
-"""Dialog for managing Whisper CTranslate2 models: status view, HF mirror download, and manual import."""
+"""Windows 11 Mica-styled dialog for managing Whisper CTranslate2 models."""
 
 from __future__ import annotations
 
@@ -28,12 +28,13 @@ from app.core import model_manager
 from app.core.errors import ErrorInfo
 from app.core.model_manager import ModelStatus
 from app.paths import PATHS, AppPaths
-from app.ui.widgets import open_path_in_os
+from app.ui.theme import apply_win11_mica_window_attributes, resolve_effective_theme
+from app.ui.widgets import make_mica_section, open_path_in_os
 from app.workers import ModelDownloadWorker
 
 
 class ModelManagerDialog(QDialog):
-    """Displays supported Whisper models with installation status, mirror toggle, download, and manual import."""
+    """Mica-styled Whisper model manager with installation status, mirror toggle, download, and manual import."""
 
     def __init__(
         self,
@@ -48,25 +49,34 @@ class ModelManagerDialog(QDialog):
         self._statuses: List[ModelStatus] = []
 
         self.setWindowTitle("Whisper 模型管理")
-        self.setMinimumSize(680, 420)
+        self.setMinimumSize(720, 460)
         self._build_ui()
         self.refresh_table()
 
+        eff = resolve_effective_theme(self.cfg.ui.theme)
+        apply_win11_mica_window_attributes(self, is_dark=(eff == "dark"))
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setSpacing(10)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        card, card_box = make_mica_section(
+            "Whisper 模型库 (CTranslate2 格式)",
+            "支持在线流式下载（含断点续传与国内镜像加速）或导入本地已下载的模型文件夹。",
+        )
 
         top_row = QHBoxLayout()
-        self.chk_hf_mirror = QCheckBox("使用国内 HuggingFace 镜像 (hf-mirror.com)")
+        self.chk_hf_mirror = QCheckBox("使用国内 HuggingFace 镜像加速 (hf-mirror.com)")
         self.chk_hf_mirror.setChecked(self.cfg.hf_mirror)
         self.chk_hf_mirror.toggled.connect(self._on_mirror_toggled)
         top_row.addWidget(self.chk_hf_mirror)
         top_row.addStretch(1)
 
-        btn_open_dir = QPushButton("打开模型文件夹")
+        btn_open_dir = QPushButton("打开模型目录")
         btn_open_dir.clicked.connect(lambda: open_path_in_os(self.paths.models_dir, False))
         top_row.addWidget(btn_open_dir)
-        root.addLayout(top_row)
+        card_box.addLayout(top_row)
 
         self.table = QTableWidget(0, 4, self)
         self.table.setHorizontalHeaderLabels(["模型名称", "预估体积", "状态", "适用场景建议"])
@@ -78,22 +88,29 @@ class ModelManagerDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
-        root.addWidget(self.table, 1)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        card_box.addWidget(self.table, 1)
 
         self.pbar = QProgressBar()
         self.pbar.setRange(0, 100)
         self.pbar.setValue(0)
-        root.addWidget(self.pbar)
+        card_box.addWidget(self.pbar)
 
-        self.lbl_status = QLabel("选择上方模型可进行在线下载或从本地文件夹手动导入。")
-        root.addWidget(self.lbl_status)
+        self.lbl_status = QLabel("在列表中选择模型后，可点击下方按钮在线下载或从本地文件夹导入。")
+        self.lbl_status.setObjectName("MutedLabel")
+        self.lbl_status.setWordWrap(True)
+        card_box.addWidget(self.lbl_status)
+
+        root.addWidget(card, 1)
 
         btn_row = QHBoxLayout()
         self.btn_download = QPushButton("下载选中模型")
         self.btn_download.setObjectName("PrimaryButton")
         self.btn_import = QPushButton("手动导入选中模型...")
         self.btn_cancel_dl = QPushButton("取消下载")
+        self.btn_cancel_dl.setObjectName("DangerButton")
         self.btn_cancel_dl.setEnabled(False)
         btn_close = QPushButton("关闭")
 
@@ -117,10 +134,10 @@ class ModelManagerDialog(QDialog):
         self._statuses = model_manager.list_models(self.paths)
         self.table.setRowCount(len(self._statuses))
         for row, st in enumerate(self._statuses):
-            name_item = QTableWidgetItem(st.spec.name)
+            name_item = QTableWidgetItem(f"  {st.spec.name}  ")
             name_item.setData(Qt.ItemDataRole.UserRole, st.spec.name)
-            size_str = f"~{st.spec.approx_size_mb} MB"
-            status_str = f"已下载 ({st.actual_size_mb:.0f} MB)" if st.installed else "未下载"
+            size_str = f"  ~{st.spec.approx_size_mb} MB  "
+            status_str = f"  ✓ 已就绪 ({st.actual_size_mb:.0f} MB)  " if st.installed else "  未下载  "
 
             status_item = QTableWidgetItem(status_str)
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -198,7 +215,7 @@ class ModelManagerDialog(QDialog):
 
         folder = QFileDialog.getExistingDirectory(
             self,
-            f"选择包含 {model_name} (CTranslate2 格式，含 model.bin) 的本地文件夹",
+            f"选择包含 {model_name} (CTranslate2 格式，含 model.bin / vocabulary.*) 的本地文件夹",
         )
         if not folder:
             return
