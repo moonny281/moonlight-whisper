@@ -147,6 +147,11 @@ class AppPaths:
         return self.app_dir / "bin"
 
     @property
+    def user_bin_dir(self) -> Path:
+        """Writable binary directory under `data_root/bin` for on-demand downloaded tools (`deno.exe`)."""
+        return self.data_root / "bin"
+
+    @property
     def assets_dir(self) -> Path:
         if self.is_frozen():
             internal_assets = self.app_dir / "_internal" / "assets"
@@ -192,23 +197,24 @@ class AppPaths:
             folder.mkdir(parents=True, exist_ok=True)
 
     def find_binary(self, name: str) -> Optional[Path]:
-        """Locate an external tool (`ffmpeg` or `deno`) in `bin/` first, then system PATH."""
+        """Locate an external tool (`ffmpeg`, `deno`, `node`) in bundled `bin/`, `_internal/bin/`, writable `data_root/bin/`, or system PATH."""
         exe_name = f"{name}.exe" if sys.platform == "win32" and not name.endswith(".exe") else name
-        bundled = self.bin_dir / exe_name
-        if bundled.exists() and bundled.is_file():
-            return bundled
-        alt_bundled = self.bin_dir / name
-        if alt_bundled.exists() and alt_bundled.is_file():
-            return alt_bundled
+        search_dirs = [
+            self.bin_dir,
+            self.app_dir / "_internal" / "bin",
+            self.user_bin_dir,
+        ]
+        for d in search_dirs:
+            for candidate_name in (exe_name, name):
+                cand = d / candidate_name
+                if cand.exists() and cand.is_file():
+                    return cand
         which_path = shutil.which(name)
         return Path(which_path).resolve() if which_path else None
 
     @staticmethod
     def migrate_directory_contents(src: Path, dst: Path) -> int:
-        """Move files from `src` to `dst` when a user changes storage directories in Settings.
-
-        Returns the number of top-level entries migrated.
-        """
+        """Move files from `src` to `dst` when a user changes storage directories in Settings."""
         src = src.resolve()
         dst = dst.resolve()
         if src == dst or not src.exists():

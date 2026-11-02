@@ -1,4 +1,4 @@
-"""yt-dlp wrapper with built-in rookie-cookies extraction, YouTube JS runtime/EJS/multi-client fallback, Cookie domain binding & static inspection, domestic proxy bypass, and isolated Cookie cleanup."""
+"""yt-dlp wrapper with built-in rookie-cookies extraction, on-demand Deno/Node JS runtime, YouTube & TikTok direct fallbacks, Cookie domain binding & static inspection, domestic proxy bypass, and isolated Cookie cleanup."""
 
 from __future__ import annotations
 
@@ -31,6 +31,10 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 
 _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YOUTUBE_URL_ID_RE = re.compile(
+    r"(?:v=|/(?:embed|shorts|live|v)/|youtu\.be/)([A-Za-z0-9_-]{11})",
+    re.IGNORECASE,
+)
 _TIKTOK_VIDEO_ID_RE = re.compile(r"(?:\[TikTok\]\s*|/(?:video|photo|v|embed/v2)/)(\d{15,22})", re.IGNORECASE)
 _SPACE_NETSCAPE_RE = re.compile(
     r"^(\S+)\s+(TRUE|FALSE)\s+(/\S*)\s+(TRUE|FALSE)\s+(\d+)\s+(\S+)(?:\s+(.*))?$",
@@ -56,6 +60,7 @@ _AGE_OR_AUTH_PATTERNS = (
 )
 
 _DOMESTIC_NO_AUTO_PROXY = ("bilibili.com", "b23.tv", "douyin.com", "iqiyi.com", "qq.com", "youku.com")
+_DENO_DOWNLOAD_ATTEMPTED: bool = False
 
 
 @dataclass
@@ -452,13 +457,94 @@ def prepare_cookie_file(
     return isolated_out
 
 
+def ensure_deno_binary(
+    proxy: str = "",
+    on_log: Optional[LogCallback] = None,
+    token: Optional[CancelToken] = None,
+    paths: AppPaths = PATHS,
+) -> Optional[Path]:
+    """Auto-download `deno.exe` on Windows into `paths.user_bin_dir` if no JS runtime (`deno`/`node`/`bun`) is present."""
+    global _DENO_DOWNLOAD_ATTEMPTED
+    existing = paths.find_binary("deno")
+    if existing and existing.exists():
+        return existing
+    if sys.platform != "win32" or _DENO_DOWNLOAD_ATTEMPTED:
+        return None
+
+    _DENO_DOWNLOAD_ATTEMPTED = True
+    eff_proxy = resolve_effective_proxy(proxy)
+    deno_urls = [
+        "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
+        "https://mirror.ghproxy.com/https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
+    ]
+    dest_dir = paths.user_bin_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_exe = dest_dir / "deno.exe"
+
+    for dl_url in deno_urls:
+        try:
+            if on_log:
+                on_log("[YouTube 运行时] 本地未找到 deno.exe，正在自动下载 YouTube JS 解算组件 (deno.exe)...")
+            with tempfile.TemporaryDirectory(prefix="deno_dl_") as tmp:
+                zip_path = Path(tmp) / "deno.zip"
+                http_client.stream_download_with_resume(
+                    url=dl_url,
+                    dest_file=zip_path,
+                    proxy=eff_proxy,
+                    token=token,
+                    timeout=35,
+                )
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extract("deno.exe", Path(tmp))
+                extracted = Path(tmp) / "deno.exe"
+                if extracted.is_file():
+                    shutil.move(str(extracted), str(dest_exe))
+                    if on_log:
+                        on_log(f"[YouTube 运行时] 已自动安装 deno.exe：{dest_exe}")
+                    return dest_exe
+        except CancelledError:
+            raise
+        except Exception:
+            continue
+    return None
+
+
 def _apply_js_runtime_opts(
     ydl_opts: Dict[str, Any],
     deno_bin: Optional[Path],
+    paths: AppPaths = PATHS,
+    proxy: str = "",
+    target_url: str = "",
+    token: Optional[CancelToken] = None,
     on_log: Optional[LogCallback] = None,
 ) -> None:
-    """YouTube 需要 JS 运行时 + yt-dlp-ejs 才能解出播放地址；缺任何一个都会表现为“登录/机器人验证/无格式”。"""
-    ydl_opts["js_runtimes"] = {"deno": {"path": str(deno_bin)}} if (deno_bin and deno_bin.exists()) else {"deno": {}}
+    """Configure `js_runtimes` (`deno`, `node`, `bun`, or `qjs`) and `remote_components` for YouTube EJS solving."""
+    resolved_deno = deno_bin if (deno_bin and deno_bin.exists()) else paths.find_binary("deno")
+    resolved_node = paths.find_binary("node")
+    resolved_bun = paths.find_binary("bun")
+
+    # If downloading YouTube and neither deno nor node nor bun is available, try auto-installing deno.exe on Windows
+    if (
+        resolved_deno is None
+        and resolved_node is None
+        and resolved_bun is None
+        and _is_youtube_url(target_url)
+    ):
+        resolved_deno = ensure_deno_binary(proxy=proxy, on_log=on_log, token=token, paths=paths)
+
+    if resolved_deno and resolved_deno.exists():
+        ydl_opts["js_runtimes"] = {"deno": {"path": str(resolved_deno)}}
+    elif resolved_node and resolved_node.exists():
+        ydl_opts["js_runtimes"] = {"node": {"path": str(resolved_node)}}
+        if on_log and _is_youtube_url(target_url):
+            on_log(f"[YouTube 运行时] 已启用系统 Node.js 作为 JS 挑战解析引擎：{resolved_node}")
+    elif resolved_bun and resolved_bun.exists():
+        ydl_opts["js_runtimes"] = {"bun": {"path": str(resolved_bun)}}
+    else:
+        ydl_opts["js_runtimes"] = {"deno": {}, "node": {}}
+        if on_log and _is_youtube_url(target_url):
+            on_log("[YouTube 警告] 未找到 deno 或 node，YouTube 部分格式可能受限；程序将自动启用多客户端与备用直链通道。")
+
     try:
         import yt_dlp_ejs  # noqa: F401
         has_ejs = True
@@ -466,10 +552,8 @@ def _apply_js_runtime_opts(
         has_ejs = False
     if not has_ejs:
         ydl_opts["remote_components"] = ["ejs:github"]
-        if on_log:
+        if on_log and _is_youtube_url(target_url):
             on_log("[YouTube] 未找到 yt-dlp-ejs，已允许从 GitHub 获取挑战解析脚本（兜底）")
-    if (deno_bin is None or not deno_bin.exists()) and on_log:
-        on_log("[YouTube 警告] 未找到 deno，YouTube 视频可能无法解析；请把 deno.exe 放入 bin/")
 
 
 def _find_cached_cookie_fallback(paths: AppPaths, target_url: str) -> Optional[Path]:
@@ -506,14 +590,22 @@ def _build_common_ydl_opts(
     if ffmpeg_dir and ffmpeg_dir.exists():
         ydl_opts["ffmpeg_location"] = str(ffmpeg_dir)
 
-    deno_bin = opts.deno_path or paths.find_binary("deno")
-    _apply_js_runtime_opts(ydl_opts, deno_bin, on_log=on_log if _is_youtube_url(target_url) else None)
-
     eff_proxy = resolve_effective_proxy(opts.proxy, target_url=target_url)
     if eff_proxy:
         ydl_opts["proxy"] = eff_proxy
         if on_log and not opts.proxy.strip():
             on_log(f"[网络] 已自动检测并启用系统代理：{eff_proxy}")
+
+    deno_bin = opts.deno_path or paths.find_binary("deno")
+    _apply_js_runtime_opts(
+        ydl_opts,
+        deno_bin,
+        paths=paths,
+        proxy=opts.proxy,
+        target_url=target_url,
+        token=token,
+        on_log=on_log,
+    )
 
     loaded_cookiefile = False
     if opts.cookies_file.strip():
@@ -562,15 +654,17 @@ def _build_common_ydl_opts(
                 ydl_opts["_rookie_cookie_dropped"] = True
                 ydl_opts["_rookie_error_msg"] = msg
 
-            # If browser live extraction failed (e.g. browser running & locking DB), check if a cached cookies.txt exists
+            # If browser live extraction failed (e.g. browser running & locking DB or v20), check if a cached cookies.txt exists
             if not loaded_cookiefile:
                 cached_fb = _find_cached_cookie_fallback(paths, target_url)
                 if cached_fb is not None:
                     prepared_fb = prepare_cookie_file(cached_fb, paths.temp_dir, on_log=None, target_url=target_url)
                     if prepared_fb is not None and prepared_fb.exists():
                         ydl_opts["cookiefile"] = str(prepared_fb)
+                        opts.cookies_file = str(prepared_fb)
                         loaded_cookiefile = True
                         ydl_opts.pop("_rookie_cookie_dropped", None)
+                        ydl_opts.pop("_rookie_error_msg", None)
                         if on_log:
                             on_log(f"[Cookies 自动回退] 浏览器实时提取受限，已自动挂载本地缓存 Cookies：{cached_fb.name}")
         else:
@@ -588,7 +682,20 @@ def _is_tiktok_url(url: str) -> bool:
 
 def _is_youtube_url(url: str) -> bool:
     u = (url or "").lower()
-    return "youtube.com" in u or "youtu.be" in u
+    return "youtube.com" in u or "youtu.be" in u or "youtube-nocookie.com" in u
+
+
+def _extract_youtube_video_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = _YOUTUBE_URL_ID_RE.search(url)
+    if m:
+        return m.group(1)
+    parsed = urllib.parse.urlparse(url)
+    qs_v = urllib.parse.parse_qs(parsed.query).get("v")
+    if qs_v and _YOUTUBE_ID_RE.match(qs_v[0]):
+        return qs_v[0]
+    return None
 
 
 def _extract_tiktok_video_id(url: str, error_text: str = "") -> Optional[str]:
@@ -598,6 +705,140 @@ def _extract_tiktok_video_id(url: str, error_text: str = "") -> Optional[str]:
         m = _TIKTOK_VIDEO_ID_RE.search(text)
         if m:
             return m.group(1)
+    return None
+
+
+def _fallback_youtube_direct(
+    url: str,
+    video_id: Optional[str],
+    proxy: str,
+    on_log: Optional[LogCallback] = None,
+) -> Optional[_DirectMediaFallback]:
+    """Resolve YouTube video metadata and direct audio stream via Piped / Invidious public API cluster
+    when the user's proxy IP triggers YouTube's 'Sign in to confirm you're not a bot' check without cookies.
+    """
+    if url in _DIRECT_MEDIA_CACHE:
+        return _DIRECT_MEDIA_CACHE[url]
+
+    vid = video_id or _extract_youtube_video_id(url)
+    if not vid:
+        return None
+
+    eff_proxy = resolve_effective_proxy(proxy, target_url=url)
+
+    # 1. Try Piped API instances
+    piped_bases = (
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.tokhmi.xyz",
+        "https://pipedapi.moomoo.me",
+        "https://piped-api.garudalinux.org",
+    )
+    if on_log:
+        on_log(f"[YouTube 备用通道 1/2] 正在通过免登录镜像接口解析音频流 (ID: {vid})...")
+
+    for base in piped_bases:
+        try:
+            resp = http_client.fetch_json(f"{base}/streams/{vid}", proxy=eff_proxy, timeout=15)
+            if not isinstance(resp, dict):
+                continue
+            audio_streams = resp.get("audioStreams")
+            if not isinstance(audio_streams, list) or not audio_streams:
+                continue
+            valid_streams = [
+                s for s in audio_streams if isinstance(s, dict) and str(s.get("url") or "").startswith("http")
+            ]
+            if not valid_streams:
+                continue
+            valid_streams.sort(key=lambda s: int(s.get("bitrate") or 0), reverse=True)
+            best = valid_streams[0]
+            stream_url = str(best["url"])
+            mime = str(best.get("mimeType") or "").lower()
+            ext = "m4a" if ("mp4" in mime or "m4a" in mime) else "webm"
+            title = str(resp.get("title") or f"YouTube_{vid}").strip() or f"YouTube_{vid}"
+            uploader = str(resp.get("uploader") or "YouTubeCreator").strip()
+            duration = float(resp.get("duration") or 0.0)
+            media_info = MediaInfo(
+                url=url,
+                id=vid,
+                title=title,
+                uploader=uploader,
+                duration=duration,
+                extractor="YouTubePiped",
+                webpage_url=url,
+            )
+            resolved = _DirectMediaFallback(
+                info=media_info,
+                stream_url=stream_url,
+                ext=ext,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            _DIRECT_MEDIA_CACHE[url] = resolved
+            if on_log:
+                on_log(f"[YouTube 备用通道] 成功解析音频直链：《{title}》 (ID: {vid})")
+            return resolved
+        except Exception:
+            continue
+
+    # 2. Try Invidious API instances with `?local=true` (proxied stream avoids Google IP bot block)
+    invidious_bases = (
+        "https://inv.tux.pizza",
+        "https://invidious.nerdvpn.de",
+        "https://inv.nadeko.net",
+        "https://yewtu.be",
+    )
+    if on_log:
+        on_log(f"[YouTube 备用通道 2/2] 正在尝试 Invidious 节点提取音频流 (ID: {vid})...")
+
+    for base in invidious_bases:
+        try:
+            resp = http_client.fetch_json(f"{base}/api/v1/videos/{vid}?local=true", proxy=eff_proxy, timeout=15)
+            if not isinstance(resp, dict):
+                continue
+            formats = resp.get("adaptiveFormats") or resp.get("formatStreams") or []
+            if not isinstance(formats, list) or not formats:
+                continue
+            audio_candidates = []
+            for f in formats:
+                if not isinstance(f, dict):
+                    continue
+                u = str(f.get("url") or "").strip()
+                if not u:
+                    continue
+                if u.startswith("/"):
+                    u = base + u
+                ftype = str(f.get("type") or "").lower()
+                if "audio" in ftype or "mp4" in ftype:
+                    audio_candidates.append((int(f.get("bitrate") or 0), u, ftype))
+            if not audio_candidates:
+                continue
+            audio_candidates.sort(key=lambda x: x[0], reverse=True)
+            _, stream_url, ftype = audio_candidates[0]
+            ext = "m4a" if "mp4" in ftype else "webm"
+            title = str(resp.get("title") or f"YouTube_{vid}").strip() or f"YouTube_{vid}"
+            uploader = str(resp.get("author") or "YouTubeCreator").strip()
+            duration = float(resp.get("lengthSeconds") or 0.0)
+            media_info = MediaInfo(
+                url=url,
+                id=vid,
+                title=title,
+                uploader=uploader,
+                duration=duration,
+                extractor="YouTubeInvidious",
+                webpage_url=url,
+            )
+            resolved = _DirectMediaFallback(
+                info=media_info,
+                stream_url=stream_url,
+                ext=ext,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            _DIRECT_MEDIA_CACHE[url] = resolved
+            if on_log:
+                on_log(f"[YouTube 备用通道] 成功从 Invidious 节点获取音频流：《{title}》 (ID: {vid})")
+            return resolved
+        except Exception:
+            continue
+
     return None
 
 
@@ -755,16 +996,16 @@ def _run_ydl_extract_with_fallbacks(
                 err_str = str(first_exc)
                 err_lower = err_str.lower()
 
-        # Fallback 2: YouTube multi-client & cookie-free `android_vr` fallback (Fixes yt-dlp#16229 / #15828)
+        # Fallback 2: YouTube multi-client & cookie-free `web_embedded,tv,mweb,web_safari,android_vr,ios` fallback
         if _is_youtube_url(url) and "failed to decrypt with dpapi" not in err_lower and not (
             "could not find" in err_lower and "cookies database" in err_lower
         ):
             had_cookies = "cookiefile" in current_opts or "cookiesfrombrowser" in current_opts
 
-            # 2A: If cookies were used, try cookie-compatible player_clients (`web`, `mweb`, `tv`, `ios`) with relaxed format
+            # 2A: If cookies were used, try cookie-compatible player_clients (`web`, `mweb`, `tv`, `web_safari`, `ios`)
             if had_cookies:
                 if on_log:
-                    on_log("[YouTube 兼容重试 1/2] 正在切换 YouTube 多客户端 (web/mweb/tv) 与复合流模式重试...")
+                    on_log("[YouTube 兼容重试 1/2] 正在切换 YouTube 多客户端 (web/mweb/tv/web_safari) 与复合流模式重试...")
                 yt_cookie_opts = copy.copy(current_opts)
                 if opts.cookies_file.strip():
                     fresh_c = prepare_cookie_file(
@@ -775,7 +1016,9 @@ def _run_ydl_extract_with_fallbacks(
                     )
                     if fresh_c and fresh_c.exists():
                         yt_cookie_opts["cookiefile"] = str(fresh_c)
-                yt_cookie_opts["extractor_args"] = {"youtube": {"player_client": ["web", "mweb", "tv", "ios"]}}
+                yt_cookie_opts["extractor_args"] = {
+                    "youtube": {"player_client": ["web", "mweb", "tv", "web_safari", "ios"]}
+                }
                 if download:
                     yt_cookie_opts["format"] = "bestaudio/best*"
                 try:
@@ -790,13 +1033,15 @@ def _run_ydl_extract_with_fallbacks(
                         yt_c_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
                     first_exc = yt_c_exc
 
-            # 2B: Try cookie-free `android_vr,ios,tv_embedded,web` (bypasses rotated/expired cookies & SABR audio restrictions!)
+            # 2B: Try cookie-free `web_embedded,tv,mweb,web_safari,android_vr,ios`
             if on_log:
-                on_log("[YouTube 兼容重试 2/2] 正在尝试 YouTube 免 Cookie 嵌入式/移动端通道 (android_vr / ios)...")
+                on_log("[YouTube 兼容重试 2/2] 正在尝试 YouTube 免 Cookie 嵌入式/移动端通道 (web_embedded / tv / android_vr / ios)...")
             yt_nocookie_opts = copy.copy(current_opts)
             yt_nocookie_opts.pop("cookiefile", None)
             yt_nocookie_opts.pop("cookiesfrombrowser", None)
-            yt_nocookie_opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "ios", "tv_embedded", "web"]}}
+            yt_nocookie_opts["extractor_args"] = {
+                "youtube": {"player_client": ["web_embedded", "tv", "mweb", "web_safari", "android_vr", "ios"]}
+            }
             if download:
                 yt_nocookie_opts["format"] = "bestaudio/best*"
             try:
@@ -912,7 +1157,10 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
         if rookie_err:
             msg = f"{rookie_err}（匿名重试后该视频仍要求登录）"
         elif getattr(exc, "cookies_dropped", False):
-            msg = "浏览器 Cookies 读取失败，已匿名重试，但该视频需要登录。请改用 Firefox、「登录并获取 Cookies」或导入 cookies.txt。"
+            msg = (
+                "当前代理节点 IP 被 YouTube 要求验证登录，且 Edge 启用了 v20 (App-Bound) 加密无法在零弹窗模式下后台解密。"
+                "请打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」登录一次（或复制 Cookie 点击「📋 从剪贴板导入」/ 改用 Firefox）。"
+            )
         elif has_cookies:
             msg = "已使用你导入的 Cookies，但站点仍要求登录：Cookies 可能已过期/被轮换，或不属于该站点账号。请重新导出（YouTube 请用无痕窗口导出并立刻关闭）。"
         else:
@@ -1050,6 +1298,11 @@ def extract_playlist_or_info(
             direct_fb = _fallback_tiktok_direct(url, video_id=vid, proxy=opts.proxy, on_log=on_log)
             if direct_fb is not None:
                 return [direct_fb.info]
+        if _is_youtube_url(url) and not opts.allow_playlist:
+            yt_vid = _extract_youtube_video_id(url)
+            yt_fb = _fallback_youtube_direct(url, video_id=yt_vid, proxy=opts.proxy, on_log=on_log)
+            if yt_fb is not None:
+                return [yt_fb.info]
         raise _translate_ydl_exception(exc, has_cookies=has_cookies) from exc
 
     if token:
@@ -1088,7 +1341,7 @@ def _download_direct_media_fallback(
     dest_file = workdir / f"{fb.info.id}.{fb.ext}"
     eff_proxy = resolve_effective_proxy(proxy, target_url=fb.info.url)
     if on_log:
-        on_log(f"[TikTok 备用通道] 开始直接下载音视频流：{dest_file.name}")
+        on_log(f"[备用通道] 开始直接下载音视频流：{dest_file.name}")
 
     def _on_chunk(cur: int, total: int) -> None:
         if on_progress and total > 0:
@@ -1198,6 +1451,19 @@ def download_audio(
                     on_log=on_log,
                     token=token,
                 )
+        if _is_youtube_url(url):
+            yt_vid = _extract_youtube_video_id(url)
+            yt_fb = _fallback_youtube_direct(url, video_id=yt_vid, proxy=opts.proxy, on_log=on_log)
+            if yt_fb is not None:
+                _DIRECT_MEDIA_CACHE.pop(url, None)
+                return _download_direct_media_fallback(
+                    fb=yt_fb,
+                    workdir=workdir,
+                    proxy=opts.proxy,
+                    on_progress=on_progress,
+                    on_log=on_log,
+                    token=token,
+                )
         raise _translate_ydl_exception(exc, has_cookies=has_cookies) from exc
 
     if token:
@@ -1231,7 +1497,8 @@ def diagnose_youtube_runtime(paths: AppPaths = PATHS) -> Dict[str, str]:
     yt = _import_yt_dlp(paths)
     report: Dict[str, str] = {"yt-dlp": str(getattr(yt.version, "__version__", "?"))}
     deno = paths.find_binary("deno")
-    report["deno"] = str(deno) if deno else "未找到"
+    node = paths.find_binary("node")
+    report["deno"] = str(deno) if deno else (f"未找到 (已启用 node: {node})" if node else "未找到 (首次解析 YouTube 时自动下载)")
     try:
         import yt_dlp_ejs
         report["yt-dlp-ejs"] = str(getattr(yt_dlp_ejs, "version", "?"))

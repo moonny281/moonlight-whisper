@@ -1,9 +1,10 @@
-"""Unit tests for built-in `rookie-cookies` (teng-lin/rookie-cookies) integration."""
+"""Unit tests for built-in `rookie-cookies` (teng-lin/rookie-cookies) integration, locked-DB snapshot recovery, and YouTube direct fallback."""
 
 from __future__ import annotations
 
 import contextlib
 import http.cookiejar
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -35,18 +36,15 @@ def _patch_sys_module(name: str, fake_mod: Any) -> Iterator[None]:
 
 class TestRookieIntegration(unittest.TestCase):
     def test_no_browser_window_spawn_defaults_and_migration(self) -> None:
-        """Regression test for v1.2.9: downloading must NEVER spawn a new Edge/Chrome window by default."""
-        # 1. Default Config and DownloadOptions must use app_bound="disabled"
+        """Regression test for v1.2.9+: downloading must NEVER spawn a new Edge/Chrome window by default."""
         cfg = Config()
         self.assertEqual(cfg.cookies_app_bound, "disabled")
         dl_opts = DownloadOptions()
         self.assertEqual(dl_opts.cookies_app_bound, "disabled")
 
-        # 2. Existing config.json with old default "injection_only" must auto-migrate to "disabled"
         migrated_cfg = Config.from_dict({"version": 1, "cookies_from_browser": "edge", "cookies_app_bound": "injection_only"})
         self.assertEqual(migrated_cfg.cookies_app_bound, "disabled")
 
-        # 3. refresh_managed_cookies must NOT spawn ManagedBrowser by default
         with tempfile.TemporaryDirectory() as tmp:
             paths = AppPaths(app_dir=Path(tmp))
             with patch("app.core.browser_cookies.ManagedBrowser") as mock_mb:
@@ -75,7 +73,7 @@ class TestRookieIntegration(unittest.TestCase):
                     "domain": ".youtube.com",
                     "path": "/",
                     "secure": True,
-                    "expires": 0,  # session cookie should get positive future timestamp
+                    "expires": 0,
                     "name": "SAPISID",
                     "value": "sapi_123",
                     "http_only": False,
@@ -114,7 +112,6 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertEqual(extract_calls[0]["domains"], ["youtube.com", "google.com"])
             self.assertEqual(extract_calls[0]["app_bound"], "disabled")
 
-            # Verify MozillaCookieJar loads the file cleanly
             jar = http.cookiejar.MozillaCookieJar(str(cookie_file))
             jar.load(ignore_discard=True, ignore_expires=True)
             self.assertEqual(len(jar), 2)
@@ -164,7 +161,9 @@ class TestRookieIntegration(unittest.TestCase):
 
         fake_rc.extract = _empty_extract  # type: ignore[attr-defined]
 
-        with tempfile.TemporaryDirectory() as tmp, _patch_sys_module("rookie_cookies", fake_rc):
+        with tempfile.TemporaryDirectory() as tmp, _patch_sys_module("rookie_cookies", fake_rc), patch(
+            "app.core.rookie_bridge._copy_locked_chromium_cookies_db", return_value=(None, None)
+        ):
             out = rookie_bridge.extract_to_netscape_file(
                 browser="edge",
                 target_url="https://www.bilibili.com/video/BV1",
@@ -172,7 +171,6 @@ class TestRookieIntegration(unittest.TestCase):
                 token=CancelToken(),
             )
             self.assertIsNone(out)
-            # Must only call once with "disabled", NEVER spawning "injection_only" or "allow_elevated_fallback"
             self.assertEqual(calls, ["disabled"])
 
         class FakeRookieEngineError(RuntimeError):
@@ -194,70 +192,106 @@ class TestRookieIntegration(unittest.TestCase):
                 )
             self.assertIn("App-Bound (v20)", ctx.exception.user_message)
 
-    def test_edge_locked_db_with_cancel_token_falls_back_cleanly_for_tiktok(self) -> None:
-        """Regression test for v1.2.8+: when `token=CancelToken()` is passed and Edge DB is share-locked (OS error 32),
-        it must NOT raise `TypeError: 'bool' object is not callable`, and TikTok download must still succeed."""
-        fake_rc = type(sys)("rookie_cookies")
-
-        class FakeCancellationHandle:
-            def cancel(self):
-                pass
-
-        class FakeShareLockedError(RuntimeError):
-            kind = "engine"
-            code = "source_inspection_failed"
-            stop_reason = None
-
-        def _locked_extract(**kw):
-            raise FakeShareLockedError("Windows browser database is share-locked at Default/Network/Cookies (OS error 32)")
-
-        fake_rc.CancellationHandle = FakeCancellationHandle  # type: ignore[attr-defined]
-        fake_rc.extract = _locked_extract  # type: ignore[attr-defined]
-
-        class BrokenYoutubeDL:
-            def __init__(self, opts):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-            def extract_info(self, url, download=False):
-                raise RuntimeError("ERROR: [TikTok] 7696957163670998294: Unexpected response from webpage request")
-
-        fake_ytdlp = type(sys)("yt_dlp")
-        fake_ytdlp.YoutubeDL = BrokenYoutubeDL  # type: ignore[attr-defined]
-
-        fake_tikwm_resp = {
-            "code": 0,
-            "data": {
-                "id": "7696957163670998294",
-                "title": "TikTok Edge 锁库回退测试",
-                "duration": 15.0,
-                "play": "https://cdn.example.com/7696957163670998294.mp4",
-                "author": {"nickname": "tester"},
-            },
-        }
-
-        with tempfile.TemporaryDirectory() as tmp, _patch_sys_module("rookie_cookies", fake_rc), _patch_sys_module(
-            "yt_dlp", fake_ytdlp
-        ), patch("app.core.http_client.fetch_json", return_value=fake_tikwm_resp):
-            downloader._DIRECT_MEDIA_CACHE.clear()
-            paths = AppPaths(app_dir=Path(tmp))
-            dl_opts = DownloadOptions(cookies_from_browser="edge")
-            logs: list[str] = []
-            info = downloader.fetch_info(
-                "https://vt.tiktok.com/ZSgwwQnPH/",
-                dl_opts,
-                token=CancelToken(),
-                on_log=logs.append,
-                paths=paths,
+    def test_edge_locked_db_snapshot_recovery_and_youtube_direct_fallback(self) -> None:
+        """Regression test for v1.3.0:
+        1) When `rookie_cookies.extract` fails with OS error 32, `_copy_locked_chromium_cookies_db` + SQLite reader recovers cookies;
+        2) When YouTube still blocks with 'Sign in to confirm you're not a bot', `_fallback_youtube_direct` resolves audio via Piped/Invidious."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Part A: Verify SQLite cookie snapshot recovery when OS error 32 occurs
+            snap_db = Path(tmp) / "Cookies.sqlite"
+            conn = sqlite3.connect(str(snap_db))
+            conn.execute(
+                "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, is_secure INTEGER, is_httponly INTEGER, expires_utc INTEGER)"
             )
-            self.assertEqual(info.id, "7696957163670998294")
-            self.assertEqual(info.title, "TikTok Edge 锁库回退测试")
-            self.assertTrue(any("OS error 32" in l for l in logs))
+            conn.execute(
+                "INSERT INTO cookies VALUES ('.youtube.com', 'SAPISID', 'sapi_from_snap', X'', '/', 1, 0, 13450000000000000)"
+            )
+            conn.commit()
+            conn.close()
+
+            fake_rc = type(sys)("rookie_cookies")
+
+            def _locked_extract(**kw):
+                raise RuntimeError("Windows browser database is share-locked at Default/Network/Cookies (OS error 32)")
+
+            fake_rc.extract = _locked_extract  # type: ignore[attr-defined]
+
+            with _patch_sys_module("rookie_cookies", fake_rc), patch(
+                "app.core.rookie_bridge._copy_locked_chromium_cookies_db", return_value=(snap_db, None)
+            ):
+                recovered_file = rookie_bridge.extract_to_netscape_file(
+                    browser="edge",
+                    target_url="https://www.youtube.com/watch?v=fyuaW6Uf-S8&t=17s",
+                    temp_dir=Path(tmp),
+                    token=CancelToken(),
+                )
+                self.assertIsNotNone(recovered_file)
+                self.assertIn("sapi_from_snap", recovered_file.read_text(encoding="utf-8"))
+
+            # Part B: Verify YouTube direct fallback when yt-dlp raises 'Sign in to confirm you're not a bot'
+            class BotBlockedYoutubeDL:
+                def __init__(self, opts):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def extract_info(self, url, download=False):
+                    raise RuntimeError("ERROR: [youtube] fyuaW6Uf-S8: Sign in to confirm you’re not a bot.")
+
+            fake_ytdlp = type(sys)("yt_dlp")
+            fake_ytdlp.YoutubeDL = BotBlockedYoutubeDL  # type: ignore[attr-defined]
+
+            fake_piped_resp = {
+                "title": "YouTube 备用通道成功测试视频",
+                "uploader": "YTCreator",
+                "duration": 210.0,
+                "audioStreams": [
+                    {
+                        "url": "https://pipedproxy.example.com/audio_fyuaW6Uf-S8.m4a",
+                        "mimeType": "audio/mp4",
+                        "bitrate": 128000,
+                    }
+                ],
+            }
+
+            def _fake_dl_stream(url, dest_file, proxy="", expected_sha256="", on_chunk_progress=None, token=None, timeout=60, expected_size=0):
+                dest_file.write_bytes(b"FAKE_M4A_AUDIO_STREAM")
+                if on_chunk_progress:
+                    on_chunk_progress(100, 100)
+                return dest_file
+
+            with _patch_sys_module("rookie_cookies", fake_rc), _patch_sys_module("yt_dlp", fake_ytdlp), patch(
+                "app.core.rookie_bridge._copy_locked_chromium_cookies_db", return_value=(None, None)
+            ), patch("app.core.http_client.fetch_json", return_value=fake_piped_resp), patch(
+                "app.core.http_client.stream_download_with_resume", side_effect=_fake_dl_stream
+            ):
+                downloader._DIRECT_MEDIA_CACHE.clear()
+                paths = AppPaths(app_dir=Path(tmp))
+                dl_opts = DownloadOptions(cookies_from_browser="edge")
+                logs: list[str] = []
+                yt_url = "https://www.youtube.com/watch?v=fyuaW6Uf-S8&t=17s"
+                info = downloader.fetch_info(
+                    yt_url,
+                    dl_opts,
+                    token=CancelToken(),
+                    on_log=logs.append,
+                    paths=paths,
+                )
+                self.assertEqual(info.id, "fyuaW6Uf-S8")
+                self.assertEqual(info.title, "YouTube 备用通道成功测试视频")
+
+                audio_path = downloader.download_audio(
+                    yt_url,
+                    workdir=Path(tmp) / "work_yt",
+                    opts=dl_opts,
+                    paths=paths,
+                )
+                self.assertTrue(audio_path.exists())
+                self.assertEqual(audio_path.name, "fyuaW6Uf-S8.m4a")
 
     def test_profile_discovery_parsing(self) -> None:
         fake_rc = type(sys)("rookie_cookies")
