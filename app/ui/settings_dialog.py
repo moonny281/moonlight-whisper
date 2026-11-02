@@ -1,9 +1,11 @@
-"""Windows 11 Mica-styled Settings Dialog (using non-overlapping Mica section cards)."""
+"""Windows 11 Mica-styled Settings Dialog (with managed browser CDP login, Cookie health check, and Firefox/Profile support)."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -12,6 +14,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -26,14 +29,16 @@ from PySide6.QtWidgets import (
 from app.config import Config, LlmConfig
 from app.core import downloader, summarizer
 from app.core.errors import ErrorInfo
+from app.core.site_cookies import inspect_netscape, netscape_to_header, probe_bilibili_login, resolve_site
 from app.paths import PATHS, AppPaths
+from app.ui.cookie_login_dialog import CookieLoginDialog
 from app.ui.theme import apply_win11_mica_window_attributes, resolve_effective_theme
 from app.ui.widgets import make_mica_section
 from app.workers import YtDlpUpdateWorker
 
 
 class SettingsDialog(QDialog):
-    """Comprehensive Mica-styled settings dialog with zero title/row overlap."""
+    """Comprehensive Mica-styled settings dialog with managed browser CDP login, Cookie health check, and zero row overlap."""
 
     def __init__(
         self,
@@ -48,7 +53,7 @@ class SettingsDialog(QDialog):
         self._ytdlp_worker: Optional[YtDlpUpdateWorker] = None
 
         self.setWindowTitle("偏好设置 - Moonlight Whisper")
-        self.setMinimumSize(680, 560)
+        self.setMinimumSize(720, 620)
         self._build_ui()
         self._load_from_config()
         if 0 <= initial_tab < self.tabs.count():
@@ -93,12 +98,15 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(12)
 
-        proxy_card, proxy_box = make_mica_section("代理与国内镜像源", "支持 HTTP / HTTPS / SOCKS5 代理及国内高速镜像")
+        proxy_card, proxy_box = make_mica_section(
+            "代理与国内镜像源",
+            "支持 HTTP / HTTPS / SOCKS5 代理；留空时自动检测系统代理（自动探测到的系统代理不接管 B 站等国内站点）",
+        )
         proxy_form = QFormLayout()
         self._configure_form(proxy_form)
 
         self.edit_proxy = QLineEdit()
-        self.edit_proxy.setPlaceholderText("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（留空直连）")
+        self.edit_proxy.setPlaceholderText("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:10808（留空自动检测系统代理）")
         proxy_form.addRow("代理地址：", self.edit_proxy)
 
         self.chk_hf_mirror = QCheckBox("启用 HuggingFace 国内镜像 (https://hf-mirror.com)")
@@ -112,35 +120,70 @@ class SettingsDialog(QDialog):
         proxy_box.addLayout(proxy_form)
         layout.addWidget(proxy_card)
 
-        cookie_card, cookie_box = make_mica_section("站点登录与 Cookies", "用于需要登录、会员或年龄验证的在线视频")
+        cookie_card, cookie_box = make_mica_section(
+            "站点登录与 Cookies",
+            "提示：Chrome / Edge (127+) 启用了 App-Bound 加密，无法直接从日常浏览器读取。\n"
+            "• 推荐使用「登录并获取 Cookies…」（专用隔离浏览器）或改用 Firefox（推荐）；\n"
+            "• 手动导出 YouTube Cookies 时，请在「无痕窗口」登录并导出后立即关闭该无痕窗口，否则会被轮换失效。",
+        )
         cookie_form = QFormLayout()
         self._configure_form(cookie_form)
 
         cookie_file_row = QHBoxLayout()
+        cookie_file_row.setSpacing(6)
         self.edit_cookies_file = QLineEdit()
-        self.edit_cookies_file.setPlaceholderText("Netscape 格式 cookies.txt 路径（留空则不使用）")
-        btn_browse_cookie = QPushButton("浏览...")
+        self.edit_cookies_file.setPlaceholderText("支持 Netscape cookies.txt / JSON（可使用下方按钮直接登录导出或检测有效性）")
+        btn_paste_cookie = QPushButton("📋 从剪贴板导入")
+        btn_paste_cookie.setToolTip("将剪贴板中的 Netscape / JSON Cookie 内容转换并保存为标准 cookies.txt")
+        btn_paste_cookie.clicked.connect(self._import_cookies_from_clipboard)
+        btn_browse_cookie = QPushButton("浏览文件...")
         btn_browse_cookie.clicked.connect(self._browse_cookies_file)
+        btn_clear_cookie = QPushButton("清除")
+        btn_clear_cookie.setObjectName("GhostButton")
+        btn_clear_cookie.clicked.connect(self._clear_cookies_file)
+
         cookie_file_row.addWidget(self.edit_cookies_file, 1)
+        cookie_file_row.addWidget(btn_paste_cookie)
         cookie_file_row.addWidget(btn_browse_cookie)
+        cookie_file_row.addWidget(btn_clear_cookie)
         cookie_form.addRow("Cookies 文件：", cookie_file_row)
+
+        cookie_action_row = QHBoxLayout()
+        cookie_action_row.setSpacing(8)
+        self.btn_login_cookie = QPushButton("登录并获取 Cookies…")
+        self.btn_login_cookie.setObjectName("PrimaryButton")
+        self.btn_login_cookie.clicked.connect(self._open_cookie_login)
+        self.btn_check_cookie = QPushButton("检测 Cookies 有效性")
+        self.btn_check_cookie.clicked.connect(self._check_cookies)
+        cookie_action_row.addWidget(self.btn_login_cookie)
+        cookie_action_row.addWidget(self.btn_check_cookie)
+        cookie_action_row.addStretch(1)
+        cookie_form.addRow("快捷工具：", cookie_action_row)
 
         self.combo_browser_cookies = QComboBox()
         self.combo_browser_cookies.addItem("不从浏览器读取", "")
-        self.combo_browser_cookies.addItem("Chrome", "chrome")
-        self.combo_browser_cookies.addItem("Edge", "edge")
-        self.combo_browser_cookies.addItem("Firefox", "firefox")
+        self.combo_browser_cookies.addItem("Firefox（推荐）", "firefox")
+        self.combo_browser_cookies.addItem("Chrome（127+ 通常无法读取）", "chrome")
+        self.combo_browser_cookies.addItem("Edge（较新版本可能无法读取）", "edge")
         cookie_form.addRow("从浏览器读取：", self.combo_browser_cookies)
+
+        self.edit_browser_profile = QLineEdit()
+        self.edit_browser_profile.setPlaceholderText("配置文件名，如 Default / Profile 1；Firefox 留空自动选择")
+        cookie_form.addRow("浏览器配置：", self.edit_browser_profile)
+
         cookie_box.addLayout(cookie_form)
         layout.addWidget(cookie_card)
 
-        ytdlp_card, ytdlp_box = make_mica_section("yt-dlp 下载引擎维护")
+        ytdlp_card, ytdlp_box = make_mica_section("yt-dlp 下载引擎与 YouTube 运行时维护")
         ytdlp_row = QHBoxLayout()
         self.lbl_ytdlp_ver = QLabel(f"当前版本：{downloader.get_yt_dlp_version(self.paths)}")
+        self.btn_diagnose_ytdlp = QPushButton("诊断 YouTube 运行环境")
+        self.btn_diagnose_ytdlp.clicked.connect(self._show_youtube_diagnosis)
         self.btn_update_ytdlp = QPushButton("一键热更新 yt-dlp")
         self.btn_update_ytdlp.clicked.connect(self._start_update_ytdlp)
         ytdlp_row.addWidget(self.lbl_ytdlp_ver)
         ytdlp_row.addStretch(1)
+        ytdlp_row.addWidget(self.btn_diagnose_ytdlp)
         ytdlp_row.addWidget(self.btn_update_ytdlp)
         ytdlp_box.addLayout(ytdlp_row)
         layout.addWidget(ytdlp_card)
@@ -292,15 +335,103 @@ class SettingsDialog(QDialog):
         if folder:
             edit.setText(folder)
 
+    def _clear_cookies_file(self) -> None:
+        self.edit_cookies_file.clear()
+        self.cfg.managed_cookie_site = ""
+
+    def _open_cookie_login(self) -> None:
+        dlg = CookieLoginDialog(self.paths, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.exported_path:
+            self.edit_cookies_file.setText(dlg.exported_path)
+            self.cfg.managed_cookie_site = dlg.exported_site_key
+            self.combo_browser_cookies.setCurrentIndex(0)
+
+    def _check_cookies(self) -> None:
+        raw_path = self.edit_cookies_file.text().strip()
+        if not raw_path:
+            QMessageBox.warning(self, "检测 Cookies", "请先选择或导入 Cookies 文件。")
+            return
+        url, ok = QInputDialog.getText(self, "检测 Cookies", "输入一个需要登录才能看的视频链接：")
+        if not ok or not url.strip():
+            return
+        target_url = url.strip()
+        logs: list[str] = []
+        prepared = downloader.prepare_cookie_file(
+            Path(raw_path).expanduser(),
+            self.paths.temp_dir,
+            on_log=logs.append,
+            target_url=target_url,
+        )
+        if prepared is None:
+            QMessageBox.warning(self, "检测结果", "\n".join(logs) or "Cookies 文件无法解析")
+            return
+        report = inspect_netscape(prepared, target_url)
+        msg = report.summary()
+        site = resolve_site(target_url)
+        if site and site.key == "bilibili" and report.ok:
+            hdr = netscape_to_header(prepared, target_url)
+            bili_ok = probe_bilibili_login(hdr, proxy=downloader.resolve_effective_proxy(self.edit_proxy.text(), target_url))
+            if bili_ok is True:
+                msg += "\n\n[B 站联网探测] 登录态有效（isLogin=True）！"
+            elif bili_ok is False:
+                msg += "\n\n[B 站联网探测] 服务端返回未登录（isLogin=False），SESSDATA 可能已失效，请重新登录导出。"
+        QMessageBox.information(self, "检测结果", msg)
+
+    def _show_youtube_diagnosis(self) -> None:
+        diag = downloader.diagnose_youtube_runtime(self.paths)
+        lines = [f"• {k}：{v}" for k, v in diag.items()]
+        QMessageBox.information(self, "YouTube 运行时诊断", "\n".join(lines))
+
+    def _import_cookies_from_clipboard(self) -> None:
+        cb = QGuiApplication.clipboard()
+        clip_text = cb.text().strip() if cb is not None else ""
+        if not clip_text:
+            QMessageBox.warning(
+                self,
+                "剪贴板为空",
+                "当前剪贴板中没有文本内容。\n"
+                "请先在浏览器中使用 Get cookies.txt LOCALLY 或 Cookie-Editor 插件复制 Cookies。",
+            )
+            return
+        target_url = ""
+        if not clip_text.startswith(("[", "{")) and "\t" not in clip_text:
+            url_in, ok = QInputDialog.getText(
+                self,
+                "绑定目标站点域名",
+                "检测到剪贴板为原始 Cookie 请求头，请输入对应的视频链接以绑定站点域名：",
+            )
+            if not ok or not url_in.strip():
+                return
+            target_url = url_in.strip()
+        try:
+            saved_path, count, sites = downloader.import_cookies_from_text(
+                clip_text,
+                paths=self.paths,
+                target_url=target_url,
+            )
+            self.edit_cookies_file.setText(str(saved_path))
+            self.combo_browser_cookies.setCurrentIndex(0)
+            sites_desc = f"\n识别到的目标站点：{', '.join(sites)}" if sites else ""
+            QMessageBox.information(
+                self,
+                "Cookies 导入成功",
+                f"已成功从剪贴板解析并转换 {count} 条有效 Cookie 记录！{sites_desc}\n\n"
+                f"已自动保存至：\n{saved_path}",
+            )
+        except Exception as exc:
+            err = ErrorInfo.from_exception(exc)
+            QMessageBox.warning(self, "Cookies 导入失败", err.user_message)
+
     def _browse_cookies_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择 Netscape 格式 cookies.txt 文件",
+            "选择 Cookies 文件 (支持 Netscape .txt 或 JSON)",
             "",
-            "Text Files (*.txt);;All Files (*)",
+            "Cookies Files (*.txt *.json);;All Files (*)",
         )
         if file_path:
             self.edit_cookies_file.setText(file_path)
+            self.combo_browser_cookies.setCurrentIndex(0)
 
     def _load_from_config(self) -> None:
         self.edit_proxy.setText(self.cfg.proxy)
@@ -314,6 +445,7 @@ class SettingsDialog(QDialog):
         idx_browser = self.combo_browser_cookies.findData(self.cfg.cookies_from_browser)
         if idx_browser >= 0:
             self.combo_browser_cookies.setCurrentIndex(idx_browser)
+        self.edit_browser_profile.setText(self.cfg.cookies_browser_profile)
 
         self.chk_allow_playlist.setChecked(self.cfg.allow_playlist)
         self.chk_vad.setChecked(self.cfg.vad)
@@ -358,7 +490,7 @@ class SettingsDialog(QDialog):
         self._ytdlp_worker = None
         self.btn_update_ytdlp.setEnabled(True)
         self.lbl_ytdlp_ver.setText(f"当前版本：{new_ver} (已更新)")
-        QMessageBox.information(self, "更新成功", f"yt-dlp 已成功更新至版本 {new_ver}！")
+        QMessageBox.information(self, "更新成功", f"yt-dlp 与 YouTube EJS 脚本已成功更新至版本 {new_ver}！")
 
     def _on_ytdlp_failed(self, err: ErrorInfo) -> None:
         self._ytdlp_worker = None
@@ -395,6 +527,7 @@ class SettingsDialog(QDialog):
         self.cfg.pypi_mirror = str(self.combo_pypi.currentData() or "tuna")
         self.cfg.cookies_file = self.edit_cookies_file.text().strip()
         self.cfg.cookies_from_browser = str(self.combo_browser_cookies.currentData() or "")
+        self.cfg.cookies_browser_profile = self.edit_browser_profile.text().strip()
 
         self.cfg.allow_playlist = self.chk_allow_playlist.isChecked()
         self.cfg.vad = self.chk_vad.isChecked()

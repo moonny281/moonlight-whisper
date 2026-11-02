@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.config import Config
-from app.core import audio, downloader, gpu_runtime, md_writer, model_manager, summarizer, transcriber
+from app.core import audio, browser_cookies, downloader, gpu_runtime, md_writer, model_manager, summarizer, transcriber
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions, MediaInfo
 from app.core.errors import CancelledError, MoonlightError, TranscribeError
@@ -127,9 +127,15 @@ def run(
                 proxy=cfg.proxy,
                 cookies_file=cfg.cookies_file,
                 cookies_from_browser=cfg.cookies_from_browser,
+                cookies_browser_profile=cfg.cookies_browser_profile,
                 allow_playlist=False,
                 ffmpeg_dir=paths.bin_dir,
             )
+            if cfg.managed_cookie_site:
+                refreshed = browser_cookies.refresh_managed_cookies(cfg.managed_cookie_site, paths)
+                if refreshed:
+                    dl_opts.cookies_file = str(refreshed)
+
             _emit_stage("获取视频信息")
             _emit_log(f"正在解析链接元数据：{job.source}")
             info = downloader.fetch_info(
@@ -348,4 +354,5 @@ def run(
         _emit_log("任务已取消，正在清理临时文件...")
         raise
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if workdir.exists():
+            shutil.rmtree(workdir, ignore_errors=True)

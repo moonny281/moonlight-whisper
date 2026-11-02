@@ -6,7 +6,10 @@ av>=11.0.0,<17.0.0
 onnxruntime>=1.17.0,<2.0.0
 huggingface_hub>=0.23.0,<1.0.0
 tokenizers>=0.19.0,<1.0.0
-yt-dlp>=2025.1.15
+# [default] 会同时安装 yt-dlp-ejs（YouTube JS 挑战解析脚本），且版本由 yt-dlp 精确锁定
+yt-dlp[default]>=2025.11.12
+# Windows 浏览器 Cookie AES-GCM 解密与 HLS AES-128 解密依赖
+pycryptodomex>=3.20.0
 # TikTok / Instagram 等站点要求 TLS/JA3 浏览器指纹伪装 (impersonation)，锁定 <=0.16.0 规避 yt-dlp#17604/#17942
 curl_cffi>=0.7.0,<=0.16.0
 certifi>=2023.5.7

@@ -58,6 +58,8 @@ class Config:
     proxy: str = ""
     cookies_file: str = ""
     cookies_from_browser: str = ""
+    cookies_browser_profile: str = ""
+    managed_cookie_site: str = ""
     hf_mirror: bool = True
     pypi_mirror: str = "tuna"      # "tuna" | "aliyun" | "official"
     filename_template: str = "{title}"
@@ -140,6 +142,8 @@ class Config:
             proxy=_str("proxy", defaults.proxy).strip(),
             cookies_file=_str("cookies_file", defaults.cookies_file).strip(),
             cookies_from_browser=_str("cookies_from_browser", defaults.cookies_from_browser).strip(),
+            cookies_browser_profile=_str("cookies_browser_profile", defaults.cookies_browser_profile).strip(),
+            managed_cookie_site=_str("managed_cookie_site", defaults.managed_cookie_site).strip(),
             hf_mirror=bool(data.get("hf_mirror", defaults.hf_mirror)),
             pypi_mirror=pypi_mirror,
             filename_template=filename_template,

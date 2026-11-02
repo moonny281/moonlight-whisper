@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
-from pathlib import Path
 from typing import List
 
 from app.config import Config
@@ -39,6 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playlist", action="store_true", help="允许展开播放列表 / 多 P 视频")
     parser.add_argument("--no-vad", action="store_true", help="关闭 VAD 静音过滤")
     parser.add_argument("--proxy", help="HTTP/SOCKS5 代理地址")
+    parser.add_argument("--cookies", help="Cookies 文件（Netscape / JSON / 原始 Cookie 头）")
+    parser.add_argument(
+        "--cookies-from-browser",
+        choices=["firefox", "chrome", "edge"],
+        help="从浏览器读取 Cookies（Chromium 系新版通常失败）",
+    )
+    parser.add_argument("--cookies-browser-profile", help="浏览器配置文件名（如 Default / Profile 1）")
+    parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs 诊断信息后退出")
     parser.add_argument("--detect-gpu", action="store_true", help="仅检测当前机器的 NVIDIA GPU 与 CUDA 运行库状态")
     parser.add_argument("--install-gpu-runtime", action="store_true", help="在线下载并安装 CUDA 12 运行库")
     return parser
@@ -72,9 +79,21 @@ def main(argv: List[str] | None = None) -> int:
         cfg.vad = False
     if args.proxy is not None:
         cfg.proxy = args.proxy
+    if args.cookies:
+        cfg.cookies_file = args.cookies
+    if args.cookies_from_browser:
+        cfg.cookies_from_browser = args.cookies_from_browser
+    if args.cookies_browser_profile:
+        cfg.cookies_browser_profile = args.cookies_browser_profile
 
     cfg.apply_to_paths(PATHS)
     PATHS.ensure_runtime_dirs()
+
+    if args.diagnose:
+        diag = downloader.diagnose_youtube_runtime(PATHS)
+        for k, v in diag.items():
+            print(f"{k}: {v}")
+        return 0
 
     token = CancelToken()
 
@@ -117,6 +136,7 @@ def main(argv: List[str] | None = None) -> int:
         proxy=cfg.proxy,
         cookies_file=cfg.cookies_file,
         cookies_from_browser=cfg.cookies_from_browser,
+        cookies_browser_profile=cfg.cookies_browser_profile,
         allow_playlist=cfg.allow_playlist,
         ffmpeg_dir=PATHS.bin_dir,
     )

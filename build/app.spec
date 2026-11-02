@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller onedir spec file for Moonlight Whisper (with Qt plugin pruning, curl_cffi TLS impersonation & pure-Python version resource)."""
+"""PyInstaller onedir spec file for Moonlight Whisper (with Qt plugin pruning, yt_dlp_ejs, Cryptodome, curl_cffi & pure-Python version resource)."""
 
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ block_cipher = None
 project_root = Path(SPECPATH).resolve().parent
 
 # Generate Windows file_version_info.txt in pure Python (UTF-8 without BOM)
-ver_str = os.environ.get("APP_VERSION", "1.2.3").strip() or "1.2.3"
+ver_str = os.environ.get("APP_VERSION", "1.2.5").strip() or "1.2.5"
 ver_parts = (ver_str.split(".") + ["0", "0", "0", "0"])[:4]
 ver_nums = tuple(int(x) if x.isdigit() else 0 for x in ver_parts)
 version_file = project_root / "build" / "file_version_info.txt"
@@ -53,6 +53,8 @@ datas = [
 binaries = []
 hiddenimports = [
     "yt_dlp",
+    "yt_dlp_ejs",
+    "Cryptodome",
     "curl_cffi",
     "cffi",
     "_cffi_backend",
@@ -80,6 +82,8 @@ for pkg in (
     "huggingface_hub",
     "opencc",
     "yt_dlp",
+    "yt_dlp_ejs",
+    "Cryptodome",
     "curl_cffi",
     "certifi",
 ):
@@ -88,8 +92,10 @@ for pkg in (
         datas.extend(pkg_datas)
         binaries.extend(pkg_bins)
         hiddenimports.extend(pkg_hidden)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[spec] collect_all({pkg}) 失败: {exc}")
+        if pkg in ("yt_dlp", "yt_dlp_ejs", "faster_whisper", "ctranslate2"):
+            raise
 
 a = Analysis(
     [str(project_root / "app" / "main.py")],

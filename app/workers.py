@@ -127,6 +127,7 @@ class PlaylistExpandWorker(QThread):
             proxy=self.cfg.proxy,
             cookies_file=self.cfg.cookies_file,
             cookies_from_browser=self.cfg.cookies_from_browser,
+            cookies_browser_profile=self.cfg.cookies_browser_profile,
             allow_playlist=self.cfg.allow_playlist,
             ffmpeg_dir=self.paths.bin_dir,
         )
@@ -143,6 +144,7 @@ class PlaylistExpandWorker(QThread):
                         src,
                         dl_opts,
                         token=self.token,
+                        on_log=logger.info,
                         paths=self.paths,
                     )
                     if len(entries) > 1:
@@ -358,7 +360,7 @@ class TaskQueue(QObject):
     def _on_worker_progress(self, job_id: str, pct: int) -> None:
         item = self._tasks.get(job_id)
         if item:
-            item.progress = pct
+            item.progress = max(item.progress, pct)
             self.task_updated.emit(job_id)
 
     def _on_worker_title(self, job_id: str, title: str) -> None:
@@ -374,34 +376,29 @@ class TaskQueue(QObject):
             item.stage_text = "完成"
             item.progress = 100
             item.result = result
-            if result.title:
-                item.display_title = result.title
+            item.display_title = result.title or item.display_title
             self.task_updated.emit(job_id)
             self.task_completed_notification.emit(item.display_title, str(result.md_path))
 
     def _on_worker_failed(self, job_id: str, err: ErrorInfo) -> None:
         item = self._tasks.get(job_id)
         if item:
-            if err.category == "cancelled":
+            if item.token.is_cancelled():
                 item.status = TaskStatus.CANCELLED
                 item.stage_text = "已取消"
             else:
                 item.status = TaskStatus.FAILED
-                item.stage_text = f"失败: {err.user_message[:64]}"
-            item.error_info = err
+                item.stage_text = "失败"
+                item.error_info = err
             self.task_updated.emit(job_id)
 
     def _on_thread_terminated(self) -> None:
-        self._current_worker = None
+        if self._current_worker is not None:
+            self._current_worker.deleteLater()
+            self._current_worker = None
         self._current_job_id = None
-        self._schedule_next()
-
-    def cancel_current(self) -> None:
-        if self._current_job_id and self._current_job_id in self._tasks:
-            item = self._tasks[self._current_job_id]
-            item.stage_text = "正在取消..."
-            item.token.cancel()
-            self.task_updated.emit(self._current_job_id)
+        if not self._shutting_down:
+            self._schedule_next()
 
     def cancel_task(self, job_id: str) -> None:
         item = self._tasks.get(job_id)
@@ -413,78 +410,43 @@ class TaskQueue(QObject):
             item.token.cancel()
             self.task_updated.emit(job_id)
         elif item.status == TaskStatus.RUNNING:
-            self.cancel_current()
-
-    def cancel_all(self) -> None:
-        for jid in self._order:
-            item = self._tasks.get(jid)
-            if item and item.status == TaskStatus.WAITING:
-                item.status = TaskStatus.CANCELLED
-                item.stage_text = "已取消"
-                item.token.cancel()
-                self.task_updated.emit(jid)
-        self.cancel_current()
-
-    def shutdown_and_wait(self, timeout_ms: int = 3000) -> None:
-        """Cancel all tasks and wait for the running worker thread to exit cleanly (Fixes P2-2)."""
-        self._shutting_down = True
-        self.cancel_all()
-        worker = self._current_worker
-        if worker is not None and worker.isRunning():
-            worker.wait(timeout_ms)
-
-    def clear_inactive_tasks(self) -> List[str]:
-        """Remove COMPLETED, FAILED, and CANCELLED tasks from the queue (Fixes P3-2)."""
-        removed_ids: List[str] = []
-        remaining_order: List[str] = []
-        for jid in self._order:
-            item = self._tasks.get(jid)
-            if item and item.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-                removed_ids.append(jid)
-                self._tasks.pop(jid, None)
-            else:
-                remaining_order.append(jid)
-        self._order = remaining_order
-        if removed_ids:
-            self.tasks_removed.emit(removed_ids)
-        return removed_ids
+            item.stage_text = "正在取消..."
+            item.token.cancel()
+            self.task_updated.emit(job_id)
 
     def retry_task(self, job_id: str) -> None:
         item = self._tasks.get(job_id)
         if not item or item.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             return
-        item.token = CancelToken()
         item.status = TaskStatus.WAITING
         item.stage_text = "等待"
         item.progress = 0
+        item.result = None
         item.error_info = None
+        item.token = CancelToken()
         self.task_updated.emit(job_id)
         self._schedule_next()
 
-    def retry_failed_tasks(self) -> int:
-        """Retry all FAILED or CANCELLED tasks in the queue."""
-        count = 0
+    def clear_finished_and_cancelled(self) -> List[str]:
+        removed: List[str] = []
+        remaining_order: List[str] = []
         for jid in self._order:
             item = self._tasks.get(jid)
-            if item and item.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                item.token = CancelToken()
-                item.status = TaskStatus.WAITING
-                item.stage_text = "等待"
-                item.progress = 0
-                item.error_info = None
-                self.task_updated.emit(jid)
-                count += 1
-        if count > 0:
-            self._schedule_next()
-        return count
+            if item and item.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED):
+                self._tasks.pop(jid, None)
+                removed.append(jid)
+            else:
+                remaining_order.append(jid)
+        self._order = remaining_order
+        if removed:
+            self.tasks_removed.emit(removed)
+        return removed
 
-    def stats(self) -> Dict[str, int]:
-        """Return task counts grouped by status."""
-        items = self.all_tasks()
-        return {
-            "total": len(items),
-            "running": sum(1 for i in items if i.status == TaskStatus.RUNNING),
-            "waiting": sum(1 for i in items if i.status == TaskStatus.WAITING),
-            "completed": sum(1 for i in items if i.status == TaskStatus.COMPLETED),
-            "failed": sum(1 for i in items if i.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)),
-        }
+    def shutdown(self, wait_ms: int = 3000) -> None:
+        """Cancel all waiting/running tasks and wait briefly for the active thread to exit."""
+        self._shutting_down = True
+        for item in self._tasks.values():
+            if item.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
+                item.token.cancel()
+        if self._current_worker is not None and self._current_worker.isRunning():
+            self._current_worker.wait(wait_ms)

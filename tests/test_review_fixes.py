@@ -1,8 +1,9 @@
-"""Regression unit tests verifying all P1, P2, P3, v1.2.1, v1.2.2, and v1.2.3 fixes."""
+"""Regression unit tests verifying all P1, P2, P3, v1.2.1, v1.2.2, v1.2.3, and v1.2.4 fixes."""
 
 from __future__ import annotations
 
 import contextlib
+import http.cookiejar
 import json
 import math
 import struct
@@ -127,7 +128,7 @@ class TestReviewFixes(unittest.TestCase):
         import app
         from app.config import LlmConfig
         from app.core import summarizer
-        self.assertEqual(app.__version__, "1.2.3")
+        self.assertEqual(app.__version__, "1.2.5")
 
         empty_cfg = LlmConfig(enabled=True, api_key="")
         ok, msg = summarizer.test_llm_connection(empty_cfg)
@@ -256,18 +257,15 @@ class TestReviewFixes(unittest.TestCase):
                 self.assertEqual(segs[0].text, "测试语音转录成功")
 
     def test_v1_2_3_tiktok_direct_fallback_and_multi_format_isolated_cookies(self) -> None:
-        # 1. Verify "webpage" does NOT falsely trigger the "age" verification error message
         tk_exc = RuntimeError(
             "ERROR: [TikTok] 7696957163670998294: Unexpected response from webpage request"
         )
         translated = downloader._translate_ydl_exception(tk_exc)
         self.assertNotIn("年龄验证", translated.user_message)
 
-        # 2. Verify JSON, raw Cookie header, and Netscape session-cookie (exp=0) files produce isolated copies
         with tempfile.TemporaryDirectory() as tmp:
             temp_dir = Path(tmp) / "temp"
 
-            # 2a. JSON cookie export
             json_cookie_file = Path(tmp) / "tiktok_cookies.json"
             json_cookie_file.write_text(
                 json.dumps(
@@ -284,15 +282,18 @@ class TestReviewFixes(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            netscape_path = downloader.prepare_cookie_file(json_cookie_file, temp_dir)
+            netscape_path = downloader.prepare_cookie_file(
+                json_cookie_file,
+                temp_dir,
+                target_url="https://vt.tiktok.com/ZSgwwQnPH/",
+            )
             self.assertIsNotNone(netscape_path)
             self.assertNotEqual(netscape_path, json_cookie_file)
             content = netscape_path.read_text(encoding="utf-8")
             self.assertTrue(content.startswith("# Netscape HTTP Cookie File"))
             self.assertIn(".tiktok.com\tTRUE\t/\tTRUE\t", content)
-            self.assertNotIn("\t0\tsessionid", content)  # expiration=0 upgraded to future timestamp
+            self.assertNotIn("\t0\tsessionid", content)
 
-            # 2b. Raw F12 Cookie header string
             raw_hdr_file = Path(tmp) / "header_cookie.txt"
             raw_hdr_file.write_text("Cookie: sessionid=tok999; ttwid=tw888", encoding="utf-8")
             hdr_out = downloader.prepare_cookie_file(
@@ -305,7 +306,6 @@ class TestReviewFixes(unittest.TestCase):
             self.assertIn(".tiktok.com\tTRUE\t/\tTRUE\t", hdr_text)
             self.assertIn("sessionid\ttok999", hdr_text)
 
-            # 3. Verify TikTok Direct API Fallback when yt-dlp fails all webpage attempts
             class BrokenYoutubeDL:
                 def __init__(self, opts):
                     pass
@@ -358,6 +358,66 @@ class TestReviewFixes(unittest.TestCase):
                 )
                 self.assertTrue(audio_file.exists())
                 self.assertEqual(audio_file.name, "7696957163670998294.mp4")
+
+    def test_v1_2_4_youtube_cookie_sabr_fallback_and_mozilla_cookiejar_strict_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(app_dir=Path(tmp))
+            # 1. Test Netscape file with empty-value trailing tab (`GPS\t`) & mismatched domain dot (`www.youtube.com\tTRUE`)
+            raw_youtube_cookies = (
+                "# Netscape HTTP Cookie File\n"
+                "www.youtube.com\tTRUE\t/\tTRUE\t0\tGPS\t\n"
+                ".youtube.com\tFALSE\t/\tTRUE\t1800000000\tSAPISID\tsapi_val_123\n"
+            )
+            saved_path, count, sites = downloader.import_cookies_from_text(raw_youtube_cookies, paths=paths)
+            self.assertEqual(count, 2)
+            self.assertIn("YouTube/Google", sites)
+
+            # Verify Python's standard library MozillaCookieJar loads the normalized file with zero AssertionError!
+            jar = http.cookiejar.MozillaCookieJar(str(saved_path))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            self.assertEqual(len(jar), 2)
+
+            # 2. Verify YouTube fallback to cookie-free `android_vr` when logged-in cookies fail (e.g. rotated cookies / SABR)
+            calls = []
+
+            class YouTubeMockYDL:
+                def __init__(self, opts):
+                    self.opts = opts
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def extract_info(self, url, download=False):
+                    has_cookie = "cookiefile" in self.opts
+                    clients = (self.opts.get("extractor_args") or {}).get("youtube", {}).get("player_client")
+                    calls.append((has_cookie, clients))
+                    if has_cookie:
+                        raise RuntimeError("ERROR: [youtube] mp28JPs25ek: Requested format is not available")
+                    return {
+                        "id": "mp28JPs25ek",
+                        "title": "YouTube 免 Cookie 降级成功测试",
+                        "uploader": "YTChannel",
+                        "duration": 120.0,
+                        "extractor_key": "Youtube",
+                        "webpage_url": url,
+                    }
+
+            fake_ytdlp = type(sys)("yt_dlp")
+            fake_ytdlp.YoutubeDL = YouTubeMockYDL  # type: ignore[attr-defined]
+
+            dl_opts = DownloadOptions(cookies_file=str(saved_path))
+            with _patch_sys_module("yt_dlp", fake_ytdlp):
+                info = downloader.fetch_info("https://www.youtube.com/watch?v=mp28JPs25ek", dl_opts, paths=paths)
+                self.assertEqual(info.title, "YouTube 免 Cookie 降级成功测试")
+                # Must have tried with cookies first, then multi-client with cookies, then succeeded without cookies on android_vr!
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(calls[0][0])
+                self.assertTrue(calls[1][0])
+                self.assertFalse(calls[2][0])
+                self.assertIn("android_vr", calls[2][1])
 
 
 if __name__ == "__main__":
