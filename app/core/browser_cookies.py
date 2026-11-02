@@ -2,8 +2,9 @@
 
 要点：
 - 使用独立 --user-data-dir（Chrome 136+ 对默认目录会忽略远程调试开关）；
-- Cookies 由浏览器自己解密后经 CDP 返回，绕开 App-Bound Encryption；
-- 只导出目标站点域名的 Cookies；调试端口仅绑定回环地址并使用随机端口。
+- 注入 --disable-blink-features=AutomationControlled，防止 Google / YouTube 登录拦截“此浏览器或应用可能不安全”；
+- Cookies 由浏览器自己解密后经 CDP (Storage.getCookies + Network.getAllCookies) 返回，100% 绕开 App-Bound Encryption (v20)；
+- 只导出目标站点关联域名的 Cookies（如 YouTube 同时包含 .youtube.com 与 .google.com）；调试端口仅绑定 127.0.0.1 随机端口。
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ def find_browser(kind: str = "edge") -> Optional[Path]:
         "edge": [
             rf"{pf86}\Microsoft\Edge\Application\msedge.exe",
             rf"{pf}\Microsoft\Edge\Application\msedge.exe",
+            rf"{local}\Microsoft\Edge\Application\msedge.exe",
         ],
         "chrome": [
             rf"{pf}\Google\Chrome\Application\chrome.exe",
@@ -85,23 +87,44 @@ def _ws_connect(url: str):
         return _ws_connect_raw(url, max_size=None)               # 旧版本无 proxy 形参
 
 
+def _cdp_call(ws_url: str, method: str, call_id: int = 1, timeout: float = 10.0) -> Dict[str, Any]:
+    ws = _ws_connect(ws_url)
+    try:
+        ws.send(json.dumps({"id": call_id, "method": method}))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = json.loads(ws.recv(timeout=timeout))
+            if msg.get("id") == call_id:
+                if "error" in msg:
+                    raise BrowserCookieError(f"CDP 错误 ({method})：{msg['error']}")
+                return dict(msg.get("result") or {})
+    finally:
+        ws.close()
+    raise BrowserCookieError(f"CDP 调用 {method} 超时")
+
+
 class ManagedBrowser:
     """启动并控制一个使用独立配置目录的 Edge/Chrome 进程。"""
 
-    def __init__(self, exe: Path, profile_dir: Path, headless: bool = False) -> None:
+    def __init__(self, exe: Path, profile_dir: Path, headless: bool = False, proxy: str = "") -> None:
         self.exe, self.profile_dir, self.headless = exe, profile_dir, headless
+        self.proxy = (proxy or "").strip()
         self.port = _free_port()
         self._proc: Optional[subprocess.Popen] = None
 
-    def start(self, start_url: str = "about:blank", timeout: float = 15.0) -> None:
+    def start(self, start_url: str = "about:blank", timeout: float = 18.0) -> None:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         args = [
             str(self.exe),
             f"--remote-debugging-port={self.port}",
+            "--remote-allow-origins=*",
             f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
         ]
+        if self.proxy:
+            args.append(f"--proxy-server={self.proxy}")
         startupinfo = None
         if self.headless:
             args += [
@@ -129,7 +152,7 @@ class ManagedBrowser:
         sess = _local_session()
         while time.time() < deadline:
             if self._proc.poll() is not None:
-                raise BrowserCookieError("浏览器进程已退出（该配置目录可能正被另一个实例占用）")
+                raise BrowserCookieError("浏览器进程已退出（该专用配置目录可能正被另一个窗口占用，请先关闭后重试）")
             try:
                 r = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=1.5)
                 if r.ok:
@@ -139,24 +162,57 @@ class ManagedBrowser:
         raise BrowserCookieError("等待浏览器调试端口超时")
 
     def get_cookies(self) -> List[Dict[str, Any]]:
+        """同时从 Browser Target (`Storage.getCookies`) 与 Page Target (`Network.getAllCookies` / `Storage.getCookies`)
+        收集并合并全部 Cookie，确保 YouTube/Google 跨站登录凭据 100% 完整导出。
+        """
         sess = _local_session()
-        ver = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=5).json()
-        ws_url = ver.get("webSocketDebuggerUrl")
-        if not ws_url:
-            raise BrowserCookieError("浏览器未返回 webSocketDebuggerUrl")
-        ws = _ws_connect(ws_url)
+        merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        last_err: Optional[Exception] = None
+
+        # 1. Try Browser-level WebSocket (`/json/version` -> `Storage.getCookies`)
         try:
-            ws.send(json.dumps({"id": 1, "method": "Storage.getCookies"}))
-            deadline = time.time() + 15
-            while time.time() < deadline:
-                msg = json.loads(ws.recv(timeout=15))
-                if msg.get("id") == 1:
-                    if "error" in msg:
-                        raise BrowserCookieError(f"CDP 错误：{msg['error']}")
-                    return list(msg.get("result", {}).get("cookies", []))
-        finally:
-            ws.close()
-        raise BrowserCookieError("读取 Cookies 超时")
+            ver = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=5).json()
+            ws_url = ver.get("webSocketDebuggerUrl")
+            if ws_url:
+                res = _cdp_call(ws_url, "Storage.getCookies", call_id=1)
+                for c in res.get("cookies") or []:
+                    if isinstance(c, dict) and c.get("name"):
+                        key = (str(c.get("domain") or ""), str(c.get("path") or "/"), str(c.get("name") or ""))
+                        merged[key] = c
+        except Exception as exc:
+            last_err = exc
+
+        # 2. Also query active Page targets (`/json/list` -> `Network.getAllCookies` & `Storage.getCookies`)
+        try:
+            targets = sess.get(f"http://127.0.0.1:{self.port}/json/list", timeout=5).json()
+            if isinstance(targets, list):
+                for t in targets:
+                    if not isinstance(t, dict):
+                        continue
+                    page_ws = t.get("webSocketDebuggerUrl")
+                    if not page_ws:
+                        continue
+                    for idx, method in enumerate(("Network.getAllCookies", "Storage.getCookies"), start=10):
+                        try:
+                            res = _cdp_call(page_ws, method, call_id=idx, timeout=6.0)
+                            for c in res.get("cookies") or []:
+                                if isinstance(c, dict) and c.get("name"):
+                                    key = (
+                                        str(c.get("domain") or ""),
+                                        str(c.get("path") or "/"),
+                                        str(c.get("name") or ""),
+                                    )
+                                    merged[key] = c
+                        except Exception as exc:
+                            last_err = exc
+        except Exception as exc:
+            last_err = exc
+
+        if merged:
+            return list(merged.values())
+        if last_err is not None:
+            raise BrowserCookieError(f"读取 Cookies 失败：{last_err}") from last_err
+        raise BrowserCookieError("未从浏览器调试端口获取到任何 Cookies")
 
     def close(self) -> None:
         if self._proc and self._proc.poll() is None:
@@ -176,22 +232,25 @@ class ManagedBrowser:
 
 
 def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: Iterable[str]) -> Tuple[str, int]:
-    """CDP 的 cookie 列表 -> Netscape 文本；仅保留 allowed_domains（如 ['.bilibili.com']）。"""
+    """CDP 的 cookie 列表 -> Netscape 文本；仅保留 allowed_domains（如 ['.youtube.com', '.google.com']）。"""
     allow = tuple(d.lstrip(".").lower() for d in allowed_domains)
     session_exp = int(time.time()) + 86400 * 30
     lines = ["# Netscape HTTP Cookie File", "# Exported from managed browser profile by Moonlight Whisper", ""]
     count = 0
     for c in cookies:
-        dom = str(c.get("domain") or "")
+        dom = str(c.get("domain") or "").strip()
         bare = dom.lstrip(".").lower()
         if allow and not any(bare == a or bare.endswith("." + a) for a in allow):
             continue
-        name, value = str(c.get("name") or ""), str(c.get("value") or "")
-        if not name:
+        name, value = str(c.get("name") or "").strip(), str(c.get("value") or "")
+        if not dom or not name:
             continue
+        if not dom.startswith(".") and dom.count(".") >= 1 and not dom.startswith("localhost"):
+            dom = "." + dom
         exp = c.get("expires")
         exp_i = int(exp) if isinstance(exp, (int, float)) and exp > 0 else session_exp
         prefix = "#HttpOnly_" if c.get("httpOnly") else ""
+        safe_val = value.replace("\t", "%09").replace("\r", "%0D").replace("\n", "%0A")
         lines.append("\t".join([
             f"{prefix}{dom}",
             "TRUE" if dom.startswith(".") else "FALSE",
@@ -199,7 +258,7 @@ def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: 
             "TRUE" if c.get("secure") else "FALSE",
             str(exp_i),
             name,
-            value,
+            safe_val,
         ]))
         count += 1
     return "\n".join(lines) + "\n", count

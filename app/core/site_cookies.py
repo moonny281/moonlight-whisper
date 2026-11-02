@@ -5,15 +5,15 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
 class SiteProfile:
     key: str
     hosts: Tuple[str, ...]            # 用于匹配输入 URL 的主机后缀
-    cookie_domains: Tuple[str, ...]   # 原始 Cookie 头只允许写入这些域
-    key_cookies: Tuple[str, ...]      # 任意命中一个即视为“看起来已登录”
+    cookie_domains: Tuple[str, ...]   # 原始 Cookie 头与导出允许绑定的域
+    key_cookies: Tuple[str, ...]      # 任意命中一个即视为“已包含登录态凭据”
     note: str = ""
 
 
@@ -22,8 +22,8 @@ SITES: Tuple[SiteProfile, ...] = (
         "youtube",
         ("youtube.com", "youtu.be", "youtube-nocookie.com"),
         (".youtube.com",),
-        ("__Secure-3PSID", "SAPISID", "LOGIN_INFO"),
-        "YouTube 需在无痕窗口导出，并立即关闭该窗口，否则 Cookie 会被轮换失效",
+        ("__Secure-3PSID", "SAPISID", "LOGIN_INFO", "__Secure-1PSID", "SID", "__Secure-3PAPISID"),
+        "YouTube 需包含 __Secure-3PSID / SAPISID / LOGIN_INFO 等登录凭据 Cookie",
     ),
     SiteProfile(
         "bilibili",
@@ -35,7 +35,7 @@ SITES: Tuple[SiteProfile, ...] = (
         "tiktok",
         ("tiktok.com",),
         (".tiktok.com",),
-        ("sessionid", "sessionid_ss"),
+        ("sessionid", "sessionid_ss", "sid_tt"),
     ),
     SiteProfile(
         "x",
@@ -84,6 +84,37 @@ def cookie_domains_for(url: str) -> List[str]:
     return ["." + ".".join(parts[-2:])] if len(parts) >= 2 else ["." + host]
 
 
+def rows_have_site_auth(rows: Iterable[Dict[str, Any]], target_url: str) -> bool:
+    """检查提取出的 Cookie 字典列表中是否真正包含目标站点的关键登录凭据（避免仅提取到匿名 PREF/YSC 时误判成功）。"""
+    site = resolve_site(target_url)
+    rows_list = [r for r in rows if isinstance(r, dict)]
+    if not rows_list:
+        return False
+    if site is None or not site.key_cookies:
+        return True
+    now = int(time.time())
+    allowed_doms = ("youtube.com", "google.com") if site.key == "youtube" else tuple(d.lstrip(".").lower() for d in site.cookie_domains)
+    names_found = set()
+    for r in rows_list:
+        dom = str(r.get("domain") or "").lstrip(".").lower()
+        if allowed_doms and not any(dom == d or dom.endswith("." + d) for d in allowed_doms):
+            continue
+        exp = r.get("expires")
+        try:
+            exp_i = int(float(exp)) if exp is not None else 0
+            if 0 < exp_i < now:
+                continue
+        except (TypeError, ValueError):
+            pass
+        name = str(r.get("name") or "").strip()
+        val = str(r.get("value") or "").strip()
+        if name and val:
+            names_found.add(name)
+    if site.key == "x" and "auth_token" in names_found and "ct0" not in names_found:
+        return False
+    return any(k in names_found for k in site.key_cookies)
+
+
 @dataclass
 class CookieReport:
     total: int = 0
@@ -106,6 +137,8 @@ class CookieReport:
 def inspect_netscape(path: Path, target_url: str) -> CookieReport:
     """对（已规范化的）Netscape cookies 文件做静态体检，不发网络请求。"""
     rep = CookieReport()
+    if not path.is_file():
+        return rep
     site = resolve_site(target_url)
     now = int(time.time())
     domains = tuple(d.lstrip(".") for d in (site.cookie_domains if site else cookie_domains_for(target_url)))
@@ -134,7 +167,7 @@ def inspect_netscape(path: Path, target_url: str) -> CookieReport:
     if site:
         rep.found_keys = [k for k in site.key_cookies if k in names_seen]
         if not rep.found_keys and rep.matched:
-            rep.missing_hint = f"但缺少登录凭据 Cookie（期望之一：{', '.join(site.key_cookies)}），可能未登录或已过期"
+            rep.missing_hint = f"但缺少登录凭据 Cookie（期望之一：{', '.join(site.key_cookies[:3])}），可能未登录或仅提取到匿名 Cookie"
         if site.key == "x" and "auth_token" in names_seen and "ct0" not in names_seen:
             rep.missing_hint = "缺少 ct0"
     rep.ok = rep.matched > 0 and not rep.missing_hint

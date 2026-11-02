@@ -197,7 +197,7 @@ class AppPaths:
             folder.mkdir(parents=True, exist_ok=True)
 
     def find_binary(self, name: str) -> Optional[Path]:
-        """Locate an external tool (`ffmpeg`, `deno`, `node`) in bundled `bin/`, `_internal/bin/`, writable `data_root/bin/`, or system PATH."""
+        """Locate an external tool (`ffmpeg`, `deno`, `node`, `bun`) in bundled `bin/`, `_internal/bin/`, writable `data_root/bin/`, system PATH, or standard Windows install paths."""
         exe_name = f"{name}.exe" if sys.platform == "win32" and not name.endswith(".exe") else name
         search_dirs = [
             self.bin_dir,
@@ -210,7 +210,29 @@ class AppPaths:
                 if cand.exists() and cand.is_file():
                     return cand
         which_path = shutil.which(name)
-        return Path(which_path).resolve() if which_path else None
+        if which_path:
+            return Path(which_path).resolve()
+        if sys.platform == "win32":
+            home = Path.home()
+            local = Path(os.environ.get("LOCALAPPDATA", "")) if os.environ.get("LOCALAPPDATA") else None
+            pf = Path(os.environ.get("ProgramFiles", "C:\\Program Files"))
+            extra_map = {
+                "deno": [
+                    home / ".deno" / "bin" / "deno.exe",
+                    (local / "Microsoft" / "WinGet" / "Links" / "deno.exe") if local else None,
+                ],
+                "node": [
+                    pf / "nodejs" / "node.exe",
+                    (local / "Programs" / "nodejs" / "node.exe") if local else None,
+                ],
+                "bun": [
+                    home / ".bun" / "bin" / "bun.exe",
+                ],
+            }
+            for cand in extra_map.get(name.lower(), []):
+                if cand and cand.is_file():
+                    return cand.resolve()
+        return None
 
     @staticmethod
     def migrate_directory_contents(src: Path, dst: Path) -> int:

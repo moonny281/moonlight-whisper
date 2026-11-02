@@ -541,7 +541,7 @@ def _apply_js_runtime_opts(
     elif resolved_bun and resolved_bun.exists():
         ydl_opts["js_runtimes"] = {"bun": {"path": str(resolved_bun)}}
     else:
-        ydl_opts["js_runtimes"] = {"deno": {}, "node": {}}
+        ydl_opts["js_runtimes"] = {"deno": {}, "node": {}, "bun": {}, "quickjs": {}}
         if on_log and _is_youtube_url(target_url):
             on_log("[YouTube 警告] 未找到 deno 或 node，YouTube 部分格式可能受限；程序将自动启用多客户端与备用直链通道。")
 
@@ -556,13 +556,24 @@ def _apply_js_runtime_opts(
             on_log("[YouTube] 未找到 yt-dlp-ejs，已允许从 GitHub 获取挑战解析脚本（兜底）")
 
 
-def _find_cached_cookie_fallback(paths: AppPaths, target_url: str) -> Optional[Path]:
-    """Check if the user has a previously exported/imported cookie file in `data_root/cookies/<site>.txt` or `data_root/cookies.txt`."""
+def _find_cached_cookie_fallback(paths: AppPaths, target_url: str, browser_id: str = "") -> Optional[Path]:
+    """Check if the user has a previously exported/imported/cached cookie file in `data_root/cookies/` or `data_root/cookies.txt`."""
     candidates: List[Path] = []
+    cookies_dir = paths.data_root / "cookies"
     site = resolve_site(target_url)
     if site is not None:
-        candidates.append(paths.data_root / "cookies" / f"{site.key}.txt")
+        if browser_id:
+            candidates.append(cookies_dir / f"rookie_cache_{browser_id.lower()}_{site.key}.txt")
+        candidates.append(cookies_dir / f"{site.key}.txt")
+        if cookies_dir.is_dir():
+            for p in sorted(cookies_dir.glob(f"rookie_cache_*_{site.key}.txt")):
+                if p not in candidates:
+                    candidates.append(p)
     candidates.append(paths.data_root / "cookies.txt")
+    for c in candidates:
+        if c.is_file() and c.stat().st_size > 0:
+            if not target_url or inspect_netscape(c, target_url).ok:
+                return c
     for c in candidates:
         if c.is_file() and c.stat().st_size > 0:
             return c
@@ -656,7 +667,7 @@ def _build_common_ydl_opts(
 
             # If browser live extraction failed (e.g. browser running & locking DB or v20), check if a cached cookies.txt exists
             if not loaded_cookiefile:
-                cached_fb = _find_cached_cookie_fallback(paths, target_url)
+                cached_fb = _find_cached_cookie_fallback(paths, target_url, browser_id=browser_name)
                 if cached_fb is not None:
                     prepared_fb = prepare_cookie_file(cached_fb, paths.temp_dir, on_log=None, target_url=target_url)
                     if prepared_fb is not None and prepared_fb.exists():

@@ -1,4 +1,4 @@
-"""Built-in bridge to `rookie-cookies` (https://github.com/teng-lin/rookie-cookies) with non-disruptive Chromium locked-DB snapshot & pure-Python v10 DPAPI fallback."""
+"""Built-in bridge to `rookie-cookies` (https://github.com/teng-lin/rookie-cookies) with concurrent zero-latency Chromium locked-DB snapshot, v20 browser_id decryption, and persistent validated Cookie caching."""
 
 from __future__ import annotations
 
@@ -20,22 +20,27 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.core.cancel import CancelToken
 from app.core.errors import CancelledError, DownloadError
-from app.core.site_cookies import SITES, cookie_domains_for, inspect_netscape, resolve_site
+from app.core.site_cookies import (
+    SITES,
+    cookie_domains_for,
+    inspect_netscape,
+    resolve_site,
+    rows_have_site_auth,
+)
 
 LogCallback = Callable[[str], None]
 
-# Default to "disabled" so downloading NEVER spawns a new Edge/Chrome browser window on Windows!
 APP_BOUND_POLICIES: Tuple[Tuple[str, str], ...] = (
-    ("disabled", "静默安全读取 (disabled，默认推荐：绝不弹出/启动新浏览器窗口)"),
-    ("injection_only", "无特权进程注入解密 v20 (injection_only，注意：Windows 下会拉起新浏览器窗口)"),
-    ("allow_elevated_fallback", "允许管理员提权解密 v20 (allow_elevated_fallback，注意：可能拉起浏览器窗口)"),
+    ("disabled", "智能缓存优先 (推荐：优先复用本地已验证缓存，缺失时自动解锁提取并永久缓存)"),
+    ("allow_elevated_fallback", "强制实时解密 v20 (allow_elevated_fallback：直接解密 Chrome/Edge v20 并更新缓存)"),
+    ("injection_only", "无特权实时解密 v20 (injection_only：使用同权限进程解密 v20 并更新缓存)"),
 )
 
 DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
     ("firefox", "Firefox（推荐：明文库 + 会话恢复，无需启动浏览器进程）"),
-    ("edge", "Microsoft Edge（内置 rookie-cookies 读取 + 锁库快照解锁）"),
-    ("chrome", "Google Chrome（内置 rookie-cookies 读取 + 锁库快照解锁）"),
-    ("brave", "Brave（内置 rookie-cookies 读取 + 锁库快照解锁）"),
+    ("edge", "Microsoft Edge（内置 rookie-cookies + 并发锁库快照解锁 + 智能缓存）"),
+    ("chrome", "Google Chrome（内置 rookie-cookies + 并发锁库快照解锁 + 智能缓存）"),
+    ("brave", "Brave（内置 rookie-cookies + 并发锁库快照解锁 + 智能缓存）"),
     ("chromium", "Chromium"),
     ("arc", "Arc"),
     ("vivaldi", "Vivaldi"),
@@ -52,6 +57,7 @@ DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
 )
 
 _GECKO_BROWSERS = {"firefox", "librewolf", "zen", "cachy"}
+_CHROMIUM_BROWSERS = {"edge", "chrome", "brave", "chromium", "vivaldi", "opera", "opera_gx", "qq", "360", "360x", "sogou", "coccoc", "yandex", "arc"}
 _APP_BOUND_CHROMIUM_BROWSERS = {"edge", "chrome", "brave", "coccoc", "avast"}
 
 
@@ -292,12 +298,22 @@ def _win32_copy_shared_file(src: Path, dst: Path) -> bool:
             if not ok or bytes_read.value == 0:
                 break
             chunks.append(buf.raw[: bytes_read.value])
-        dst.write_bytes(b"".join(chunks))
+        data = b"".join(chunks)
+        if not data:
+            return False
+        dst.write_bytes(data)
         return dst.is_file() and dst.stat().st_size > 0
     except Exception:
         return False
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _copy_sidecars(src_db: Path, dst_db: Path) -> None:
+    for suffix in ("-wal", "-journal"):
+        side = src_db.with_name(src_db.name + suffix)
+        if side.is_file():
+            _win32_copy_shared_file(side, dst_db.with_name(dst_db.name + suffix))
 
 
 def _copy_locked_chromium_cookies_db(
@@ -316,53 +332,103 @@ def _copy_locked_chromium_cookies_db(
     snap_dir = temp_dir / "cookies" / f"snap_{browser_id}_{uuid.uuid4().hex[:6]}"
     snap_dir.mkdir(parents=True, exist_ok=True)
     dst_db = snap_dir / "Cookies"
+    dst_ps = snap_dir / "Cookies_ps"
 
     # Attempt 1: Try shared-mode copy (`FILE_SHARE_READ | WRITE | DELETE`)
     if _win32_copy_shared_file(src_db, dst_db):
-        for suffix in ("-wal", "-journal"):
-            side = src_db.with_name(src_db.name + suffix)
-            if side.is_file():
-                _win32_copy_shared_file(side, dst_db.with_name(dst_db.name + suffix))
+        _copy_sidecars(src_db, dst_db)
         return dst_db, local_state
 
     if sys.platform != "win32":
         return None, None
 
-    # Attempt 2: Briefly restart ONLY the headless `network.mojom.NetworkService` utility subprocess.
-    # In Chromium's architecture, NetworkService is a headless background socket worker (`--type=utility`).
-    # Terminating ONLY this background worker releases the exclusive file lock on `Network/Cookies` immediately,
-    # while all open browser windows & tabs remain completely untouched and zero new windows are created!
-    exe_map = {"edge": "msedge.exe", "chrome": "chrome.exe", "brave": "brave.exe"}
+    # Attempt 2: Concurrently poll `CreateFileW` every 2ms in Python WHILE PowerShell restarts ONLY the headless
+    # `network.mojom.NetworkService` (`--service-sandbox-type=network`) utility subprocess and immediately copies `$src` -> `$dst_ps`.
+    # Why concurrent polling is essential: Edge respawns `NetworkService` in ~80ms after `Stop-Process`, whereas `powershell.exe`
+    # takes ~500ms to exit. Running a 2ms Python polling loop concurrently with `Popen` + in-PowerShell `[System.IO.File]::Copy`
+    # captures the unlocked file within 1-5ms of handle release!
+    exe_map = {
+        "edge": "msedge.exe",
+        "chrome": "chrome.exe",
+        "brave": "brave.exe",
+        "vivaldi": "vivaldi.exe",
+        "opera": "opera.exe",
+        "opera_gx": "opera.exe",
+    }
     exe_name = exe_map.get(browser_id.lower())
     if exe_name:
+        ps_src = str(src_db).replace("'", "''")
+        ps_dst = str(dst_ps).replace("'", "''")
+        ps_script = (
+            f"$src = '{ps_src}'; $dst = '{ps_dst}'; "
+            f"Get-CimInstance Win32_Process -Filter \"Name='{exe_name}'\" | "
+            "Where-Object { $_.CommandLine -like '*network.mojom.NetworkService*' -or $_.CommandLine -like '*--service-sandbox-type=network*' } | "
+            "ForEach-Object { "
+            "  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; "
+            "  for ($i=0; $i -lt 80; $i++) { "
+            "    try { [System.IO.File]::Copy($src, $dst, $true); if ((Get-Item $dst -ErrorAction SilentlyContinue).Length -gt 0) { break } } "
+            "    catch { Start-Sleep -Milliseconds 3 } "
+            "  } "
+            "}"
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        proc: Optional[subprocess.Popen] = None
         try:
-            ps_script = (
-                f"Get-CimInstance Win32_Process -Filter \"Name='{exe_name}'\" | "
-                "Where-Object { $_.CommandLine -like '*--utility-sub-type=network.mojom.NetworkService*' } | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-            )
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.run(
+            proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=4,
                 creationflags=flags,
-                check=False,
             )
-            # Poll rapidly for up to 400ms while the file lock is released
-            for _ in range(20):
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
                 if _win32_copy_shared_file(src_db, dst_db):
-                    for suffix in ("-wal", "-journal"):
-                        side = src_db.with_name(src_db.name + suffix)
-                        if side.is_file():
-                            _win32_copy_shared_file(side, dst_db.with_name(dst_db.name + suffix))
+                    _copy_sidecars(src_db, dst_db)
                     if on_log:
-                        on_log(f"[Cookies] 已通过后台无感快照解锁读取 {browser_id} 的 Cookies 数据库")
+                        on_log(f"[Cookies] 已通过后台毫秒级快照解锁读取 {browser_id} 的 Cookies 数据库")
                     return dst_db, local_state
-                time.sleep(0.02)
+                if dst_ps.is_file() and dst_ps.stat().st_size > 0:
+                    try:
+                        shutil.copy2(dst_ps, dst_db)
+                        _copy_sidecars(src_db, dst_db)
+                        if on_log:
+                            on_log(f"[Cookies] 已通过后台无感快照解锁读取 {browser_id} 的 Cookies 数据库")
+                        return dst_db, local_state
+                    except OSError:
+                        pass
+                if proc.poll() is not None:
+                    # One final check right after PowerShell finishes
+                    if dst_ps.is_file() and dst_ps.stat().st_size > 0:
+                        shutil.copy2(dst_ps, dst_db)
+                        _copy_sidecars(src_db, dst_db)
+                        return dst_db, local_state
+                    break
+                time.sleep(0.002)
         except Exception:
             pass
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    # Attempt 3: Try Windows `esentutl.exe /y` file copy utility
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        subprocess.run(
+            ["esentutl.exe", "/y", str(src_db), "/d", str(dst_db), "/o"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            creationflags=flags,
+            check=False,
+        )
+        if dst_db.is_file() and dst_db.stat().st_size > 0:
+            _copy_sidecars(src_db, dst_db)
+            return dst_db, local_state
+    except Exception:
+        pass
 
     return None, None
 
@@ -389,12 +455,49 @@ def _dpapi_unprotect(encrypted_bytes: bytes) -> Optional[bytes]:
         kernel32.LocalFree(out_blob.pbData)
 
 
+def _decrypt_aes_gcm_cookie_value(enc_bytes: bytes, key: bytes) -> Optional[str]:
+    """Decrypt a Chromium `v10`/`v11`/`v20` AES-256-GCM cookie payload, stripping the 32-byte SHA-256 domain digest on Chromium 130+."""
+    if len(enc_bytes) < 3 + 12 + 16 or len(key) != 32:
+        return None
+    try:
+        from Cryptodome.Cipher import AES  # type: ignore
+    except ImportError:
+        try:
+            from Crypto.Cipher import AES  # type: ignore
+        except ImportError:
+            return None
+    try:
+        nonce = enc_bytes[3:15]
+        ciphertext = enc_bytes[15:-16]
+        tag = enc_bytes[-16:]
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        plain = cipher.decrypt_and_verify(ciphertext, tag)
+        # In Chromium 130+, the first 32 bytes of `plain` are the binary SHA-256 hash of `host_key`.
+        # Because random 32-byte SHA-256 digests almost always contain invalid UTF-8 sequences or control bytes (< 0x20),
+        # check whether `plain` is pure printable ASCII/UTF-8 or has the 32-byte binary prefix.
+        if len(plain) > 32:
+            prefix32 = plain[:32]
+            has_binary_prefix = False
+            try:
+                prefix_str = prefix32.decode("utf-8")
+                if any(ord(ch) < 0x20 and ch not in ("\t", "\n", "\r") for ch in prefix_str):
+                    has_binary_prefix = True
+            except UnicodeDecodeError:
+                has_binary_prefix = True
+            if has_binary_prefix:
+                return plain[32:].decode("utf-8", errors="replace")
+        return plain.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
 def _decrypt_chromium_sqlite_cookies(
     db_path: Path,
     local_state_path: Optional[Path],
     domains: Optional[List[str]],
+    v20_key: Optional[bytes] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Read an unlocked Chromium `Cookies` SQLite file and decrypt plaintext + `v10` DPAPI cookies in pure Python.
+    """Read an unlocked Chromium `Cookies` SQLite file and decrypt plaintext + `v10` DPAPI (+ `v20` if `v20_key` provided) cookies.
     Returns `(decrypted_rows, v20_skipped_count)`.
     """
     v10_key: Optional[bytes] = None
@@ -427,24 +530,21 @@ def _decrypt_chromium_sqlite_cookies(
             if not cookie_val and enc_val:
                 enc_bytes = bytes(enc_val)
                 if enc_bytes.startswith(b"v20"):
-                    v20_count += 1
-                    continue
-                if enc_bytes.startswith((b"v10", b"v11")) and v10_key:
-                    try:
-                        from Cryptodome.Cipher import AES  # type: ignore
-
-                        nonce = enc_bytes[3:15]
-                        ciphertext = enc_bytes[15:-16]
-                        tag = enc_bytes[-16:]
-                        cipher = AES.new(v10_key, AES.MODE_GCM, nonce=nonce)
-                        plain = cipher.decrypt_and_verify(ciphertext, tag)
-                        # Chrome/Edge 130+ prepends a 32-byte SHA-256 domain digest before the UTF-8 cookie value
-                        try:
-                            cookie_val = plain.decode("utf-8")
-                        except UnicodeDecodeError:
-                            if len(plain) > 32:
-                                cookie_val = plain[32:].decode("utf-8", errors="replace")
-                    except Exception:
+                    if v20_key:
+                        dec = _decrypt_aes_gcm_cookie_value(enc_bytes, v20_key)
+                        if dec is not None:
+                            cookie_val = dec
+                        else:
+                            v20_count += 1
+                            continue
+                    else:
+                        v20_count += 1
+                        continue
+                elif enc_bytes.startswith((b"v10", b"v11")) and v10_key:
+                    dec = _decrypt_aes_gcm_cookie_value(enc_bytes, v10_key)
+                    if dec is not None:
+                        cookie_val = dec
+                    else:
                         continue
                 else:
                     unprot = _dpapi_unprotect(enc_bytes)
@@ -502,8 +602,8 @@ def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
         "locked" in lower and ("database" in lower or "sqlite" in lower or "cookie" in lower)
     ):
         return (
-            f"{b_label} 正在运行并独占锁定了 Cookies 数据库（Windows OS error 32）。"
-            f"请先关闭 {b_label} 后再试，或在设置中点击「登录并获取 Cookies…」导出一次后永久免弹窗使用，也可改用 Firefox。"
+            f"{b_label} 正在运行并锁定了 Cookies 数据库（Windows OS error 32）。"
+            f"请打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」导出一次后永久免弹窗使用，或先关闭 {b_label} 后再试。"
         )
 
     if kind in ("request", "source") or "conflicting_profile" in code or "profile" in code:
@@ -522,7 +622,7 @@ def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
     ):
         return (
             f"无法从 {b_label} 解密 App-Bound (v20) Cookies（{code or 'decrypt_failed'}）："
-            "为防止自动弹出新浏览器窗口，默认已禁用进程注入。建议使用设置中的「登录并获取 Cookies…」导出一次或改用 Firefox。"
+            "请打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」一键导出，或改用 Firefox。"
         )
 
     return f"通过 rookie-cookies 从 {b_label} 读取 Cookies 失败（{code or kind or 'error'}）：{text}"
@@ -552,6 +652,94 @@ def _build_extract_kwargs(
     return kwargs
 
 
+def _persistent_cookie_cache_candidates(base_temp: Path, b_id: str, target_url: str) -> List[Path]:
+    """Return persistent cookie cache file paths under `data_root/cookies/` (or `base_temp/cookies_cache` when isolated)."""
+    resolved = base_temp.resolve()
+    data_cookies_dir = (resolved.parent / "cookies") if resolved.name == "temp" else (resolved / "cookies_cache")
+    site = resolve_site(target_url)
+    site_key = site.key if site is not None else "general"
+    return [
+        data_cookies_dir / f"rookie_cache_{b_id}_{site_key}.txt",
+        data_cookies_dir / f"{site_key}.txt",
+    ]
+
+
+def _save_to_persistent_cookie_cache(
+    netscape_content: str,
+    base_temp: Path,
+    b_id: str,
+    target_url: str,
+    on_log: Optional[LogCallback] = None,
+) -> None:
+    """Save a validated Netscape cookie file into `data_root/cookies/` so subsequent downloads never need to touch the browser."""
+    try:
+        candidates = _persistent_cookie_cache_candidates(base_temp, b_id, target_url)
+        for cache_path in candidates:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(netscape_content, encoding="utf-8")
+            try:
+                os.chmod(cache_path, 0o600)
+            except OSError:
+                pass
+        if on_log and candidates:
+            on_log(f"[Cookies 缓存] 已将提取成功的登录凭据持久化缓存至：{candidates[0].name}（后续下载将直接秒级复用，零弹窗）")
+    except Exception:
+        pass
+
+
+def _call_extract_from_path(
+    rc: Any,
+    snap_db: Path,
+    b_id: str,
+    local_state: Optional[Path],
+    domains: Optional[List[str]],
+    app_bound_policy: str,
+) -> List[Dict[str, Any]]:
+    """Call `rookie_cookies.extract_from_path` properly:
+    IMPORTANT: `browser_id` and `local_state_path` are mutually exclusive in `rookie-cookies`.
+    Passing `browser_id=b_id` is required for `v20` App-Bound decryption; `local_state_path` only supports legacy `v10`.
+    """
+    extract_path_fn = getattr(rc, "extract_from_path", None)
+    if not callable(extract_path_fn):
+        return []
+
+    # 1. Try with `browser_id=b_id` first (required for v20 App-Bound key resolution)
+    try:
+        kw_browser: Dict[str, Any] = {
+            "domains": domains,
+            "browser_id": b_id,
+            "app_bound": app_bound_policy,
+        }
+        res = list(extract_path_fn(str(snap_db), **kw_browser) or [])
+        if res:
+            return res
+    except TypeError:
+        try:
+            res = list(extract_path_fn(str(snap_db), domains=domains, browser_id=b_id) or [])
+            if res:
+                return res
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # 2. Fallback to `local_state_path` (for custom Chromium forks or v10 DPAPI)
+    if local_state is not None and local_state.is_file():
+        try:
+            kw_ls: Dict[str, Any] = {
+                "domains": domains,
+                "local_state_path": str(local_state),
+                "app_bound": app_bound_policy,
+            }
+            res = list(extract_path_fn(str(snap_db), **kw_ls) or [])
+            if res:
+                return res
+        except Exception:
+            pass
+
+    return []
+
+
 def extract_to_netscape_file(
     browser: str,
     profile: str = "",
@@ -561,21 +749,42 @@ def extract_to_netscape_file(
     timeout: float = 15.0,
     token: Optional[CancelToken] = None,
     on_log: Optional[LogCallback] = None,
+    force_refresh: bool = False,
 ) -> Optional[Path]:
-    """Extract cookies for `target_url` from `browser` using `rookie-cookies` (with locked-DB snapshot fallback)
-    and write an isolated Netscape cookiefile. Defaults to `app_bound="disabled"` so it NEVER spawns a browser window.
+    """Extract cookies for `target_url` from `browser` using:
+    1. Validated persistent Cookie cache in `data_root/cookies/` (instant, zero browser interaction);
+    2. Concurrent zero-latency locked-DB snapshot (`_copy_locked_chromium_cookies_db`) to eliminate `OS error 32`;
+    3. Silent `v10` + `extract_from_path(..., browser_id=b_id)` extraction;
+    4. Automatic one-time `v20` decryption (`allow_elevated_fallback` -> `injection_only`) when `v20` auth cookies are detected,
+       immediately saving the decrypted cookies to the persistent cache so subsequent downloads never spawn a browser window.
     """
     if token:
         token.check()
+
+    b_id = (browser or "").strip().lower()
+    if not b_id:
+        return None
+
+    base_temp = temp_dir or Path.cwd() / "temp"
+    cookie_dir = base_temp / "cookies"
+    cookie_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Check persistent validated Cookie cache first (when not forcing refresh)
+    if not force_refresh and target_url:
+        for cache_cand in _persistent_cookie_cache_candidates(base_temp, b_id, target_url):
+            if cache_cand.is_file() and cache_cand.stat().st_size > 0:
+                rep = inspect_netscape(cache_cand, target_url)
+                if rep.ok:
+                    out_cached = cookie_dir / f"cookies_session_rookie_{b_id}_{uuid.uuid4().hex[:8]}.txt"
+                    shutil.copy2(cache_cand, out_cached)
+                    if on_log:
+                        on_log(f"[Cookies 缓存] 已直接复用已验证的本地浏览器 Cookies 缓存 ({cache_cand.name})：{rep.summary()}")
+                    return out_cached
 
     rc = _import_rookie()
     if rc is None:
         if on_log:
             on_log("[rookie-cookies] 未检测到内置 rookie_cookies 模块，将回退至 yt-dlp 原生读取。")
-        return None
-
-    b_id = (browser or "").strip().lower()
-    if not b_id:
         return None
 
     prof = (profile or "").strip() or None
@@ -584,7 +793,6 @@ def extract_to_netscape_file(
         policy = "disabled"
 
     domains = extraction_domains_for(target_url)
-    base_temp = temp_dir or Path.cwd() / "temp"
 
     cancel_handle = None
     stop_watcher = threading.Event()
@@ -613,93 +821,117 @@ def extract_to_netscape_file(
         v20_skipped = 0
         extract_fn = getattr(rc, "extract", None)
         read_fn = getattr(rc, "read", None)
+        snap_db: Optional[Path] = None
+        local_state: Optional[Path] = None
 
-        try:
-            if callable(extract_fn):
-                kwargs = _build_extract_kwargs(b_id, prof, domains, policy, timeout, cancel_handle)
-                try:
-                    rows = list(extract_fn(**kwargs) or [])
-                except TypeError:
-                    minimal_kw: Dict[str, Any] = {"browser": b_id, "app_bound": policy}
-                    if prof:
-                        minimal_kw["profile"] = prof
-                    if domains is not None:
-                        minimal_kw["domains"] = domains
+        # On Windows Chromium browsers, snapshot the locked SQLite database FIRST so we never hit OS error 32!
+        if sys.platform == "win32" and b_id in _CHROMIUM_BROWSERS:
+            snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
+            if snap_db is not None and snap_db.is_file():
+                # 1A: First try pure-Python v10 + plaintext decryption on `snap_db`
+                rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                # 1B: If not enough for site auth, try `extract_from_path` with current policy
+                if not rows_have_site_auth(rows, target_url):
+                    path_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, policy)
+                    if rows_have_site_auth(path_rows, target_url) or len(path_rows) > len(rows):
+                        rows = path_rows
+                # 1C: If auth cookies are STILL missing because they are v20-encrypted (`v20_skipped > 0` or App-Bound browser),
+                # perform a one-time v20 extraction on the already-unlocked `snap_db` and cache it permanently!
+                if not rows_have_site_auth(rows, target_url) and (v20_skipped > 0 or b_id in _APP_BOUND_CHROMIUM_BROWSERS):
+                    for v20_pol in ("allow_elevated_fallback", "injection_only"):
+                        if on_log:
+                            on_log(
+                                f"[Cookies] 检测到 {b_id} 中包含 {v20_skipped or 'App-Bound'} 条 v20 加密登录凭据，"
+                                f"正在对已解锁快照执行一次性解密 ({v20_pol}) 并写入持久缓存..."
+                            )
+                        v20_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, v20_pol)
+                        if rows_have_site_auth(v20_rows, target_url):
+                            rows = v20_rows
+                            break
+                        if len(v20_rows) > len(rows):
+                            rows = v20_rows
+
+        # Step 2: Standard `rookie_cookies.extract` (for Firefox/Gecko, macOS/Linux, or if `snap_db` still lacked auth cookies)
+        if not rows_have_site_auth(rows, target_url):
+            try:
+                eff_pol = policy
+                if sys.platform == "win32" and b_id in _APP_BOUND_CHROMIUM_BROWSERS and eff_pol == "disabled" and (v20_skipped > 0 or not rows):
+                    eff_pol = "allow_elevated_fallback"
+                if callable(extract_fn):
+                    kwargs = _build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)
                     try:
-                        rows = list(extract_fn(**minimal_kw) or [])
+                        direct_rows = list(extract_fn(**kwargs) or [])
                     except TypeError:
-                        if policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
-                            rows = []
-                        else:
-                            rows = list(extract_fn(browser=b_id) or [])
-            elif callable(read_fn):
-                read_kw = _build_extract_kwargs(b_id, prof, None, policy, timeout, cancel_handle)
-                read_kw.pop("domains", None)
-                snap = read_fn(**read_kw)
-                all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
-                if domains:
-                    rows = [
-                        r
-                        for r in all_rows
-                        if any(
-                            str(r.get("domain") or "").lstrip(".").lower() == d
-                            or str(r.get("domain") or "").lstrip(".").lower().endswith("." + d)
-                            for d in domains
-                        )
-                    ]
-                else:
-                    rows = all_rows
-            else:
-                if policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
-                    rows = []
+                        minimal_kw: Dict[str, Any] = {"browser": b_id, "app_bound": eff_pol}
+                        if prof:
+                            minimal_kw["profile"] = prof
+                        if domains is not None:
+                            minimal_kw["domains"] = domains
+                        try:
+                            direct_rows = list(extract_fn(**minimal_kw) or [])
+                        except TypeError:
+                            direct_rows = list(extract_fn(browser=b_id) or [])
+                    if rows_have_site_auth(direct_rows, target_url) or len(direct_rows) > len(rows):
+                        rows = direct_rows
+                elif callable(read_fn):
+                    read_kw = _build_extract_kwargs(b_id, prof, None, eff_pol, timeout, cancel_handle)
+                    read_kw.pop("domains", None)
+                    snap = read_fn(**read_kw)
+                    all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
+                    if domains:
+                        direct_rows = [
+                            r
+                            for r in all_rows
+                            if any(
+                                str(r.get("domain") or "").lstrip(".").lower() == d
+                                or str(r.get("domain") or "").lstrip(".").lower().endswith("." + d)
+                                for d in domains
+                            )
+                        ]
+                    else:
+                        direct_rows = all_rows
+                    if rows_have_site_auth(direct_rows, target_url) or len(direct_rows) > len(rows):
+                        rows = direct_rows
                 else:
                     helper_fn = getattr(rc, b_id, None)
                     if not callable(helper_fn):
                         raise RuntimeError(f"rookie_cookies 不支持浏览器 {b_id}")
-                    rows = list(helper_fn(domains=domains) if domains else helper_fn())
-        except Exception as primary_exc:
-            err_lower = str(primary_exc).lower()
-            is_locked_err = (
-                "os error 32" in err_lower
-                or "share-locked" in err_lower
-                or "being used by another process" in err_lower
-                or ("locked" in err_lower and ("database" in err_lower or "cookie" in err_lower))
-            )
-            if is_locked_err and b_id in ("edge", "chrome", "brave", "chromium", "vivaldi", "opera", "opera_gx"):
-                snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
-                if snap_db is not None and snap_db.is_file():
-                    extract_path_fn = getattr(rc, "extract_from_path", None)
-                    if callable(extract_path_fn):
-                        try:
-                            path_kw: Dict[str, Any] = {"domains": domains, "app_bound": policy}
-                            if local_state is not None:
-                                path_kw["local_state_path"] = str(local_state)
-                            else:
-                                path_kw["browser_id"] = b_id
-                            rows = list(extract_path_fn(str(snap_db), **path_kw) or [])
-                        except Exception:
-                            rows = []
-                    if not rows:
-                        rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
-                else:
+                    direct_rows = list(helper_fn(domains=domains) if domains else helper_fn())
+                    if rows_have_site_auth(direct_rows, target_url) or len(direct_rows) > len(rows):
+                        rows = direct_rows
+            except Exception as primary_exc:
+                err_lower = str(primary_exc).lower()
+                is_locked_err = (
+                    "os error 32" in err_lower
+                    or "share-locked" in err_lower
+                    or "being used by another process" in err_lower
+                    or ("locked" in err_lower and ("database" in err_lower or "cookie" in err_lower))
+                )
+                if is_locked_err and b_id in _CHROMIUM_BROWSERS:
+                    if snap_db is None or not snap_db.is_file():
+                        snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
+                    if snap_db is not None and snap_db.is_file():
+                        for fallback_pol in (policy, "allow_elevated_fallback", "injection_only"):
+                            cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, fallback_pol)
+                            if rows_have_site_auth(cand_rows, target_url):
+                                rows = cand_rows
+                                break
+                            if len(cand_rows) > len(rows):
+                                rows = cand_rows
+                        if not rows:
+                            rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                    elif not rows:
+                        raise primary_exc
+                elif not rows:
                     raise primary_exc
-            else:
-                raise primary_exc
-
-        # If extract() succeeded without throwing OS error 32, but returned 0 rows on Chromium with policy=="disabled",
-        # also check if our SQLite v10 reader can recover any v10/plaintext cookies from the database
-        if not rows and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
-            snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=None)
-            if snap_db is not None and snap_db.is_file():
-                rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
 
         if not rows:
             if on_log:
                 dom_desc = f"（目标域: {', '.join(domains)}）" if domains else ""
-                if (policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS) or v20_skipped > 0:
+                if v20_skipped > 0:
                     on_log(
-                        f"[Cookies 提示] {b_id} 中的 Cookie 采用 App-Bound (v20) 加密；为避免自动弹出新浏览器窗口，"
-                        "已跳过进程注入读取。正在自动启用免 Cookie 通道与备用解析接口（若需登录态，可在设置中点击「登录并获取 Cookies…」导出一次或改用 Firefox）。"
+                        f"[Cookies 警告] {b_id} 中检测到 {v20_skipped} 条 App-Bound (v20) 加密 Cookie 未能自动解密。"
+                        "请打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」导出一次（永久免弹窗复用），或改用 Firefox。"
                     )
                 else:
                     on_log(
@@ -757,22 +989,39 @@ def extract_to_netscape_file(
         if valid_count == 0:
             return None
 
-        cookie_dir = base_temp / "cookies"
-        cookie_dir.mkdir(parents=True, exist_ok=True)
+        final_netscape = "\n".join(fixed_lines) + "\n"
         out_path = cookie_dir / f"cookies_session_rookie_{b_id}_{uuid.uuid4().hex[:8]}.txt"
-        out_path.write_text("\n".join(fixed_lines) + "\n", encoding="utf-8")
+        out_path.write_text(final_netscape, encoding="utf-8")
         try:
             os.chmod(out_path, 0o600)
         except OSError:
             pass
 
-        if on_log:
+        if target_url:
+            rep = inspect_netscape(out_path, target_url)
+            if on_log:
+                on_log(
+                    f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}) 提取 {valid_count} 条 Cookie | {rep.summary()}"
+                )
+            # If the extracted cookie file contains only anonymous cookies (missing key login cookies) while v20 cookies were skipped,
+            # do NOT treat this partial anonymous file as a valid login cookie file (so caller can fall back to cached cookies or warn clearly)
+            if not rep.ok and v20_skipped > 0:
+                if on_log:
+                    on_log(
+                        f"[Cookies 警告] 从 {b_id} 仅读取到匿名 Cookie，关键登录凭据 ({v20_skipped} 条) 受 v20 保护未能解密；"
+                        "建议使用设置中的「登录并获取 Cookies…」导出一次。"
+                    )
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+                return None
+            if rep.ok:
+                _save_to_persistent_cookie_cache(final_netscape, base_temp, b_id, target_url, on_log=on_log)
+        elif on_log:
             on_log(
-                f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}, 策略: {policy}) 成功提取 {valid_count} 条 Cookie"
+                f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}) 成功提取 {valid_count} 条 Cookie"
             )
-            if target_url:
-                rep = inspect_netscape(out_path, target_url)
-                on_log(f"[Cookies 体检] {rep.summary()}")
 
         return out_path
 
@@ -798,33 +1047,31 @@ def diagnose_browser_cookies(
     """Run an on-demand browser Cookie extraction & static inspection check for the Settings UI."""
     rc = _import_rookie()
     if rc is None:
-        return (
-            False,
-            "当前环境未安装 rookie-cookies 组件（请运行 `pip install rookie-cookies>=0.6.0` 或使用打包版）。",
-        )
-    import tempfile
+        return False, "当前环境未安装 rookie-cookies 组件，请运行 pip install rookie-cookies>=0.6.0。"
 
     logs: List[str] = []
-    with tempfile.TemporaryDirectory(prefix="rookie_diag_") as tmp:
+    try:
+        out_file = extract_to_netscape_file(
+            browser=browser,
+            profile=profile,
+            target_url=target_url,
+            app_bound=app_bound,
+            on_log=logs.append,
+            force_refresh=True,
+        )
+    except Exception as exc:
+        return False, "\n".join(logs) if logs else str(exc)
+
+    if out_file is None or not out_file.exists():
+        return False, "\n".join(logs) or f"未能从 {browser} 提取到任何有效 Cookie。"
+
+    try:
+        if target_url:
+            rep = inspect_netscape(out_file, target_url)
+            return rep.ok, "\n".join(logs + [rep.summary()])
+        return True, "\n".join(logs) or "Cookie 提取成功。"
+    finally:
         try:
-            out = extract_to_netscape_file(
-                browser=browser,
-                profile=profile,
-                target_url=target_url,
-                temp_dir=Path(tmp),
-                app_bound=app_bound,
-                timeout=15.0,
-                on_log=logs.append,
-            )
-        except DownloadError as exc:
-            return False, exc.user_message
-        except Exception as exc:
-            return False, translate_rookie_error(exc, browser_id=browser)
-
-        if out is None or not out.exists():
-            return False, "\n".join(logs) or f"未能从 {browser} 提取到匹配的 Cookie。"
-
-        if target_url.strip():
-            rep = inspect_netscape(out, target_url.strip())
-            return rep.ok, "\n".join(logs)
-        return True, "\n".join(logs)
+            out_file.unlink()
+        except OSError:
+            pass

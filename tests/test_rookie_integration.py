@@ -308,5 +308,91 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertEqual(profs[1].profile_id, "Profile 1")
 
 
+    def test_v1_3_1_v20_browser_id_decryption_and_persistent_cookie_cache(self) -> None:
+        """Regression test for v1.3.1:
+        1) Anonymous-only cookies (e.g. PREF) do not fool rows_have_site_auth into skipping v20 extraction;
+        2) _call_extract_from_path passes browser_id="edge" (not local_state_path) so v20 App-Bound decryption works on snap_db;
+        3) Once valid YouTube login cookies are extracted, subsequent calls reuse the persistent cache with 0 browser calls."""
+        from app.core.site_cookies import rows_have_site_auth
+
+        yt_url = "https://www.youtube.com/watch?v=fyuaW6Uf-S8&t=17s"
+        self.assertFalse(
+            rows_have_site_auth([{"domain": ".youtube.com", "name": "PREF", "value": "tz=Asia.Shanghai", "expires": 0}], yt_url)
+        )
+        self.assertTrue(
+            rows_have_site_auth([{"domain": ".youtube.com", "name": "__Secure-3PSID", "value": "secret_psid", "expires": 0}], yt_url)
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp) / "temp"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            snap_db = Path(tmp) / "Cookies.sqlite"
+            local_state = Path(tmp) / "Local State"
+            local_state.write_text("{}", encoding="utf-8")
+
+            conn = sqlite3.connect(str(snap_db))
+            conn.execute(
+                "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, is_secure INTEGER, is_httponly INTEGER, expires_utc INTEGER)"
+            )
+            # 1 anonymous plaintext cookie (PREF) + 1 v20-encrypted login cookie (__Secure-3PSID)
+            conn.execute(
+                "INSERT INTO cookies VALUES ('.youtube.com', 'PREF', 'f4=4000000', X'', '/', 1, 0, 13450000000000000)"
+            )
+            conn.execute(
+                "INSERT INTO cookies VALUES ('.youtube.com', '__Secure-3PSID', '', X'76323000112233445566778899AABBCCDDEEFF', '/', 1, 1, 13450000000000000)"
+            )
+            conn.commit()
+            conn.close()
+
+            fake_rc = type(sys)("rookie_cookies")
+            path_calls = []
+
+            def _fake_extract_from_path(db_p, **kw):
+                path_calls.append(kw)
+                # Verify browser_id is passed (NOT local_state_path) so v20 decryption is enabled
+                if kw.get("browser_id") == "edge" and kw.get("app_bound") in ("allow_elevated_fallback", "injection_only"):
+                    return [
+                        {
+                            "domain": ".youtube.com",
+                            "name": "__Secure-3PSID",
+                            "value": "v20_decrypted_psid_ok",
+                            "path": "/",
+                            "secure": True,
+                            "http_only": True,
+                            "expires": 1999999999,
+                        }
+                    ]
+                return []
+
+            fake_rc.extract_from_path = _fake_extract_from_path  # type: ignore[attr-defined]
+            fake_rc.extract = lambda **kw: (_ for _ in ()).throw(RuntimeError("OS error 32"))  # type: ignore[attr-defined]
+
+            with _patch_sys_module("rookie_cookies", fake_rc), patch(
+                "app.core.rookie_bridge._copy_locked_chromium_cookies_db", return_value=(snap_db, local_state)
+            ):
+                # Call 1: unlocks snap_db, sees PREF is not enough & v20_skipped==1, decrypts via browser_id="edge" and caches
+                out1 = rookie_bridge.extract_to_netscape_file(
+                    browser="edge",
+                    target_url=yt_url,
+                    temp_dir=temp_dir,
+                    token=CancelToken(),
+                )
+                self.assertIsNotNone(out1)
+                self.assertIn("v20_decrypted_psid_ok", out1.read_text(encoding="utf-8"))
+                self.assertTrue(any(c.get("browser_id") == "edge" for c in path_calls))
+
+                # Call 2: hits persistent validated cache immediately with ZERO calls to extract_from_path!
+                calls_before = len(path_calls)
+                out2 = rookie_bridge.extract_to_netscape_file(
+                    browser="edge",
+                    target_url=yt_url,
+                    temp_dir=temp_dir,
+                    token=CancelToken(),
+                )
+                self.assertIsNotNone(out2)
+                self.assertIn("v20_decrypted_psid_ok", out2.read_text(encoding="utf-8"))
+                self.assertEqual(len(path_calls), calls_before)
+
+
 if __name__ == "__main__":
     unittest.main()

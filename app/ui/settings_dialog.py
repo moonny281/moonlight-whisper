@@ -400,11 +400,15 @@ class SettingsDialog(QDialog):
         self.cfg.managed_cookie_site = ""
 
     def _open_cookie_login(self) -> None:
-        dlg = CookieLoginDialog(self.paths, self)
+        dlg = CookieLoginDialog(
+            self.paths,
+            self,
+            proxy=self.edit_proxy.text().strip(),
+            preferred_browser=str(self.combo_browser_cookies.currentData() or "edge"),
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.exported_path:
             self.edit_cookies_file.setText(dlg.exported_path)
             self.cfg.managed_cookie_site = dlg.exported_site_key
-            self.combo_browser_cookies.setCurrentIndex(0)
 
     def _check_cookies(self) -> None:
         raw_path = self.edit_cookies_file.text().strip()
