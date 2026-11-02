@@ -9,8 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Iterator
+from unittest.mock import patch
 
 from app.core import downloader, rookie_bridge
+from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions
 from app.core.errors import DownloadError
 from app.paths import AppPaths
@@ -81,6 +83,7 @@ class TestRookieIntegration(unittest.TestCase):
                 target_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 temp_dir=Path(tmp),
                 app_bound="injection_only",
+                token=CancelToken(),
                 on_log=logs.append,
             )
             self.assertIsNotNone(cookie_file)
@@ -90,7 +93,6 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertEqual(extract_calls[0]["profile"], "Profile 1")
             self.assertEqual(extract_calls[0]["domains"], ["youtube.com", "google.com"])
             self.assertEqual(extract_calls[0]["app_bound"], "injection_only")
-            self.assertTrue(extract_calls[0]["include_session"])
 
             # Verify MozillaCookieJar loads the file cleanly
             jar = http.cookiejar.MozillaCookieJar(str(cookie_file))
@@ -126,13 +128,14 @@ class TestRookieIntegration(unittest.TestCase):
                 on_log=logs.append,
                 paths=paths,
                 target_url="https://www.bilibili.com/video/BV1xx411c7mD",
+                token=CancelToken(),
             )
             self.assertIn("cookiefile", ydl_opts)
             self.assertNotIn("cookiesfrombrowser", ydl_opts)
             self.assertTrue(Path(ydl_opts["cookiefile"]).exists())
             self.assertTrue(any("SESSDATA" in l for l in logs))
 
-    def test_elevated_fallback_and_rookie_error_translation(self) -> None:
+    def test_elevated_fallback_and_rookie_error_translation_with_cancel_token(self) -> None:
         fake_rc = type(sys)("rookie_cookies")
         calls = []
 
@@ -160,6 +163,7 @@ class TestRookieIntegration(unittest.TestCase):
                 target_url="https://www.bilibili.com/video/BV1",
                 temp_dir=Path(tmp),
                 app_bound="injection_only",
+                token=CancelToken(),
             )
             self.assertIsNotNone(out)
             self.assertEqual(calls, ["injection_only", "allow_elevated_fallback"])
@@ -179,13 +183,79 @@ class TestRookieIntegration(unittest.TestCase):
                     browser="edge",
                     target_url="https://www.bilibili.com/video/BV1",
                     temp_dir=Path(tmp),
+                    token=CancelToken(),
                 )
             self.assertIn("App-Bound (v20)", ctx.exception.user_message)
             self.assertIn("允许管理员提权兜底", ctx.exception.user_message)
 
+    def test_edge_locked_db_with_cancel_token_falls_back_cleanly_for_tiktok(self) -> None:
+        """Regression test for v1.2.8: when `token=CancelToken()` is passed and Edge DB is share-locked (OS error 32),
+        it must NOT raise `TypeError: 'bool' object is not callable`, and TikTok download must still succeed."""
+        fake_rc = type(sys)("rookie_cookies")
+
+        class FakeCancellationHandle:
+            def cancel(self):
+                pass
+
+        class FakeShareLockedError(RuntimeError):
+            kind = "engine"
+            code = "source_inspection_failed"
+            stop_reason = None
+
+        def _locked_extract(**kw):
+            raise FakeShareLockedError("Windows browser database is share-locked at Default/Network/Cookies (OS error 32)")
+
+        fake_rc.CancellationHandle = FakeCancellationHandle  # type: ignore[attr-defined]
+        fake_rc.extract = _locked_extract  # type: ignore[attr-defined]
+
+        class BrokenYoutubeDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download=False):
+                raise RuntimeError("ERROR: [TikTok] 7696957163670998294: Unexpected response from webpage request")
+
+        fake_ytdlp = type(sys)("yt_dlp")
+        fake_ytdlp.YoutubeDL = BrokenYoutubeDL  # type: ignore[attr-defined]
+
+        fake_tikwm_resp = {
+            "code": 0,
+            "data": {
+                "id": "7696957163670998294",
+                "title": "TikTok Edge 锁库回退测试",
+                "duration": 15.0,
+                "play": "https://cdn.example.com/7696957163670998294.mp4",
+                "author": {"nickname": "tester"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, _patch_sys_module("rookie_cookies", fake_rc), _patch_sys_module(
+            "yt_dlp", fake_ytdlp
+        ), patch("app.core.http_client.fetch_json", return_value=fake_tikwm_resp):
+            downloader._DIRECT_MEDIA_CACHE.clear()
+            paths = AppPaths(app_dir=Path(tmp))
+            dl_opts = DownloadOptions(cookies_from_browser="edge")
+            logs: list[str] = []
+            info = downloader.fetch_info(
+                "https://vt.tiktok.com/ZSgwwQnPH/",
+                dl_opts,
+                token=CancelToken(),
+                on_log=logs.append,
+                paths=paths,
+            )
+            self.assertEqual(info.id, "7696957163670998294")
+            self.assertEqual(info.title, "TikTok Edge 锁库回退测试")
+            self.assertTrue(any("OS error 32" in l for l in logs))
+
     def test_profile_discovery_parsing(self) -> None:
         fake_rc = type(sys)("rookie_cookies")
-        fake_rc.profiles = lambda browser_id, timeout=5.0: [  # type: ignore[attr-defined]
+        fake_rc.profiles = lambda browser_id, timeout=5: [  # type: ignore[attr-defined]
             {"profile": {"profile_id": "Default", "display_name": "Person 1", "is_default": True}},
             {"profile": {"profile_id": "Profile 1", "display_name": "Work Account", "is_default": False}},
         ]

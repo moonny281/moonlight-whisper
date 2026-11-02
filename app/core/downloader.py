@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from app.core import http_client, rookie_bridge
 from app.core.cancel import CancelToken
 from app.core.errors import CancelledError, DownloadError
-from app.core.site_cookies import cookie_domains_for, inspect_netscape
+from app.core.site_cookies import cookie_domains_for, inspect_netscape, resolve_site
 from app.paths import PATHS, AppPaths
 
 ProgressCallback = Callable[[float, str], None]
@@ -465,12 +465,24 @@ def _apply_js_runtime_opts(
     except ImportError:
         has_ejs = False
     if not has_ejs:
-        # 兜底：允许 yt-dlp 从其官方 GitHub 发布页获取脚本（yt-dlp 会做哈希校验）。默认情况下该能力是关闭的。
         ydl_opts["remote_components"] = ["ejs:github"]
         if on_log:
             on_log("[YouTube] 未找到 yt-dlp-ejs，已允许从 GitHub 获取挑战解析脚本（兜底）")
     if (deno_bin is None or not deno_bin.exists()) and on_log:
         on_log("[YouTube 警告] 未找到 deno，YouTube 视频可能无法解析；请把 deno.exe 放入 bin/")
+
+
+def _find_cached_cookie_fallback(paths: AppPaths, target_url: str) -> Optional[Path]:
+    """Check if the user has a previously exported/imported cookie file in `data_root/cookies/<site>.txt` or `data_root/cookies.txt`."""
+    candidates: List[Path] = []
+    site = resolve_site(target_url)
+    if site is not None:
+        candidates.append(paths.data_root / "cookies" / f"{site.key}.txt")
+    candidates.append(paths.data_root / "cookies.txt")
+    for c in candidates:
+        if c.is_file() and c.stat().st_size > 0:
+            return c
+    return None
 
 
 def _build_common_ydl_opts(
@@ -542,8 +554,26 @@ def _build_common_ydl_opts(
             except DownloadError as r_exc:
                 ydl_opts["_rookie_cookie_dropped"] = True
                 ydl_opts["_rookie_error_msg"] = r_exc.user_message
+            except Exception as unexpected_exc:
+                msg = rookie_bridge.translate_rookie_error(unexpected_exc, browser_id=browser_name)
+                if on_log:
+                    on_log(f"[Cookies 警告] {msg}")
+                ydl_opts["_rookie_cookie_dropped"] = True
+                ydl_opts["_rookie_error_msg"] = msg
+
+            # If browser live extraction failed (e.g. browser running & locking DB), check if a cached cookies.txt exists
+            if not loaded_cookiefile:
+                cached_fb = _find_cached_cookie_fallback(paths, target_url)
+                if cached_fb is not None:
+                    prepared_fb = prepare_cookie_file(cached_fb, paths.temp_dir, on_log=None, target_url=target_url)
+                    if prepared_fb is not None and prepared_fb.exists():
+                        ydl_opts["cookiefile"] = str(prepared_fb)
+                        loaded_cookiefile = True
+                        ydl_opts.pop("_rookie_cookie_dropped", None)
+                        if on_log:
+                            on_log(f"[Cookies 自动回退] 浏览器实时提取受限，已自动挂载本地缓存 Cookies：{cached_fb.name}")
         else:
-            ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)  # (浏览器, 配置, keyring, 容器)
+            ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
 
     if _is_tiktok_url(target_url) and "tiktok" in _WORKING_UA_CACHE:
         ydl_opts["http_headers"] = {"User-Agent": _WORKING_UA_CACHE["tiktok"]}

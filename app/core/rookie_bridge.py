@@ -42,6 +42,8 @@ DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
     ("yandex", "Yandex Browser"),
 )
 
+_GECKO_BROWSERS = {"firefox", "librewolf", "zen", "cachy"}
+
 
 @dataclass
 class BrowserProfileInfo:
@@ -87,8 +89,6 @@ def list_supported_browsers() -> List[Dict[str, str]]:
             try:
                 raw_list = supp_fn()
                 results: List[Dict[str, str]] = []
-                seen: set = set()
-                # Put primary recommended browsers first if present in supported_browsers()
                 by_id: Dict[str, Dict[str, Any]] = {}
                 for item in raw_list or []:
                     if isinstance(item, dict) and item.get("id"):
@@ -105,7 +105,6 @@ def list_supported_browsers() -> List[Dict[str, str]]:
                             "engine": str(item.get("engine") or ""),
                         }
                     )
-                    seen.add(b_id)
                 if results:
                     return results
             except Exception:
@@ -128,7 +127,7 @@ def list_browser_profiles(browser_id: str, timeout: float = 5.0) -> List[Browser
 
     try:
         try:
-            raw_profiles = prof_fn(b_id, timeout=timeout)
+            raw_profiles = prof_fn(b_id, timeout=int(timeout))
         except TypeError:
             raw_profiles = prof_fn(b_id)
     except Exception:
@@ -153,7 +152,6 @@ def extraction_domains_for(target_url: str) -> Optional[List[str]]:
     and matches subdomains automatically.
     """
     if not (target_url or "").strip():
-        # Default to all major video platforms supported by Moonlight Whisper
         all_doms: List[str] = ["youtube.com", "google.com"]
         for s in SITES:
             for d in s.cookie_domains:
@@ -205,6 +203,14 @@ def _records_to_netscape_fallback(records: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _is_token_cancelled(token: Optional[CancelToken]) -> bool:
+    """Safely check whether `token` is cancelled regardless of whether `is_cancelled` is a bool property or method."""
+    if token is None:
+        return False
+    attr = getattr(token, "is_cancelled", False)
+    return bool(attr() if callable(attr) else attr)
+
+
 def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
     """Translate a `rookie_cookies.RookieError` (or subclass) into an actionable Chinese diagnostic message."""
     kind = str(getattr(exc, "kind", "") or "")
@@ -220,6 +226,14 @@ def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
         if stop_reason == "timed_out":
             return f"从 {b_label} 提取 Cookie 超时（可能正等待系统密钥环或浏览器响应），请重试或改用「登录并获取 Cookies…」。"
         return f"从 {b_label} 提取 Cookie 中止 ({stop_reason or code})：{text}"
+
+    if "os error 32" in lower or "share-locked" in lower or "being used by another process" in lower or (
+        "locked" in lower and ("database" in lower or "sqlite" in lower or "cookie" in lower)
+    ):
+        return (
+            f"{b_label} 正在运行并独占锁定了 Cookies 数据库（Windows OS error 32）。"
+            f"请先完全关闭 {b_label} 后再试（或以管理员身份运行本程序启用卷影复制），也可在设置中点击「登录并获取 Cookies…」或改用 Firefox。"
+        )
 
     if kind in ("request", "source") or "conflicting_profile" in code or "profile" in code:
         return (
@@ -237,11 +251,36 @@ def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
     ):
         return (
             f"无法从 {b_label} 解密 App-Bound (v20) Cookies（{code or 'decrypt_failed'}）："
-            "可能是 Windows Defender / 杀毒软件拦截了无特权解密组件，或 Chrome 133+ 启用了 flag-3 保护。"
+            "可能是 Windows Defender / 杀毒软件拦截了无特权解密组件，或 Chrome/Edge 133+ 启用了 flag-3 保护。"
             "可在设置中将 App-Bound 策略切换为「允许管理员提权兜底」，或点击「登录并获取 Cookies…」/ 改用 Firefox。"
         )
 
     return f"通过 rookie-cookies 从 {b_label} 读取 Cookies 失败（{code or kind or 'error'}）：{text}"
+
+
+def _build_extract_kwargs(
+    b_id: str,
+    prof: Optional[str],
+    domains: Optional[List[str]],
+    policy: str,
+    timeout: float,
+    cancel_handle: Any = None,
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "browser": b_id,
+        "app_bound": policy,
+        "timeout": max(1, int(timeout)),
+    }
+    if prof:
+        kwargs["profile"] = prof
+    if domains is not None:
+        kwargs["domains"] = domains
+    if b_id in _GECKO_BROWSERS or prof is None:
+        # Pass include_session=True so Gecko browsers include session cookies; safe on extract/read
+        kwargs["include_session"] = True
+    if cancel_handle is not None:
+        kwargs["cancellation"] = cancel_handle
+    return kwargs
 
 
 def extract_to_netscape_file(
@@ -286,7 +325,7 @@ def extract_to_netscape_file(
 
             def _watch_cancel() -> None:
                 while not stop_watcher.wait(0.1):
-                    if token.is_cancelled():
+                    if _is_token_cancelled(token):
                         try:
                             cancel_handle.cancel()
                         except Exception:
@@ -304,20 +343,10 @@ def extract_to_netscape_file(
         read_fn = getattr(rc, "read", None)
 
         if callable(extract_fn):
-            kwargs: Dict[str, Any] = {
-                "browser": b_id,
-                "profile": prof,
-                "domains": domains,
-                "include_session": True,
-                "app_bound": policy,
-                "timeout": timeout,
-            }
-            if cancel_handle is not None:
-                kwargs["cancellation"] = cancel_handle
+            kwargs = _build_extract_kwargs(b_id, prof, domains, policy, timeout, cancel_handle)
             try:
                 rows = list(extract_fn(**kwargs) or [])
             except TypeError:
-                # Fallback if an older/minor binding signature omits some keyword args
                 minimal_kw: Dict[str, Any] = {"browser": b_id}
                 if prof:
                     minimal_kw["profile"] = prof
@@ -325,15 +354,8 @@ def extract_to_netscape_file(
                     minimal_kw["domains"] = domains
                 rows = list(extract_fn(**minimal_kw) or [])
         elif callable(read_fn):
-            read_kw: Dict[str, Any] = {
-                "browser": b_id,
-                "profile": prof,
-                "include_session": True,
-                "app_bound": policy,
-                "timeout": timeout,
-            }
-            if cancel_handle is not None:
-                read_kw["cancellation"] = cancel_handle
+            read_kw = _build_extract_kwargs(b_id, prof, None, policy, timeout, cancel_handle)
+            read_kw.pop("domains", None)
             snap = read_fn(**read_kw)
             all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
             if domains:
@@ -358,14 +380,14 @@ def extract_to_netscape_file(
         # try a second pass with allow_elevated_fallback if callable(extract_fn)
         if not rows and policy == "injection_only" and b_id in ("chrome", "edge", "brave") and callable(extract_fn):
             try:
-                retry_kw = {
-                    "browser": b_id,
-                    "profile": prof,
-                    "domains": domains,
-                    "include_session": True,
-                    "app_bound": "allow_elevated_fallback",
-                    "timeout": timeout,
-                }
+                retry_kw = _build_extract_kwargs(
+                    b_id,
+                    prof,
+                    domains,
+                    "allow_elevated_fallback",
+                    timeout,
+                    cancel_handle,
+                )
                 rows = list(extract_fn(**retry_kw) or [])
                 if rows and on_log:
                     on_log(f"[rookie-cookies] 已通过 allow_elevated_fallback 策略从 {b_id} 提取到 {len(rows)} 条 Cookie。")
@@ -452,7 +474,7 @@ def extract_to_netscape_file(
         return out_path
 
     except Exception as exc:
-        if token and token.is_cancelled():
+        if _is_token_cancelled(token):
             raise CancelledError("任务已取消") from exc
         if str(getattr(exc, "stop_reason", "")) == "cancelled":
             raise CancelledError("任务已取消") from exc
@@ -497,7 +519,7 @@ def diagnose_browser_cookies(
             return False, translate_rookie_error(exc, browser_id=browser)
 
         if out is None or not out.exists():
-            return False, "\n".join(logs) or f"未能从 {browser} 提取到任何匹配的 Cookie。"
+            return False, "\n".join(logs) or f"未能从 {browser} 提取到匹配的 Cookie。"
 
         if target_url.strip():
             rep = inspect_netscape(out, target_url.strip())
