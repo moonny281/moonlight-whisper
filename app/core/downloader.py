@@ -75,7 +75,7 @@ class DownloadOptions:
     cookies_file: str = ""
     cookies_from_browser: str = ""
     cookies_browser_profile: str = ""   # 例如 "Default" / "Profile 1" / Firefox 配置目录名
-    cookies_app_bound: str = "injection_only"  # "injection_only" | "allow_elevated_fallback" | "disabled"
+    cookies_app_bound: str = "disabled"  # "disabled" (default: no browser spawn) | "injection_only" | "allow_elevated_fallback"
     allow_playlist: bool = False
     ffmpeg_dir: Optional[Path] = None
     deno_path: Optional[Path] = None
@@ -546,6 +546,7 @@ def _build_common_ydl_opts(
                 )
                 if rookie_cookie_file is not None and rookie_cookie_file.exists():
                     ydl_opts["cookiefile"] = str(rookie_cookie_file)
+                    opts.cookies_file = str(rookie_cookie_file)
                     loaded_cookiefile = True
                 else:
                     ydl_opts["_rookie_cookie_dropped"] = True
@@ -1008,6 +1009,8 @@ def fetch_info(
         deno_path=opts.deno_path,
     )
     items = extract_playlist_or_info(url, single_opts, token=token, on_log=on_log, paths=paths)
+    if single_opts.cookies_file and not opts.cookies_file:
+        opts.cookies_file = single_opts.cookies_file
     if not items:
         raise DownloadError("未能解析到有效的视频信息", detail=url)
     return items[0]

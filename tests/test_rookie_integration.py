@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from unittest.mock import patch
 
-from app.core import downloader, rookie_bridge
+from app.config import Config
+from app.core import browser_cookies, downloader, rookie_bridge
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions
 from app.core.errors import DownloadError
@@ -33,6 +34,26 @@ def _patch_sys_module(name: str, fake_mod: Any) -> Iterator[None]:
 
 
 class TestRookieIntegration(unittest.TestCase):
+    def test_no_browser_window_spawn_defaults_and_migration(self) -> None:
+        """Regression test for v1.2.9: downloading must NEVER spawn a new Edge/Chrome window by default."""
+        # 1. Default Config and DownloadOptions must use app_bound="disabled"
+        cfg = Config()
+        self.assertEqual(cfg.cookies_app_bound, "disabled")
+        dl_opts = DownloadOptions()
+        self.assertEqual(dl_opts.cookies_app_bound, "disabled")
+
+        # 2. Existing config.json with old default "injection_only" must auto-migrate to "disabled"
+        migrated_cfg = Config.from_dict({"version": 1, "cookies_from_browser": "edge", "cookies_app_bound": "injection_only"})
+        self.assertEqual(migrated_cfg.cookies_app_bound, "disabled")
+
+        # 3. refresh_managed_cookies must NOT spawn ManagedBrowser by default
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(app_dir=Path(tmp))
+            with patch("app.core.browser_cookies.ManagedBrowser") as mock_mb:
+                res = browser_cookies.refresh_managed_cookies("bilibili", paths)
+                self.assertIsNone(res)
+                mock_mb.assert_not_called()
+
     def test_youtube_dual_domain_extraction_and_netscape_output(self) -> None:
         self.assertEqual(
             rookie_bridge.extraction_domains_for("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
@@ -82,7 +103,6 @@ class TestRookieIntegration(unittest.TestCase):
                 profile="Profile 1",
                 target_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 temp_dir=Path(tmp),
-                app_bound="injection_only",
                 token=CancelToken(),
                 on_log=logs.append,
             )
@@ -92,7 +112,7 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertEqual(extract_calls[0]["browser"], "edge")
             self.assertEqual(extract_calls[0]["profile"], "Profile 1")
             self.assertEqual(extract_calls[0]["domains"], ["youtube.com", "google.com"])
-            self.assertEqual(extract_calls[0]["app_bound"], "injection_only")
+            self.assertEqual(extract_calls[0]["app_bound"], "disabled")
 
             # Verify MozillaCookieJar loads the file cleanly
             jar = http.cookiejar.MozillaCookieJar(str(cookie_file))
@@ -120,7 +140,6 @@ class TestRookieIntegration(unittest.TestCase):
             opts = DownloadOptions(
                 cookies_from_browser="chrome",
                 cookies_browser_profile="Default",
-                cookies_app_bound="injection_only",
             )
             logs = []
             ydl_opts = downloader._build_common_ydl_opts(
@@ -135,38 +154,26 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertTrue(Path(ydl_opts["cookiefile"]).exists())
             self.assertTrue(any("SESSDATA" in l for l in logs))
 
-    def test_elevated_fallback_and_rookie_error_translation_with_cancel_token(self) -> None:
+    def test_disabled_policy_does_not_spawn_second_pass_and_translates_errors(self) -> None:
         fake_rc = type(sys)("rookie_cookies")
         calls = []
 
-        def _extract_needing_elevated(**kw):
+        def _empty_extract(**kw):
             calls.append(kw.get("app_bound"))
-            if kw.get("app_bound") == "injection_only":
-                return []
-            return [
-                {
-                    "domain": ".bilibili.com",
-                    "path": "/",
-                    "secure": True,
-                    "expires": 1999999999,
-                    "name": "SESSDATA",
-                    "value": "elevated_ok",
-                    "http_only": True,
-                }
-            ]
+            return []
 
-        fake_rc.extract = _extract_needing_elevated  # type: ignore[attr-defined]
+        fake_rc.extract = _empty_extract  # type: ignore[attr-defined]
 
         with tempfile.TemporaryDirectory() as tmp, _patch_sys_module("rookie_cookies", fake_rc):
             out = rookie_bridge.extract_to_netscape_file(
-                browser="chrome",
+                browser="edge",
                 target_url="https://www.bilibili.com/video/BV1",
                 temp_dir=Path(tmp),
-                app_bound="injection_only",
                 token=CancelToken(),
             )
-            self.assertIsNotNone(out)
-            self.assertEqual(calls, ["injection_only", "allow_elevated_fallback"])
+            self.assertIsNone(out)
+            # Must only call once with "disabled", NEVER spawning "injection_only" or "allow_elevated_fallback"
+            self.assertEqual(calls, ["disabled"])
 
         class FakeRookieEngineError(RuntimeError):
             kind = "engine"
@@ -186,10 +193,9 @@ class TestRookieIntegration(unittest.TestCase):
                     token=CancelToken(),
                 )
             self.assertIn("App-Bound (v20)", ctx.exception.user_message)
-            self.assertIn("允许管理员提权兜底", ctx.exception.user_message)
 
     def test_edge_locked_db_with_cancel_token_falls_back_cleanly_for_tiktok(self) -> None:
-        """Regression test for v1.2.8: when `token=CancelToken()` is passed and Edge DB is share-locked (OS error 32),
+        """Regression test for v1.2.8+: when `token=CancelToken()` is passed and Edge DB is share-locked (OS error 32),
         it must NOT raise `TypeError: 'bool' object is not callable`, and TikTok download must still succeed."""
         fake_rc = type(sys)("rookie_cookies")
 

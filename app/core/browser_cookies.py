@@ -102,15 +102,28 @@ class ManagedBrowser:
             "--no-first-run",
             "--no-default-browser-check",
         ]
+        startupinfo = None
         if self.headless:
-            args += ["--headless=new", "--disable-gpu"]
+            args += [
+                "--headless=new",
+                "--disable-gpu",
+                "--no-startup-window",
+                "--silent-launch",
+                "--window-position=-32000,-32000",
+                "--window-size=1,1",
+            ]
+            if sys.platform == "win32" and hasattr(subprocess, "STARTUPINFO"):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+                startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         args.append(start_url)
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if self.headless else 0
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if (self.headless and sys.platform == "win32") else 0
         self._proc = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=flags,
+            startupinfo=startupinfo,
         )
         deadline = time.time() + timeout
         sess = _local_session()
@@ -203,21 +216,25 @@ def export_site_cookies(browser: ManagedBrowser, out_file: Path, allowed_domains
     return count
 
 
-def refresh_managed_cookies(site_key: str, paths, browser_kind: str = "edge") -> Optional[Path]:
-    """每次任务前静默刷新 cookies；失败（例如登录窗口仍开着导致配置目录被占用）不应阻断任务。"""
+def refresh_managed_cookies(site_key: str, paths, browser_kind: str = "edge", spawn_browser: bool = False) -> Optional[Path]:
+    """返回已导出的站点 Cookies 文件路径；默认绝不在后台启动新的 Edge/Chrome 浏览器进程（避免每次下载弹出新 Edge 窗口）。"""
     from app.core.site_cookies import SITES
 
     site = next((s for s in SITES if s.key == site_key), None)
-    exe = find_browser(browser_kind) or find_browser("chrome")
-    if site is None or exe is None:
+    if site is None:
         return None
     out = paths.data_root / "cookies" / f"{site_key}.txt"
+    if not spawn_browser:
+        return out if out.exists() else None
+    exe = find_browser(browser_kind) or find_browser("chrome")
+    if exe is None:
+        return out if out.exists() else None
     browser = ManagedBrowser(exe, paths.data_root / "browser_profile", headless=True)
     try:
         browser.start()
         export_site_cookies(browser, out, site.cookie_domains)
         return out
     except Exception:
-        return out if out.exists() else None     # 退回上一次导出的文件
+        return out if out.exists() else None
     finally:
         browser.close()

@@ -9,7 +9,7 @@ block_cipher = None
 project_root = Path(SPECPATH).resolve().parent
 
 # Generate Windows file_version_info.txt in pure Python (UTF-8 without BOM)
-ver_str = os.environ.get("APP_VERSION", "1.2.8").strip() or "1.2.8"
+ver_str = os.environ.get("APP_VERSION", "1.2.9").strip() or "1.2.9"
 ver_parts = (ver_str.split(".") + ["0", "0", "0", "0"])[:4]
 ver_nums = tuple(int(x) if x.isdigit() else 0 for x in ver_parts)
 version_file = project_root / "build" / "file_version_info.txt"

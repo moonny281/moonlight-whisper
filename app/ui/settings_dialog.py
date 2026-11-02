@@ -440,7 +440,7 @@ class SettingsDialog(QDialog):
                     profile=self._current_profile_text(),
                     target_url=target_url,
                     temp_dir=self.paths.temp_dir,
-                    app_bound=str(self.combo_app_bound.currentData() or "injection_only"),
+                    app_bound=str(self.combo_app_bound.currentData() or "disabled"),
                     on_log=logs.append,
                 )
             except Exception as exc:
@@ -622,7 +622,7 @@ class SettingsDialog(QDialog):
         self.cfg.cookies_file = self.edit_cookies_file.text().strip()
         self.cfg.cookies_from_browser = str(self.combo_browser_cookies.currentData() or "")
         self.cfg.cookies_browser_profile = self._current_profile_text()
-        self.cfg.cookies_app_bound = str(self.combo_app_bound.currentData() or "injection_only")
+        self.cfg.cookies_app_bound = str(self.combo_app_bound.currentData() or "disabled")
 
         self.cfg.allow_playlist = self.chk_allow_playlist.isChecked()
         self.cfg.vad = self.chk_vad.isChecked()

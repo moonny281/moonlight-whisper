@@ -1,4 +1,4 @@
-"""Built-in bridge to `rookie-cookies` (https://github.com/teng-lin/rookie-cookies) for native Rust browser Cookie extraction & App-Bound v20 decryption."""
+"""Built-in bridge to `rookie-cookies` (https://github.com/teng-lin/rookie-cookies) for native Rust browser Cookie extraction."""
 
 from __future__ import annotations
 
@@ -16,17 +16,18 @@ from app.core.site_cookies import SITES, cookie_domains_for, inspect_netscape, r
 
 LogCallback = Callable[[str], None]
 
+# Default to "disabled" so downloading NEVER spawns a new Edge/Chrome browser window on Windows!
 APP_BOUND_POLICIES: Tuple[Tuple[str, str], ...] = (
-    ("injection_only", "标准无特权解密 (injection_only，推荐)"),
-    ("allow_elevated_fallback", "允许管理员提权兜底 (allow_elevated_fallback，适配 Chrome 133+ flag-3)"),
-    ("disabled", "禁用 v20 进程注入 (disabled，防杀毒软件拦截)"),
+    ("disabled", "静默安全读取 (disabled，默认推荐：绝不弹出/启动新浏览器窗口)"),
+    ("injection_only", "无特权进程注入解密 v20 (injection_only，注意：Windows 下会拉起新浏览器窗口)"),
+    ("allow_elevated_fallback", "允许管理员提权解密 v20 (allow_elevated_fallback，注意：可能拉起浏览器窗口)"),
 )
 
 DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
-    ("firefox", "Firefox（明文库 + 会话恢复）"),
-    ("edge", "Microsoft Edge（内置 rookie-cookies v10/v20 解密）"),
-    ("chrome", "Google Chrome（内置 rookie-cookies v10/v20 解密）"),
-    ("brave", "Brave（内置 rookie-cookies v10/v20 解密）"),
+    ("firefox", "Firefox（推荐：明文库 + 会话恢复，无需启动浏览器进程）"),
+    ("edge", "Microsoft Edge（内置 rookie-cookies 读取）"),
+    ("chrome", "Google Chrome（内置 rookie-cookies 读取）"),
+    ("brave", "Brave（内置 rookie-cookies 读取）"),
     ("chromium", "Chromium"),
     ("arc", "Arc"),
     ("vivaldi", "Vivaldi"),
@@ -43,6 +44,7 @@ DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
 )
 
 _GECKO_BROWSERS = {"firefox", "librewolf", "zen", "cachy"}
+_APP_BOUND_CHROMIUM_BROWSERS = {"edge", "chrome", "brave", "coccoc", "avast"}
 
 
 @dataclass
@@ -232,7 +234,7 @@ def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
     ):
         return (
             f"{b_label} 正在运行并独占锁定了 Cookies 数据库（Windows OS error 32）。"
-            f"请先完全关闭 {b_label} 后再试（或以管理员身份运行本程序启用卷影复制），也可在设置中点击「登录并获取 Cookies…」或改用 Firefox。"
+            f"请先关闭 {b_label} 后再试，或在设置中点击「登录并获取 Cookies…」导出一次后永久免弹窗使用，也可改用 Firefox。"
         )
 
     if kind in ("request", "source") or "conflicting_profile" in code or "profile" in code:
@@ -251,8 +253,7 @@ def translate_rookie_error(exc: BaseException, browser_id: str = "") -> str:
     ):
         return (
             f"无法从 {b_label} 解密 App-Bound (v20) Cookies（{code or 'decrypt_failed'}）："
-            "可能是 Windows Defender / 杀毒软件拦截了无特权解密组件，或 Chrome/Edge 133+ 启用了 flag-3 保护。"
-            "可在设置中将 App-Bound 策略切换为「允许管理员提权兜底」，或点击「登录并获取 Cookies…」/ 改用 Firefox。"
+            "为防止自动弹出新浏览器窗口，默认已禁用进程注入。建议使用设置中的「登录并获取 Cookies…」导出一次或改用 Firefox。"
         )
 
     return f"通过 rookie-cookies 从 {b_label} 读取 Cookies 失败（{code or kind or 'error'}）：{text}"
@@ -275,8 +276,8 @@ def _build_extract_kwargs(
         kwargs["profile"] = prof
     if domains is not None:
         kwargs["domains"] = domains
-    if b_id in _GECKO_BROWSERS or prof is None:
-        # Pass include_session=True so Gecko browsers include session cookies; safe on extract/read
+    if b_id in _GECKO_BROWSERS:
+        # Only pass include_session=True on Gecko browsers (Firefox/LibreWolf/Zen)
         kwargs["include_session"] = True
     if cancel_handle is not None:
         kwargs["cancellation"] = cancel_handle
@@ -288,12 +289,14 @@ def extract_to_netscape_file(
     profile: str = "",
     target_url: str = "",
     temp_dir: Optional[Path] = None,
-    app_bound: str = "injection_only",
+    app_bound: str = "disabled",
     timeout: float = 15.0,
     token: Optional[CancelToken] = None,
     on_log: Optional[LogCallback] = None,
 ) -> Optional[Path]:
-    """Extract cookies for `target_url` from `browser` using `rookie-cookies` and write an isolated Netscape cookiefile."""
+    """Extract cookies for `target_url` from `browser` using `rookie-cookies` and write an isolated Netscape cookiefile.
+    Defaults to `app_bound="disabled"` so that `rookie-cookies` NEVER spawns a new Edge/Chrome window on Windows.
+    """
     if token:
         token.check()
 
@@ -308,9 +311,9 @@ def extract_to_netscape_file(
         return None
 
     prof = (profile or "").strip() or None
-    policy = (app_bound or "injection_only").strip().lower()
+    policy = (app_bound or "disabled").strip().lower()
     if policy not in ("injection_only", "allow_elevated_fallback", "disabled"):
-        policy = "injection_only"
+        policy = "disabled"
 
     domains = extraction_domains_for(target_url)
 
@@ -347,12 +350,19 @@ def extract_to_netscape_file(
             try:
                 rows = list(extract_fn(**kwargs) or [])
             except TypeError:
-                minimal_kw: Dict[str, Any] = {"browser": b_id}
+                # Always preserve app_bound=policy in fallback kwargs so it never defaults to spawning a browser!
+                minimal_kw: Dict[str, Any] = {"browser": b_id, "app_bound": policy}
                 if prof:
                     minimal_kw["profile"] = prof
                 if domains is not None:
                     minimal_kw["domains"] = domains
-                rows = list(extract_fn(**minimal_kw) or [])
+                try:
+                    rows = list(extract_fn(**minimal_kw) or [])
+                except TypeError:
+                    if policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                        rows = []
+                    else:
+                        rows = list(extract_fn(browser=b_id) or [])
         elif callable(read_fn):
             read_kw = _build_extract_kwargs(b_id, prof, None, policy, timeout, cancel_handle)
             read_kw.pop("domains", None)
@@ -371,36 +381,29 @@ def extract_to_netscape_file(
             else:
                 rows = all_rows
         else:
-            helper_fn = getattr(rc, b_id, None)
-            if not callable(helper_fn):
-                raise RuntimeError(f"rookie_cookies 不支持浏览器 {b_id}")
-            rows = list(helper_fn(domains=domains) if domains else helper_fn())
-
-        # If injection_only returned 0 rows on Windows Chromium and policy wasn't allow_elevated_fallback,
-        # try a second pass with allow_elevated_fallback if callable(extract_fn)
-        if not rows and policy == "injection_only" and b_id in ("chrome", "edge", "brave") and callable(extract_fn):
-            try:
-                retry_kw = _build_extract_kwargs(
-                    b_id,
-                    prof,
-                    domains,
-                    "allow_elevated_fallback",
-                    timeout,
-                    cancel_handle,
-                )
-                rows = list(extract_fn(**retry_kw) or [])
-                if rows and on_log:
-                    on_log(f"[rookie-cookies] 已通过 allow_elevated_fallback 策略从 {b_id} 提取到 {len(rows)} 条 Cookie。")
-            except Exception:
-                pass
+            # Never call legacy named helpers (rc.edge(), rc.chrome()) when policy == "disabled"
+            # because legacy helpers unconditionally use allow_elevated_fallback and spawn a browser window!
+            if policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                rows = []
+            else:
+                helper_fn = getattr(rc, b_id, None)
+                if not callable(helper_fn):
+                    raise RuntimeError(f"rookie_cookies 不支持浏览器 {b_id}")
+                rows = list(helper_fn(domains=domains) if domains else helper_fn())
 
         if not rows:
             if on_log:
                 dom_desc = f"（目标域: {', '.join(domains)}）" if domains else ""
-                on_log(
-                    f"[Cookies 警告] rookie-cookies 从 {b_id} (配置: {prof or '默认'}) 未提取到匹配的 Cookie{dom_desc}。"
-                    "请确认已在浏览器中登录目标网站。"
-                )
+                if policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                    on_log(
+                        f"[Cookies 提示] {b_id} 中的 Cookie 采用 App-Bound (v20) 加密；为避免自动弹出新浏览器窗口，"
+                        "已跳过进程注入读取。若该视频需要登录，请在设置中点击「登录并获取 Cookies…」导出一次或改用 Firefox。"
+                    )
+                else:
+                    on_log(
+                        f"[Cookies 警告] rookie-cookies 从 {b_id} (配置: {prof or '默认'}) 未提取到匹配的 Cookie{dom_desc}。"
+                        "请确认已在浏览器中登录目标网站。"
+                    )
             return None
 
         to_netscape_fn = getattr(rc, "to_netscape", None)
@@ -465,7 +468,7 @@ def extract_to_netscape_file(
 
         if on_log:
             on_log(
-                f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}, 策略: {policy}) 成功解密并提取 {valid_count} 条 Cookie"
+                f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}, 策略: {policy}) 成功提取 {valid_count} 条 Cookie"
             )
             if target_url:
                 rep = inspect_netscape(out_path, target_url)
@@ -490,7 +493,7 @@ def diagnose_browser_cookies(
     browser: str,
     profile: str = "",
     target_url: str = "",
-    app_bound: str = "injection_only",
+    app_bound: str = "disabled",
 ) -> Tuple[bool, str]:
     """Run an on-demand browser Cookie extraction & static inspection check for the Settings UI."""
     rc = _import_rookie()
