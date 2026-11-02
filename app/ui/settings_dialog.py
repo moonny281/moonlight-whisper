@@ -1,4 +1,4 @@
-"""Windows 11 Mica-styled Settings Dialog (with managed browser CDP login, Cookie health check, and Firefox/Profile support)."""
+"""Windows 11 Mica-styled Settings Dialog (with built-in rookie-cookies browser extraction, Profile discovery, managed browser CDP login, and Cookie health check)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import Config, LlmConfig
-from app.core import downloader, summarizer
+from app.core import downloader, rookie_bridge, summarizer
 from app.core.errors import ErrorInfo
 from app.core.site_cookies import inspect_netscape, netscape_to_header, probe_bilibili_login, resolve_site
 from app.paths import PATHS, AppPaths
@@ -38,7 +38,7 @@ from app.workers import YtDlpUpdateWorker
 
 
 class SettingsDialog(QDialog):
-    """Comprehensive Mica-styled settings dialog with managed browser CDP login, Cookie health check, and zero row overlap."""
+    """Comprehensive Mica-styled settings dialog with built-in rookie-cookies support, Profile discovery, and zero row overlap."""
 
     def __init__(
         self,
@@ -53,7 +53,7 @@ class SettingsDialog(QDialog):
         self._ytdlp_worker: Optional[YtDlpUpdateWorker] = None
 
         self.setWindowTitle("偏好设置 - Moonlight Whisper")
-        self.setMinimumSize(720, 620)
+        self.setMinimumSize(740, 650)
         self._build_ui()
         self._load_from_config()
         if 0 <= initial_tab < self.tabs.count():
@@ -120,19 +120,43 @@ class SettingsDialog(QDialog):
         proxy_box.addLayout(proxy_form)
         layout.addWidget(proxy_card)
 
+        rookie_ver = rookie_bridge.get_version()
         cookie_card, cookie_box = make_mica_section(
-            "站点登录与 Cookies",
-            "提示：Chrome / Edge (127+) 启用了 App-Bound 加密，无法直接从日常浏览器读取。\n"
-            "• 推荐使用「登录并获取 Cookies…」（专用隔离浏览器）或改用 Firefox（推荐）；\n"
-            "• 手动导出 YouTube Cookies 时，请在「无痕窗口」登录并导出后立即关闭该无痕窗口，否则会被轮换失效。",
+            f"站点登录与 Cookies（内置 rookie-cookies: {rookie_ver}）",
+            "• 方式一（推荐）：在下方选择「从浏览器读取」，内置 rookie-cookies 原生支持 Edge / Chrome / Brave (含 Windows App-Bound v20 解密) 与 Firefox；\n"
+            "• 方式二：点击「登录并获取 Cookies…」打开专用隔离浏览器登录导出，或直接导入 cookies.txt。",
         )
         cookie_form = QFormLayout()
         self._configure_form(cookie_form)
 
+        self.combo_browser_cookies = QComboBox()
+        self.combo_browser_cookies.addItem("不从浏览器读取（使用下方 Cookies 文件或匿名请求）", "")
+        for b_info in rookie_bridge.list_supported_browsers():
+            self.combo_browser_cookies.addItem(b_info["display_name"], b_info["id"])
+        self.combo_browser_cookies.currentIndexChanged.connect(self._on_browser_changed)
+        cookie_form.addRow("从浏览器读取：", self.combo_browser_cookies)
+
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(6)
+        self.combo_browser_profile = QComboBox()
+        self.combo_browser_profile.setEditable(True)
+        if self.combo_browser_profile.lineEdit() is not None:
+            self.combo_browser_profile.lineEdit().setPlaceholderText("留空自动选择默认配置，或点击右侧刷新本机 Profile 列表")
+        self.btn_refresh_profiles = QPushButton("刷新配置")
+        self.btn_refresh_profiles.clicked.connect(self._refresh_browser_profiles)
+        profile_row.addWidget(self.combo_browser_profile, 1)
+        profile_row.addWidget(self.btn_refresh_profiles)
+        cookie_form.addRow("浏览器配置：", profile_row)
+
+        self.combo_app_bound = QComboBox()
+        for policy_key, policy_label in rookie_bridge.APP_BOUND_POLICIES:
+            self.combo_app_bound.addItem(policy_label, policy_key)
+        cookie_form.addRow("v20 解密策略：", self.combo_app_bound)
+
         cookie_file_row = QHBoxLayout()
         cookie_file_row.setSpacing(6)
         self.edit_cookies_file = QLineEdit()
-        self.edit_cookies_file.setPlaceholderText("支持 Netscape cookies.txt / JSON（可使用下方按钮直接登录导出或检测有效性）")
+        self.edit_cookies_file.setPlaceholderText("可选：指定本地 cookies.txt / JSON（若填写则优先于上方浏览器读取）")
         btn_paste_cookie = QPushButton("📋 从剪贴板导入")
         btn_paste_cookie.setToolTip("将剪贴板中的 Netscape / JSON Cookie 内容转换并保存为标准 cookies.txt")
         btn_paste_cookie.clicked.connect(self._import_cookies_from_clipboard)
@@ -160,24 +184,13 @@ class SettingsDialog(QDialog):
         cookie_action_row.addStretch(1)
         cookie_form.addRow("快捷工具：", cookie_action_row)
 
-        self.combo_browser_cookies = QComboBox()
-        self.combo_browser_cookies.addItem("不从浏览器读取", "")
-        self.combo_browser_cookies.addItem("Firefox（推荐）", "firefox")
-        self.combo_browser_cookies.addItem("Chrome（127+ 通常无法读取）", "chrome")
-        self.combo_browser_cookies.addItem("Edge（较新版本可能无法读取）", "edge")
-        cookie_form.addRow("从浏览器读取：", self.combo_browser_cookies)
-
-        self.edit_browser_profile = QLineEdit()
-        self.edit_browser_profile.setPlaceholderText("配置文件名，如 Default / Profile 1；Firefox 留空自动选择")
-        cookie_form.addRow("浏览器配置：", self.edit_browser_profile)
-
         cookie_box.addLayout(cookie_form)
         layout.addWidget(cookie_card)
 
-        ytdlp_card, ytdlp_box = make_mica_section("yt-dlp 下载引擎与 YouTube 运行时维护")
+        ytdlp_card, ytdlp_box = make_mica_section("yt-dlp 下载引擎与运行环境维护")
         ytdlp_row = QHBoxLayout()
         self.lbl_ytdlp_ver = QLabel(f"当前版本：{downloader.get_yt_dlp_version(self.paths)}")
-        self.btn_diagnose_ytdlp = QPushButton("诊断 YouTube 运行环境")
+        self.btn_diagnose_ytdlp = QPushButton("诊断运行环境")
         self.btn_diagnose_ytdlp.clicked.connect(self._show_youtube_diagnosis)
         self.btn_update_ytdlp = QPushButton("一键热更新 yt-dlp")
         self.btn_update_ytdlp.clicked.connect(self._start_update_ytdlp)
@@ -335,6 +348,53 @@ class SettingsDialog(QDialog):
         if folder:
             edit.setText(folder)
 
+    def _current_profile_text(self) -> str:
+        data = self.combo_browser_profile.currentData()
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        return self.combo_browser_profile.currentText().strip()
+
+    def _on_browser_changed(self) -> None:
+        browser_id = str(self.combo_browser_cookies.currentData() or "").strip()
+        if browser_id and rookie_bridge.is_available():
+            self._populate_profiles(browser_id, keep_text=self._current_profile_text())
+
+    def _populate_profiles(self, browser_id: str, keep_text: str = "") -> None:
+        self.combo_browser_profile.blockSignals(True)
+        try:
+            self.combo_browser_profile.clear()
+            self.combo_browser_profile.addItem("", "")
+            for p in rookie_bridge.list_browser_profiles(browser_id):
+                label = f"{p.profile_id} ({p.display_name})" if p.display_name != p.profile_id else p.profile_id
+                if p.is_default:
+                    label += " [默认]"
+                self.combo_browser_profile.addItem(label, p.profile_id)
+            if keep_text:
+                idx = self.combo_browser_profile.findData(keep_text)
+                if idx >= 0:
+                    self.combo_browser_profile.setCurrentIndex(idx)
+                else:
+                    self.combo_browser_profile.setEditText(keep_text)
+        finally:
+            self.combo_browser_profile.blockSignals(False)
+
+    def _refresh_browser_profiles(self) -> None:
+        browser_id = str(self.combo_browser_cookies.currentData() or "").strip()
+        if not browser_id:
+            QMessageBox.information(self, "提示", "请先在「从浏览器读取」下拉框中选择一个浏览器。")
+            return
+        cur = self._current_profile_text()
+        self._populate_profiles(browser_id, keep_text=cur)
+        count = max(0, self.combo_browser_profile.count() - 1)
+        if count > 0:
+            QMessageBox.information(self, "刷新完成", f"已通过 rookie-cookies 发现 {browser_id} 的 {count} 个本地配置目录。")
+        else:
+            QMessageBox.information(
+                self,
+                "未发现多配置",
+                f"未检测到 {browser_id} 的额外配置目录（留空即可自动使用默认配置）。",
+            )
+
     def _clear_cookies_file(self) -> None:
         self.edit_cookies_file.clear()
         self.cfg.managed_cookie_site = ""
@@ -348,23 +408,49 @@ class SettingsDialog(QDialog):
 
     def _check_cookies(self) -> None:
         raw_path = self.edit_cookies_file.text().strip()
-        if not raw_path:
-            QMessageBox.warning(self, "检测 Cookies", "请先选择或导入 Cookies 文件。")
+        browser_id = str(self.combo_browser_cookies.currentData() or "").strip()
+        if not raw_path and not browser_id:
+            QMessageBox.warning(
+                self,
+                "检测 Cookies",
+                "请先选择「从浏览器读取」的浏览器，或指定「Cookies 文件」。",
+            )
             return
         url, ok = QInputDialog.getText(self, "检测 Cookies", "输入一个需要登录才能看的视频链接：")
         if not ok or not url.strip():
             return
         target_url = url.strip()
-        logs: list[str] = []
-        prepared = downloader.prepare_cookie_file(
-            Path(raw_path).expanduser(),
-            self.paths.temp_dir,
-            on_log=logs.append,
-            target_url=target_url,
-        )
-        if prepared is None:
-            QMessageBox.warning(self, "检测结果", "\n".join(logs) or "Cookies 文件无法解析")
-            return
+
+        if raw_path:
+            logs: list[str] = []
+            prepared = downloader.prepare_cookie_file(
+                Path(raw_path).expanduser(),
+                self.paths.temp_dir,
+                on_log=logs.append,
+                target_url=target_url,
+            )
+            if prepared is None:
+                QMessageBox.warning(self, "检测结果", "\n".join(logs) or "Cookies 文件无法解析")
+                return
+        else:
+            logs = []
+            try:
+                prepared = rookie_bridge.extract_to_netscape_file(
+                    browser=browser_id,
+                    profile=self._current_profile_text(),
+                    target_url=target_url,
+                    temp_dir=self.paths.temp_dir,
+                    app_bound=str(self.combo_app_bound.currentData() or "injection_only"),
+                    on_log=logs.append,
+                )
+            except Exception as exc:
+                err = ErrorInfo.from_exception(exc)
+                QMessageBox.warning(self, "浏览器提取失败", err.user_message)
+                return
+            if prepared is None:
+                QMessageBox.warning(self, "检测结果", "\n".join(logs) or f"未能从 {browser_id} 提取到匹配的 Cookies")
+                return
+
         report = inspect_netscape(prepared, target_url)
         msg = report.summary()
         site = resolve_site(target_url)
@@ -374,13 +460,13 @@ class SettingsDialog(QDialog):
             if bili_ok is True:
                 msg += "\n\n[B 站联网探测] 登录态有效（isLogin=True）！"
             elif bili_ok is False:
-                msg += "\n\n[B 站联网探测] 服务端返回未登录（isLogin=False），SESSDATA 可能已失效，请重新登录导出。"
+                msg += "\n\n[B 站联网探测] 服务端返回未登录（isLogin=False），SESSDATA 可能已失效，请重新登录。"
         QMessageBox.information(self, "检测结果", msg)
 
     def _show_youtube_diagnosis(self) -> None:
         diag = downloader.diagnose_youtube_runtime(self.paths)
         lines = [f"• {k}：{v}" for k, v in diag.items()]
-        QMessageBox.information(self, "YouTube 运行时诊断", "\n".join(lines))
+        QMessageBox.information(self, "运行环境诊断", "\n".join(lines))
 
     def _import_cookies_from_clipboard(self) -> None:
         cb = QGuiApplication.clipboard()
@@ -445,7 +531,15 @@ class SettingsDialog(QDialog):
         idx_browser = self.combo_browser_cookies.findData(self.cfg.cookies_from_browser)
         if idx_browser >= 0:
             self.combo_browser_cookies.setCurrentIndex(idx_browser)
-        self.edit_browser_profile.setText(self.cfg.cookies_browser_profile)
+        elif self.cfg.cookies_from_browser:
+            self.combo_browser_cookies.addItem(self.cfg.cookies_from_browser, self.cfg.cookies_from_browser)
+            self.combo_browser_cookies.setCurrentIndex(self.combo_browser_cookies.count() - 1)
+
+        self._populate_profiles(self.cfg.cookies_from_browser, keep_text=self.cfg.cookies_browser_profile)
+
+        idx_ab = self.combo_app_bound.findData(self.cfg.cookies_app_bound)
+        if idx_ab >= 0:
+            self.combo_app_bound.setCurrentIndex(idx_ab)
 
         self.chk_allow_playlist.setChecked(self.cfg.allow_playlist)
         self.chk_vad.setChecked(self.cfg.vad)
@@ -527,7 +621,8 @@ class SettingsDialog(QDialog):
         self.cfg.pypi_mirror = str(self.combo_pypi.currentData() or "tuna")
         self.cfg.cookies_file = self.edit_cookies_file.text().strip()
         self.cfg.cookies_from_browser = str(self.combo_browser_cookies.currentData() or "")
-        self.cfg.cookies_browser_profile = self.edit_browser_profile.text().strip()
+        self.cfg.cookies_browser_profile = self._current_profile_text()
+        self.cfg.cookies_app_bound = str(self.combo_app_bound.currentData() or "injection_only")
 
         self.cfg.allow_playlist = self.chk_allow_playlist.isChecked()
         self.cfg.vad = self.chk_vad.isChecked()

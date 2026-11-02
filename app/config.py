@@ -59,6 +59,7 @@ class Config:
     cookies_file: str = ""
     cookies_from_browser: str = ""
     cookies_browser_profile: str = ""
+    cookies_app_bound: str = "injection_only"  # "injection_only" | "allow_elevated_fallback" | "disabled"
     managed_cookie_site: str = ""
     hf_mirror: bool = True
     pypi_mirror: str = "tuna"      # "tuna" | "aliyun" | "official"
@@ -119,6 +120,10 @@ class Config:
         if pypi_mirror not in ("tuna", "aliyun", "official"):
             pypi_mirror = "tuna"
 
+        cookies_app_bound = _str("cookies_app_bound", defaults.cookies_app_bound).strip().lower()
+        if cookies_app_bound not in ("injection_only", "allow_elevated_fallback", "disabled"):
+            cookies_app_bound = "injection_only"
+
         filename_template = _str("filename_template", defaults.filename_template).strip() or "{title}"
 
         return cls(
@@ -143,6 +148,7 @@ class Config:
             cookies_file=_str("cookies_file", defaults.cookies_file).strip(),
             cookies_from_browser=_str("cookies_from_browser", defaults.cookies_from_browser).strip(),
             cookies_browser_profile=_str("cookies_browser_profile", defaults.cookies_browser_profile).strip(),
+            cookies_app_bound=cookies_app_bound,
             managed_cookie_site=_str("managed_cookie_site", defaults.managed_cookie_site).strip(),
             hf_mirror=bool(data.get("hf_mirror", defaults.hf_mirror)),
             pypi_mirror=pypi_mirror,
@@ -163,7 +169,6 @@ class Config:
             version = 0
 
         if version < 1:
-            # v0 -> v1 migration: normalize legacy keys if present
             if "simplify_chinese" in migrated and "to_simplified" not in migrated:
                 migrated["to_simplified"] = bool(migrated.pop("simplify_chinese"))
             if "export_srt" in migrated and "write_srt" not in migrated:
@@ -211,7 +216,6 @@ class Config:
             cfg = cls()
 
         cfg.apply_to_paths(paths)
-        # If custom `data_dir` redirects to another `config.json`, load from there if present
         redirected = paths.config_path
         if path is None and redirected != target and redirected.exists():
             try:

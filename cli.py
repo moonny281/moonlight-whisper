@@ -9,7 +9,7 @@ import sys
 from typing import List
 
 from app.config import Config
-from app.core import downloader, gpu_runtime, pipeline
+from app.core import downloader, gpu_runtime, pipeline, rookie_bridge
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions
 from app.core.errors import CancelledError, ErrorInfo
@@ -21,7 +21,7 @@ from app.paths import PATHS
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="moonlight-whisper-cli",
-        description="Moonlight Whisper 命令行视频/音频转录工具 (yt-dlp + faster-whisper)",
+        description="Moonlight Whisper 命令行视频/音频转录工具 (yt-dlp + rookie-cookies + faster-whisper)",
     )
     parser.add_argument(
         "inputs",
@@ -41,11 +41,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cookies", help="Cookies 文件（Netscape / JSON / 原始 Cookie 头）")
     parser.add_argument(
         "--cookies-from-browser",
-        choices=["firefox", "chrome", "edge"],
-        help="从浏览器读取 Cookies（Chromium 系新版通常失败）",
+        help="通过内置 rookie-cookies 从浏览器提取 Cookies（支持 chrome/edge/firefox/brave/arc/vivaldi/opera/qq/360 等）",
     )
-    parser.add_argument("--cookies-browser-profile", help="浏览器配置文件名（如 Default / Profile 1）")
-    parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs 诊断信息后退出")
+    parser.add_argument("--cookies-browser-profile", help="浏览器配置文件名（如 Default / Profile 1 / default-release）")
+    parser.add_argument(
+        "--app-bound",
+        choices=["injection_only", "allow_elevated_fallback", "disabled"],
+        help="Windows Chromium v20 App-Bound 解密策略（默认 injection_only）",
+    )
+    parser.add_argument("--list-profiles", metavar="BROWSER", help="列出指定浏览器在本机已发现的 Profile 列表后退出")
+    parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs / rookie-cookies 诊断信息后退出")
     parser.add_argument("--detect-gpu", action="store_true", help="仅检测当前机器的 NVIDIA GPU 与 CUDA 运行库状态")
     parser.add_argument("--install-gpu-runtime", action="store_true", help="在线下载并安装 CUDA 12 运行库")
     return parser
@@ -82,12 +87,24 @@ def main(argv: List[str] | None = None) -> int:
     if args.cookies:
         cfg.cookies_file = args.cookies
     if args.cookies_from_browser:
-        cfg.cookies_from_browser = args.cookies_from_browser
+        cfg.cookies_from_browser = args.cookies_from_browser.strip().lower()
     if args.cookies_browser_profile:
         cfg.cookies_browser_profile = args.cookies_browser_profile
+    if args.app_bound:
+        cfg.cookies_app_bound = args.app_bound
 
     cfg.apply_to_paths(PATHS)
     PATHS.ensure_runtime_dirs()
+
+    if args.list_profiles:
+        profiles = rookie_bridge.list_browser_profiles(args.list_profiles)
+        if not profiles:
+            print(f"未在当前系统发现 {args.list_profiles} 的配置文件（或未安装 rookie-cookies）。")
+            return 0
+        for p in profiles:
+            default_tag = " [默认]" if p.is_default else ""
+            print(f"{p.profile_id}\t({p.display_name}){default_tag}")
+        return 0
 
     if args.diagnose:
         diag = downloader.diagnose_youtube_runtime(PATHS)
@@ -137,6 +154,7 @@ def main(argv: List[str] | None = None) -> int:
         cookies_file=cfg.cookies_file,
         cookies_from_browser=cfg.cookies_from_browser,
         cookies_browser_profile=cfg.cookies_browser_profile,
+        cookies_app_bound=cfg.cookies_app_bound,
         allow_playlist=cfg.allow_playlist,
         ffmpeg_dir=PATHS.bin_dir,
     )

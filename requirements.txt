@@ -1,4 +1,4 @@
-# Moonlight Whisper 依赖清单 (兼容 CUDA 12 / cuDNN 9 与 Windows x64 Python 3.10~3.12)
+# Moonlight Whisper 依赖清单 (兼容 CUDA 12 / cuDNN 9 与 Windows x64 Python 3.11~3.12)
 faster-whisper>=1.1.0,<2.0.0
 ctranslate2>=4.5.0,<5.0.0
 # faster-whisper <=1.2.1 调用 av.open(..., metadata_errors="ignore")，而 PyAV 18+ 移除了该参数
@@ -8,6 +8,8 @@ huggingface_hub>=0.23.0,<1.0.0
 tokenizers>=0.19.0,<1.0.0
 # [default] 会同时安装 yt-dlp-ejs（YouTube JS 挑战解析脚本），且版本由 yt-dlp 精确锁定
 yt-dlp[default]>=2025.11.12
+# 内置 teng-lin/rookie-cookies 原生 Rust 跨平台浏览器 Cookie 提取与 Windows App-Bound v20 解密引擎
+rookie-cookies>=0.6.0
 # Windows 浏览器 Cookie AES-GCM 解密与 HLS AES-128 解密依赖
 pycryptodomex>=3.20.0
 # TikTok / Instagram 等站点要求 TLS/JA3 浏览器指纹伪装 (impersonation)，锁定 <=0.16.0 规避 yt-dlp#17604/#17942

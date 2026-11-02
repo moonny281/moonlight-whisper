@@ -128,6 +128,7 @@ def run(
                 cookies_file=cfg.cookies_file,
                 cookies_from_browser=cfg.cookies_from_browser,
                 cookies_browser_profile=cfg.cookies_browser_profile,
+                cookies_app_bound=cfg.cookies_app_bound,
                 allow_playlist=False,
                 ffmpeg_dir=paths.bin_dir,
             )

@@ -1,4 +1,4 @@
-"""yt-dlp wrapper with YouTube JS runtime/EJS/multi-client fallback, Cookie domain binding & static inspection, domestic proxy bypass, and isolated Cookie cleanup."""
+"""yt-dlp wrapper with built-in rookie-cookies extraction, YouTube JS runtime/EJS/multi-client fallback, Cookie domain binding & static inspection, domestic proxy bypass, and isolated Cookie cleanup."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from app.core import http_client
+from app.core import http_client, rookie_bridge
 from app.core.cancel import CancelToken
 from app.core.errors import CancelledError, DownloadError
 from app.core.site_cookies import cookie_domains_for, inspect_netscape
@@ -75,6 +75,7 @@ class DownloadOptions:
     cookies_file: str = ""
     cookies_from_browser: str = ""
     cookies_browser_profile: str = ""   # 例如 "Default" / "Profile 1" / Firefox 配置目录名
+    cookies_app_bound: str = "injection_only"  # "injection_only" | "allow_elevated_fallback" | "disabled"
     allow_playlist: bool = False
     ffmpeg_dir: Optional[Path] = None
     deno_path: Optional[Path] = None
@@ -386,7 +387,7 @@ def import_cookies_from_text(
     if count <= 0 or not netscape_text:
         raise DownloadError(
             "未能从剪贴板识别到有效的 Cookie 内容（若粘贴的是原始 Cookie 请求头，需同时指定目标站点链接）。\n"
-            "推荐使用 Get cookies.txt LOCALLY 或 Cookie-Editor 插件导出，或使用「登录并获取 Cookies…」。"
+            "推荐直接启用「从浏览器读取 (rookie-cookies)」或使用「登录并获取 Cookies…」。"
         )
     paths.ensure_runtime_dirs()
     dest = paths.data_root / "cookies.txt"
@@ -436,7 +437,7 @@ def prepare_cookie_file(
     if count <= 0 or not netscape_text:
         if on_log:
             on_log(
-                f"[Cookies 警告] 文件 {cookie_path.name} 未包含可识别的 Cookie，建议使用「偏好设置 -> 登录并获取 Cookies」或重新导出。"
+                f"[Cookies 警告] 文件 {cookie_path.name} 未包含可识别的 Cookie，建议使用「偏好设置 -> 从浏览器读取 (rookie-cookies)」或重新导出。"
             )
         return None
 
@@ -477,6 +478,7 @@ def _build_common_ydl_opts(
     on_log: Optional[LogCallback] = None,
     paths: AppPaths = PATHS,
     target_url: str = "",
+    token: Optional[CancelToken] = None,
 ) -> Dict[str, Any]:
     ydl_opts: Dict[str, Any] = {
         "noplaylist": not opts.allow_playlist,
@@ -517,7 +519,31 @@ def _build_common_ydl_opts(
     if opts.cookies_from_browser.strip() and not loaded_cookiefile:
         browser_name = opts.cookies_from_browser.strip().lower()
         profile = opts.cookies_browser_profile.strip() or None
-        ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)  # (浏览器, 配置, keyring, 容器)
+        if rookie_bridge.is_available():
+            try:
+                purge_stale_cookie_files(paths.temp_dir)
+                _register_cookie_dir_cleanup(paths.temp_dir / "cookies")
+                rookie_cookie_file = rookie_bridge.extract_to_netscape_file(
+                    browser=browser_name,
+                    profile=opts.cookies_browser_profile.strip(),
+                    target_url=target_url,
+                    temp_dir=paths.temp_dir,
+                    app_bound=opts.cookies_app_bound,
+                    token=token,
+                    on_log=on_log,
+                )
+                if rookie_cookie_file is not None and rookie_cookie_file.exists():
+                    ydl_opts["cookiefile"] = str(rookie_cookie_file)
+                    loaded_cookiefile = True
+                else:
+                    ydl_opts["_rookie_cookie_dropped"] = True
+            except CancelledError:
+                raise
+            except DownloadError as r_exc:
+                ydl_opts["_rookie_cookie_dropped"] = True
+                ydl_opts["_rookie_error_msg"] = r_exc.user_message
+        else:
+            ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)  # (浏览器, 配置, keyring, 容器)
 
     if _is_tiktok_url(target_url) and "tiktok" in _WORKING_UA_CACHE:
         ydl_opts["http_headers"] = {"User-Agent": _WORKING_UA_CACHE["tiktok"]}
@@ -660,13 +686,10 @@ def _run_ydl_extract_with_fallbacks(
     paths: AppPaths,
     on_log: Optional[LogCallback] = None,
 ) -> Tuple[Any, Optional[Any]]:
-    """Run `ydl.extract_info(url, download=download)` with automatic fallbacks for:
-    1. Windows Edge/Chrome SQLite cookie database exclusive lock (`Could not copy Chrome cookie database`)
-    2. YouTube multi-client (`web,mweb,tv,ios`) + SABR format fallback + cookie-free `android_vr` fallback
-    3. TikTok anti-bot webpage challenge (`Unexpected response from webpage request`) with fresh cookie copies & proven UAs
-    """
+    """Run `ydl.extract_info(url, download=download)` with automatic fallbacks."""
     current_opts = copy.copy(ydl_opts)
-    cookies_dropped = False
+    cookies_dropped = bool(current_opts.pop("_rookie_cookie_dropped", False))
+    rookie_err_msg = str(current_opts.pop("_rookie_error_msg", "") or "")
 
     try:
         with yt_dlp.YoutubeDL(current_opts) as ydl:
@@ -674,6 +697,10 @@ def _run_ydl_extract_with_fallbacks(
     except CancelledError:
         raise
     except Exception as first_exc:
+        if cookies_dropped:
+            first_exc.cookies_dropped = True  # type: ignore[attr-defined]
+        if rookie_err_msg:
+            first_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
         err_str = str(first_exc)
         err_lower = err_str.lower()
 
@@ -728,6 +755,8 @@ def _run_ydl_extract_with_fallbacks(
                 except Exception as yt_c_exc:
                     if cookies_dropped:
                         yt_c_exc.cookies_dropped = True  # type: ignore[attr-defined]
+                    if rookie_err_msg:
+                        yt_c_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
                     first_exc = yt_c_exc
 
             # 2B: Try cookie-free `android_vr,ios,tv_embedded,web` (bypasses rotated/expired cookies & SABR audio restrictions!)
@@ -747,6 +776,8 @@ def _run_ydl_extract_with_fallbacks(
             except Exception as yt_nc_exc:
                 if cookies_dropped:
                     yt_nc_exc.cookies_dropped = True  # type: ignore[attr-defined]
+                if rookie_err_msg:
+                    yt_nc_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
                 first_exc = yt_nc_exc
 
         # Fallback 3: TikTok webpage anti-bot challenge (`Unexpected response from webpage request`)
@@ -791,6 +822,8 @@ def _run_ydl_extract_with_fallbacks(
                 except Exception as tk_exc:
                     if cookies_dropped:
                         tk_exc.cookies_dropped = True  # type: ignore[attr-defined]
+                    if rookie_err_msg:
+                        tk_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
                     first_exc = tk_exc
 
         raise first_exc
@@ -803,19 +836,19 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
     if "failed to decrypt with dpapi" in lower:
         return DownloadError(
             "无法解密 Chrome/Edge 的 Cookies：新版 Chromium（127+）启用了 App-Bound 加密，yt-dlp 无法从外部读取。"
-            "请改用 Firefox 读取，或在设置中点击「登录并获取 Cookies」，也可导入 cookies.txt。",
+            "请确认已安装内置 rookie-cookies 组件，或改用 Firefox、「登录并获取 Cookies」、导入 cookies.txt。",
             detail=text,
         )
 
     if "could not find" in lower and "cookies database" in lower:
         return DownloadError(
-            "未找到所选浏览器的 Cookies 数据库，请确认浏览器已安装、已登录，并在设置中填写正确的配置文件名（如 Profile 1）。",
+            "未找到所选浏览器的 Cookies 数据库，请确认浏览器已安装、已登录，并在设置中选择正确的配置文件名（如 Profile 1）。",
             detail=text,
         )
 
     if "could not copy" in lower and "cookie database" in lower:
         return DownloadError(
-            "浏览器正在运行并独占锁定了 Cookies 数据库（#7271）。请先关闭浏览器，或改用 Firefox、「登录并获取 Cookies」或导入 cookies.txt。",
+            "浏览器正在运行并独占锁定了 Cookies 数据库（#7271）。请先关闭浏览器，或使用内置 rookie-cookies / Firefox /「登录并获取 Cookies」。",
             detail=text,
         )
 
@@ -844,7 +877,10 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
         )
 
     if any(pat in lower for pat in _AGE_OR_AUTH_PATTERNS):
-        if getattr(exc, "cookies_dropped", False):
+        rookie_err = getattr(exc, "rookie_error_msg", "")
+        if rookie_err:
+            msg = f"{rookie_err}（匿名重试后该视频仍要求登录）"
+        elif getattr(exc, "cookies_dropped", False):
             msg = "浏览器 Cookies 读取失败，已匿名重试，但该视频需要登录。请改用 Firefox、「登录并获取 Cookies」或导入 cookies.txt。"
         elif has_cookies:
             msg = "已使用你导入的 Cookies，但站点仍要求登录：Cookies 可能已过期/被轮换，或不属于该站点账号。请重新导出（YouTube 请用无痕窗口导出并立刻关闭）。"
@@ -936,6 +972,7 @@ def fetch_info(
         cookies_file=opts.cookies_file,
         cookies_from_browser=opts.cookies_from_browser,
         cookies_browser_profile=opts.cookies_browser_profile,
+        cookies_app_bound=opts.cookies_app_bound,
         allow_playlist=False,
         ffmpeg_dir=opts.ffmpeg_dir,
         deno_path=opts.deno_path,
@@ -958,7 +995,7 @@ def extract_playlist_or_info(
         token.check()
 
     yt_dlp = _import_yt_dlp(paths)
-    ydl_opts = _build_common_ydl_opts(opts, on_log=on_log, paths=paths, target_url=url)
+    ydl_opts = _build_common_ydl_opts(opts, on_log=on_log, paths=paths, target_url=url, token=token)
     ydl_opts["extract_flat"] = "in_playlist" if opts.allow_playlist else False
     has_cookies = bool("cookiefile" in ydl_opts or "cookiesfrombrowser" in ydl_opts)
 
@@ -1091,7 +1128,7 @@ def download_audio(
             if on_progress:
                 on_progress(1.0, "音频流下载完成")
 
-    ydl_opts = _build_common_ydl_opts(opts, on_log=on_log, paths=paths, target_url=url)
+    ydl_opts = _build_common_ydl_opts(opts, on_log=on_log, paths=paths, target_url=url, token=token)
     ydl_opts["noplaylist"] = True
     ydl_opts["format"] = "bestaudio/best*"
     ydl_opts["outtmpl"] = str(workdir / "%(id)s.%(ext)s")
@@ -1172,6 +1209,7 @@ def diagnose_youtube_runtime(paths: AppPaths = PATHS) -> Dict[str, str]:
         report["yt-dlp 期望的 EJS 版本"] = str(_info.VERSION)
     except Exception:
         report["yt-dlp 期望的 EJS 版本"] = "未知"
+    report["rookie-cookies (浏览器 Cookie 引擎)"] = rookie_bridge.get_version()
     return report
 
 
