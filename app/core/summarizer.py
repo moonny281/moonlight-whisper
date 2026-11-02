@@ -54,7 +54,19 @@ def generate_summary(
 
     max_chars = 24000
     if len(full_text) > max_chars:
-        full_text = full_text[:max_chars] + "\n...(后文省略)"
+        head_len = 10000
+        mid_len = 7000
+        tail_len = 7000
+        mid_start = max(head_len, (len(full_text) - mid_len) // 2)
+        full_text = (
+            full_text[:head_len]
+            + "\n\n...[中段节选]...\n\n"
+            + full_text[mid_start : mid_start + mid_len]
+            + "\n\n...[后段节选]...\n\n"
+            + full_text[-tail_len:]
+        )
+        if on_log:
+            on_log(f"[摘要提示] 转录文本超过 {max_chars} 字符，已自动抽取前、中、后三段核心内容生成全局摘要。")
 
     endpoint = llm_cfg.base_url.rstrip("/")
     if not endpoint.endswith("/chat/completions"):

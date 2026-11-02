@@ -46,8 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cookies-browser-profile", help="浏览器配置文件名（如 Default / Profile 1 / default-release）")
     parser.add_argument(
         "--app-bound",
-        choices=["injection_only", "allow_elevated_fallback", "disabled"],
-        help="Windows Chromium v20 App-Bound 解密策略（默认 injection_only）",
+        choices=["disabled", "smart", "injection_only", "allow_elevated_fallback"],
+        help="Windows Chromium v20 App-Bound 解密策略（默认 disabled）",
     )
     parser.add_argument("--list-profiles", metavar="BROWSER", help="列出指定浏览器在本机已发现的 Profile 列表后退出")
     parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs / rookie-cookies 诊断信息后退出")

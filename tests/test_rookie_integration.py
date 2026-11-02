@@ -375,6 +375,7 @@ class TestRookieIntegration(unittest.TestCase):
                     browser="edge",
                     target_url=yt_url,
                     temp_dir=temp_dir,
+                    app_bound="smart",
                     token=CancelToken(),
                 )
                 self.assertIsNotNone(out1)
@@ -392,6 +393,95 @@ class TestRookieIntegration(unittest.TestCase):
                 self.assertIsNotNone(out2)
                 self.assertIn("v20_decrypted_psid_ok", out2.read_text(encoding="utf-8"))
                 self.assertEqual(len(path_calls), calls_before)
+
+
+    def test_v1_3_2_code_review_fixes(self) -> None:
+        """Regression tests for all items in the v1.3.1 code review report (Issues A, B, C, D, E, F, G & Section 3)."""
+        # Issue B: Old Node (<22) must be rejected by _usable and must NOT block ensure_deno_binary
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_node = Path(tmp) / "node.exe"
+            fake_node.write_bytes(b"fake")
+            fake_deno = Path(tmp) / "deno.exe"
+            fake_deno.write_bytes(b"fake")
+
+            with patch("app.core.downloader._probe_version", return_value=(18, 20, 0)):
+                self.assertIsNone(downloader._usable(fake_node, "node"))
+            with patch("app.core.downloader._probe_version", return_value=(22, 4, 0)):
+                self.assertEqual(downloader._usable(fake_node, "node"), fake_node)
+            with patch("app.core.downloader._probe_version", return_value=(1, 46, 0)):
+                self.assertIsNone(downloader._usable(fake_deno, "deno"))
+            with patch("app.core.downloader._probe_version", return_value=(2, 3, 1)):
+                self.assertEqual(downloader._usable(fake_deno, "deno"), fake_deno)
+
+            ydl_opts: dict = {}
+            ensure_called = []
+            with patch.object(AppPaths, "find_binary", side_effect=lambda name: fake_node if name == "node" else None), patch(
+                "app.core.downloader._probe_version", return_value=(20, 11, 0)
+            ), patch(
+                "app.core.downloader.ensure_deno_binary",
+                side_effect=lambda **kw: (ensure_called.append(True) or fake_deno),
+            ):
+                downloader._apply_js_runtime_opts(
+                    ydl_opts,
+                    deno_bin=None,
+                    paths=AppPaths(app_dir=Path(tmp)),
+                    target_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                )
+                self.assertTrue(ensure_called)
+                self.assertEqual(ydl_opts["js_runtimes"], {"deno": {"path": str(fake_deno)}})
+
+        # Issue C: _pick_root_exc must preserve root-cause JS challenge failure over subsequent bot-check retry errors
+        e1 = RuntimeError("ERROR: [youtube] dQw4w9WgXcQ: n challenge solving failed: QuickJS error")
+        e2 = RuntimeError("ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot")
+        self.assertIs(downloader._pick_root_exc([e1, e2]), e1)
+
+        # Issue E: Invidious fallback must ignore video/mp4 (2.5 Mbps) and select audio/mp4 (130 kbps)
+        invidious_payload = {
+            "title": "Invidious Audio Filter Test",
+            "author": "Tester",
+            "lengthSeconds": 120,
+            "adaptiveFormats": [
+                {
+                    "type": "video/mp4; codecs=\"avc1.640028\"",
+                    "bitrate": "2500000",
+                    "url": "https://inv.tux.pizza/videoplayback?id=VIDEO_ONLY",
+                },
+                {
+                    "type": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "bitrate": "130000",
+                    "url": "https://inv.tux.pizza/videoplayback?id=AUDIO_ONLY",
+                },
+            ],
+        }
+
+        def _mock_fetch_json(url, **kw):
+            if "api/v1/videos" in url:
+                return invidious_payload
+            raise RuntimeError("piped down")
+
+        downloader._DIRECT_MEDIA_CACHE.clear()
+        with patch("app.core.http_client.fetch_json", side_effect=_mock_fetch_json):
+            fb = downloader._fallback_youtube_direct(
+                "https://www.youtube.com/watch?v=testAudio11",
+                video_id="testAudio11",
+                proxy="",
+            )
+            self.assertIsNotNone(fb)
+            self.assertIn("id=AUDIO_ONLY", fb.stream_url)
+            self.assertNotIn("id=VIDEO_ONLY", fb.stream_url)
+
+        # Section 3: Corrupted config.json backup & proxy URL credential redaction
+        self.assertEqual(
+            downloader._redact_proxy_url("http://myuser:secretpass@127.0.0.1:7890"),
+            "http://***:***@127.0.0.1:7890",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = AppPaths(app_dir=Path(tmp))
+            bad_cfg = paths.bootstrap_config_path
+            bad_cfg.write_text("{broken json", encoding="utf-8")
+            loaded = Config.load(paths=paths)
+            self.assertEqual(loaded.cookies_app_bound, "disabled")
+            self.assertTrue(bad_cfg.with_suffix(".json.bak").is_file())
 
 
 if __name__ == "__main__":

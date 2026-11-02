@@ -1,8 +1,9 @@
-"""Configuration management (`config.json`) with validation and schema migration."""
+"""Configuration management (`config.json`) with validation, corrupted file backup, and schema migration."""
 
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -121,7 +122,7 @@ class Config:
             pypi_mirror = "tuna"
 
         cookies_app_bound = _str("cookies_app_bound", defaults.cookies_app_bound).strip().lower()
-        if cookies_app_bound not in ("injection_only", "allow_elevated_fallback", "disabled"):
+        if cookies_app_bound not in ("disabled", "smart", "injection_only", "allow_elevated_fallback"):
             cookies_app_bound = "disabled"
 
         filename_template = _str("filename_template", defaults.filename_template).strip() or "{title}"
@@ -204,9 +205,18 @@ class Config:
         tmp_path.replace(target)
         return target
 
+    @staticmethod
+    def _backup_corrupted_file(target: Path) -> None:
+        try:
+            if target.is_file():
+                bak = target.with_suffix(target.suffix + ".bak")
+                shutil.copy2(target, bak)
+        except OSError:
+            pass
+
     @classmethod
     def load(cls, path: Optional[Path] = None, paths: AppPaths = PATHS) -> "Config":
-        """Load configuration from disk, creating a default file if missing or corrupted."""
+        """Load configuration from disk, backing up `.bak` before falling back to defaults if corrupted."""
         target = path or paths.bootstrap_config_path
         if not target.exists():
             cfg = cls()
@@ -217,6 +227,7 @@ class Config:
             raw = json.loads(target.read_text(encoding="utf-8"))
             cfg = cls.from_dict(raw)
         except (OSError, json.JSONDecodeError):
+            cls._backup_corrupted_file(target)
             cfg = cls()
 
         cfg.apply_to_paths(paths)
@@ -227,5 +238,5 @@ class Config:
                 cfg = cls.from_dict(raw_redirected)
                 cfg.apply_to_paths(paths)
             except (OSError, json.JSONDecodeError):
-                pass
+                cls._backup_corrupted_file(redirected)
         return cfg

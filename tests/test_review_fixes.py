@@ -128,7 +128,7 @@ class TestReviewFixes(unittest.TestCase):
         import app
         from app.config import LlmConfig
         from app.core import summarizer
-        self.assertEqual(app.__version__, "1.3.1")
+        self.assertEqual(app.__version__, "1.3.2")
 
         empty_cfg = LlmConfig(enabled=True, api_key="")
         ok, msg = summarizer.test_llm_connection(empty_cfg)
@@ -417,7 +417,7 @@ class TestReviewFixes(unittest.TestCase):
                 self.assertTrue(calls[0][0])
                 self.assertTrue(calls[1][0])
                 self.assertFalse(calls[2][0])
-                self.assertIn("android_vr", calls[2][1])
+                self.assertIn("web_embedded", calls[2][1])
 
 
 if __name__ == "__main__":

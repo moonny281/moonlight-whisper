@@ -31,9 +31,10 @@ from app.core.site_cookies import (
 LogCallback = Callable[[str], None]
 
 APP_BOUND_POLICIES: Tuple[Tuple[str, str], ...] = (
-    ("disabled", "智能缓存优先 (推荐：优先复用本地已验证缓存，缺失时自动解锁提取并永久缓存)"),
-    ("allow_elevated_fallback", "强制实时解密 v20 (allow_elevated_fallback：直接解密 Chrome/Edge v20 并更新缓存)"),
-    ("injection_only", "无特权实时解密 v20 (injection_only：使用同权限进程解密 v20 并更新缓存)"),
+    ("disabled", "完全禁用 v20 解密（默认推荐：仅用明文库 / DPAPI v10 / 本地缓存，绝不启动浏览器）"),
+    ("smart", "智能缓存优先（缺失时自动解锁解密一次并永久缓存）"),
+    ("injection_only", "无特权实时解密 v20 (injection_only)"),
+    ("allow_elevated_fallback", "允许管理员提权解密 v20 (allow_elevated_fallback)"),
 )
 
 DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
@@ -57,7 +58,22 @@ DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
 )
 
 _GECKO_BROWSERS = {"firefox", "librewolf", "zen", "cachy"}
-_CHROMIUM_BROWSERS = {"edge", "chrome", "brave", "chromium", "vivaldi", "opera", "opera_gx", "qq", "360", "360x", "sogou", "coccoc", "yandex", "arc"}
+_CHROMIUM_BROWSERS = {
+    "edge",
+    "chrome",
+    "brave",
+    "chromium",
+    "vivaldi",
+    "opera",
+    "opera_gx",
+    "qq",
+    "360",
+    "360x",
+    "sogou",
+    "coccoc",
+    "yandex",
+    "arc",
+}
 _APP_BOUND_CHROMIUM_BROWSERS = {"edge", "chrome", "brave", "coccoc", "avast"}
 
 
@@ -344,9 +360,6 @@ def _copy_locked_chromium_cookies_db(
 
     # Attempt 2: Concurrently poll `CreateFileW` every 2ms in Python WHILE PowerShell restarts ONLY the headless
     # `network.mojom.NetworkService` (`--service-sandbox-type=network`) utility subprocess and immediately copies `$src` -> `$dst_ps`.
-    # Why concurrent polling is essential: Edge respawns `NetworkService` in ~80ms after `Stop-Process`, whereas `powershell.exe`
-    # takes ~500ms to exit. Running a 2ms Python polling loop concurrently with `Popen` + in-PowerShell `[System.IO.File]::Copy`
-    # captures the unlocked file within 1-5ms of handle release!
     exe_map = {
         "edge": "msedge.exe",
         "chrome": "chrome.exe",
@@ -397,7 +410,6 @@ def _copy_locked_chromium_cookies_db(
                     except OSError:
                         pass
                 if proc.poll() is not None:
-                    # One final check right after PowerShell finishes
                     if dst_ps.is_file() and dst_ps.stat().st_size > 0:
                         shutil.copy2(dst_ps, dst_db)
                         _copy_sidecars(src_db, dst_db)
@@ -462,19 +474,13 @@ def _decrypt_aes_gcm_cookie_value(enc_bytes: bytes, key: bytes) -> Optional[str]
     try:
         from Cryptodome.Cipher import AES  # type: ignore
     except ImportError:
-        try:
-            from Crypto.Cipher import AES  # type: ignore
-        except ImportError:
-            return None
+        return None
     try:
         nonce = enc_bytes[3:15]
         ciphertext = enc_bytes[15:-16]
         tag = enc_bytes[-16:]
         cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
         plain = cipher.decrypt_and_verify(ciphertext, tag)
-        # In Chromium 130+, the first 32 bytes of `plain` are the binary SHA-256 hash of `host_key`.
-        # Because random 32-byte SHA-256 digests almost always contain invalid UTF-8 sequences or control bytes (< 0x20),
-        # check whether `plain` is pure printable ASCII/UTF-8 or has the 32-byte binary prefix.
         if len(plain) > 32:
             prefix32 = plain[:32]
             has_binary_prefix = False
@@ -552,7 +558,6 @@ def _decrypt_chromium_sqlite_cookies(
                         cookie_val = unprot.decode("utf-8", errors="replace")
             if not cookie_val:
                 continue
-            # Convert Chromium WebKit timestamp (microseconds since 1601-01-01) to Unix epoch seconds
             exp_unix = 0
             try:
                 exp_int = int(exp_utc or 0)
@@ -703,7 +708,6 @@ def _call_extract_from_path(
     if not callable(extract_path_fn):
         return []
 
-    # 1. Try with `browser_id=b_id` first (required for v20 App-Bound key resolution)
     try:
         kw_browser: Dict[str, Any] = {
             "domains": domains,
@@ -723,7 +727,6 @@ def _call_extract_from_path(
     except Exception:
         pass
 
-    # 2. Fallback to `local_state_path` (for custom Chromium forks or v10 DPAPI)
     if local_state is not None and local_state.is_file():
         try:
             kw_ls: Dict[str, Any] = {
@@ -751,12 +754,10 @@ def extract_to_netscape_file(
     on_log: Optional[LogCallback] = None,
     force_refresh: bool = False,
 ) -> Optional[Path]:
-    """Extract cookies for `target_url` from `browser` using:
-    1. Validated persistent Cookie cache in `data_root/cookies/` (instant, zero browser interaction);
-    2. Concurrent zero-latency locked-DB snapshot (`_copy_locked_chromium_cookies_db`) to eliminate `OS error 32`;
-    3. Silent `v10` + `extract_from_path(..., browser_id=b_id)` extraction;
-    4. Automatic one-time `v20` decryption (`allow_elevated_fallback` -> `injection_only`) when `v20` auth cookies are detected,
-       immediately saving the decrypted cookies to the persistent cache so subsequent downloads never spawn a browser window.
+    """Extract cookies for `target_url` from `browser`:
+    - Respects `app_bound="disabled"` strictly (never silently upgrades `disabled` to `allow_elevated_fallback` or `injection_only`);
+    - Supports `app_bound="smart"` for opt-in one-time v20 decryption with persistent caching;
+    - Recovers locked Chromium databases (`OS error 32`) via `_copy_locked_chromium_cookies_db`.
     """
     if token:
         token.check()
@@ -789,8 +790,17 @@ def extract_to_netscape_file(
 
     prof = (profile or "").strip() or None
     policy = (app_bound or "disabled").strip().lower()
-    if policy not in ("injection_only", "allow_elevated_fallback", "disabled"):
+    if policy not in ("disabled", "smart", "injection_only", "allow_elevated_fallback"):
         policy = "disabled"
+
+    # `disabled` strictly stays `"disabled"`! Only `"smart"` escalates when v20 decryption is needed.
+    eff_pol = "disabled" if policy in ("disabled", "smart") else policy
+    allow_v20_escalation = policy in ("smart", "injection_only", "allow_elevated_fallback")
+    escalation_policies: Tuple[str, ...] = (
+        ("allow_elevated_fallback", "injection_only")
+        if policy in ("smart", "allow_elevated_fallback")
+        else (("injection_only",) if policy == "injection_only" else ())
+    )
 
     domains = extraction_domains_for(target_url)
 
@@ -824,114 +834,104 @@ def extract_to_netscape_file(
         snap_db: Optional[Path] = None
         local_state: Optional[Path] = None
 
-        # On Windows Chromium browsers, snapshot the locked SQLite database FIRST so we never hit OS error 32!
-        if sys.platform == "win32" and b_id in _CHROMIUM_BROWSERS:
-            snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
-            if snap_db is not None and snap_db.is_file():
-                # 1A: First try pure-Python v10 + plaintext decryption on `snap_db`
-                rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
-                # 1B: If not enough for site auth, try `extract_from_path` with current policy
-                if not rows_have_site_auth(rows, target_url):
-                    path_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, policy)
-                    if rows_have_site_auth(path_rows, target_url) or len(path_rows) > len(rows):
-                        rows = path_rows
-                # 1C: If auth cookies are STILL missing because they are v20-encrypted (`v20_skipped > 0` or App-Bound browser),
-                # perform a one-time v20 extraction on the already-unlocked `snap_db` and cache it permanently!
-                if not rows_have_site_auth(rows, target_url) and (v20_skipped > 0 or b_id in _APP_BOUND_CHROMIUM_BROWSERS):
-                    for v20_pol in ("allow_elevated_fallback", "injection_only"):
-                        if on_log:
-                            on_log(
-                                f"[Cookies] 检测到 {b_id} 中包含 {v20_skipped or 'App-Bound'} 条 v20 加密登录凭据，"
-                                f"正在对已解锁快照执行一次性解密 ({v20_pol}) 并写入持久缓存..."
-                            )
-                        v20_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, v20_pol)
-                        if rows_have_site_auth(v20_rows, target_url):
-                            rows = v20_rows
-                            break
-                        if len(v20_rows) > len(rows):
-                            rows = v20_rows
-
-        # Step 2: Standard `rookie_cookies.extract` (for Firefox/Gecko, macOS/Linux, or if `snap_db` still lacked auth cookies)
-        if not rows_have_site_auth(rows, target_url):
-            try:
-                eff_pol = policy
-                if sys.platform == "win32" and b_id in _APP_BOUND_CHROMIUM_BROWSERS and eff_pol == "disabled" and (v20_skipped > 0 or not rows):
-                    eff_pol = "allow_elevated_fallback"
-                if callable(extract_fn):
-                    kwargs = _build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)
+        # Step 2: Primary extraction via `rookie_cookies.extract` / `read` (always passing `eff_pol`)
+        try:
+            if callable(extract_fn):
+                kwargs = _build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)
+                try:
+                    rows = list(extract_fn(**kwargs) or [])
+                except TypeError:
+                    minimal_kw: Dict[str, Any] = {"browser": b_id, "app_bound": eff_pol}
+                    if prof:
+                        minimal_kw["profile"] = prof
+                    if domains is not None:
+                        minimal_kw["domains"] = domains
                     try:
-                        direct_rows = list(extract_fn(**kwargs) or [])
+                        rows = list(extract_fn(**minimal_kw) or [])
                     except TypeError:
-                        minimal_kw: Dict[str, Any] = {"browser": b_id, "app_bound": eff_pol}
-                        if prof:
-                            minimal_kw["profile"] = prof
-                        if domains is not None:
-                            minimal_kw["domains"] = domains
-                        try:
-                            direct_rows = list(extract_fn(**minimal_kw) or [])
-                        except TypeError:
-                            direct_rows = list(extract_fn(browser=b_id) or [])
-                    if rows_have_site_auth(direct_rows, target_url) or len(direct_rows) > len(rows):
-                        rows = direct_rows
-                elif callable(read_fn):
-                    read_kw = _build_extract_kwargs(b_id, prof, None, eff_pol, timeout, cancel_handle)
-                    read_kw.pop("domains", None)
-                    snap = read_fn(**read_kw)
-                    all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
-                    if domains:
-                        direct_rows = [
-                            r
-                            for r in all_rows
-                            if any(
-                                str(r.get("domain") or "").lstrip(".").lower() == d
-                                or str(r.get("domain") or "").lstrip(".").lower().endswith("." + d)
-                                for d in domains
-                            )
-                        ]
-                    else:
-                        direct_rows = all_rows
-                    if rows_have_site_auth(direct_rows, target_url) or len(direct_rows) > len(rows):
-                        rows = direct_rows
+                        if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                            rows = []
+                        else:
+                            rows = list(extract_fn(browser=b_id) or [])
+            elif callable(read_fn):
+                read_kw = _build_extract_kwargs(b_id, prof, None, eff_pol, timeout, cancel_handle)
+                read_kw.pop("domains", None)
+                snap = read_fn(**read_kw)
+                all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
+                if domains:
+                    rows = [
+                        r
+                        for r in all_rows
+                        if any(
+                            str(r.get("domain") or "").lstrip(".").lower() == d
+                            or str(r.get("domain") or "").lstrip(".").lower().endswith("." + d)
+                            for d in domains
+                        )
+                    ]
+                else:
+                    rows = all_rows
+            else:
+                if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                    rows = []
                 else:
                     helper_fn = getattr(rc, b_id, None)
                     if not callable(helper_fn):
                         raise RuntimeError(f"rookie_cookies 不支持浏览器 {b_id}")
-                    direct_rows = list(helper_fn(domains=domains) if domains else helper_fn())
-                    if rows_have_site_auth(direct_rows, target_url) or len(direct_rows) > len(rows):
-                        rows = direct_rows
-            except Exception as primary_exc:
-                err_lower = str(primary_exc).lower()
-                is_locked_err = (
-                    "os error 32" in err_lower
-                    or "share-locked" in err_lower
-                    or "being used by another process" in err_lower
-                    or ("locked" in err_lower and ("database" in err_lower or "cookie" in err_lower))
-                )
-                if is_locked_err and b_id in _CHROMIUM_BROWSERS:
-                    if snap_db is None or not snap_db.is_file():
-                        snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
-                    if snap_db is not None and snap_db.is_file():
-                        for fallback_pol in (policy, "allow_elevated_fallback", "injection_only"):
-                            cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, fallback_pol)
+                    rows = list(helper_fn(domains=domains) if domains else helper_fn())
+        except Exception as primary_exc:
+            err_lower = str(primary_exc).lower()
+            is_locked_err = (
+                "os error 32" in err_lower
+                or "share-locked" in err_lower
+                or "being used by another process" in err_lower
+                or ("locked" in err_lower and ("database" in err_lower or "cookie" in err_lower))
+            )
+            if is_locked_err and b_id in _CHROMIUM_BROWSERS:
+                snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
+                if snap_db is not None and snap_db.is_file():
+                    rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                    if not rows_have_site_auth(rows, target_url):
+                        cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol)
+                        if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
+                            rows = cand_rows
+                    if not rows_have_site_auth(rows, target_url) and allow_v20_escalation:
+                        for v20_pol in escalation_policies:
+                            cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, v20_pol)
                             if rows_have_site_auth(cand_rows, target_url):
                                 rows = cand_rows
                                 break
                             if len(cand_rows) > len(rows):
                                 rows = cand_rows
-                        if not rows:
-                            rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
-                    elif not rows:
-                        raise primary_exc
-                elif not rows:
+                else:
                     raise primary_exc
+            else:
+                raise primary_exc
+
+        # Step 3: If primary extract returned no auth cookies on Chromium without throwing OS error 32,
+        # try reading the unlocked SQLite snapshot for v10/plaintext cookies (and v20 ONLY if `allow_v20_escalation` is True)
+        if not rows_have_site_auth(rows, target_url) and b_id in _CHROMIUM_BROWSERS:
+            if snap_db is None or not snap_db.is_file():
+                snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=None)
+            if snap_db is not None and snap_db.is_file():
+                sql_rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                if rows_have_site_auth(sql_rows, target_url) or len(sql_rows) > len(rows):
+                    rows = sql_rows
+                if not rows_have_site_auth(rows, target_url) and allow_v20_escalation:
+                    for v20_pol in escalation_policies:
+                        cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, v20_pol)
+                        if rows_have_site_auth(cand_rows, target_url):
+                            rows = cand_rows
+                            break
+                        if len(cand_rows) > len(rows):
+                            rows = cand_rows
 
         if not rows:
             if on_log:
                 dom_desc = f"（目标域: {', '.join(domains)}）" if domains else ""
-                if v20_skipped > 0:
+                if (policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS) or v20_skipped > 0:
                     on_log(
-                        f"[Cookies 警告] {b_id} 中检测到 {v20_skipped} 条 App-Bound (v20) 加密 Cookie 未能自动解密。"
-                        "请打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」导出一次（永久免弹窗复用），或改用 Firefox。"
+                        f"[Cookies 提示] {b_id} 中的 Cookie 采用 App-Bound (v20) 加密；当前策略为 {policy}，"
+                        "未启用进程注入/提权解密。建议使用设置中的「登录并获取 Cookies…」导出一次（永久免弹窗复用）或改用 Firefox。"
                     )
                 else:
                     on_log(
@@ -1001,10 +1001,8 @@ def extract_to_netscape_file(
             rep = inspect_netscape(out_path, target_url)
             if on_log:
                 on_log(
-                    f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}) 提取 {valid_count} 条 Cookie | {rep.summary()}"
+                    f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}, 策略: {policy}) 提取 {valid_count} 条 Cookie | {rep.summary()}"
                 )
-            # If the extracted cookie file contains only anonymous cookies (missing key login cookies) while v20 cookies were skipped,
-            # do NOT treat this partial anonymous file as a valid login cookie file (so caller can fall back to cached cookies or warn clearly)
             if not rep.ok and v20_skipped > 0:
                 if on_log:
                     on_log(
@@ -1020,7 +1018,7 @@ def extract_to_netscape_file(
                 _save_to_persistent_cookie_cache(final_netscape, base_temp, b_id, target_url, on_log=on_log)
         elif on_log:
             on_log(
-                f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}) 成功提取 {valid_count} 条 Cookie"
+                f"[rookie-cookies] 已从 {b_id} (配置: {prof or '自动'}, 策略: {policy}) 成功提取 {valid_count} 条 Cookie"
             )
 
         return out_path

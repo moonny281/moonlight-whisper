@@ -12,8 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 class SiteProfile:
     key: str
     hosts: Tuple[str, ...]            # 用于匹配输入 URL 的主机后缀
-    cookie_domains: Tuple[str, ...]   # 原始 Cookie 头与导出允许绑定的域
-    key_cookies: Tuple[str, ...]      # 任意命中一个即视为“已包含登录态凭据”
+    cookie_domains: Tuple[str, ...]   # 原始 Cookie 头只允许写入这些域
+    key_cookies: Tuple[str, ...]      # 任意命中一个即视为“看起来已登录”
     note: str = ""
 
 
@@ -70,6 +70,15 @@ def resolve_site(url: str) -> Optional[SiteProfile]:
     return None
 
 
+def export_domains_for(site: Optional[SiteProfile]) -> Tuple[str, ...]:
+    """浏览器导出与登录凭据体检允许匹配的域名集合（YouTube 同时包含 .youtube.com 与 .google.com）。"""
+    if site is None:
+        return ()
+    if site.key == "youtube":
+        return (".youtube.com", ".google.com")
+    return site.cookie_domains
+
+
 def cookie_domains_for(url: str) -> List[str]:
     """原始 Cookie 头应绑定的域：已知站点取其画像域，未知站点取可注册域；绝不再写入无关站点。"""
     site = resolve_site(url)
@@ -93,7 +102,7 @@ def rows_have_site_auth(rows: Iterable[Dict[str, Any]], target_url: str) -> bool
     if site is None or not site.key_cookies:
         return True
     now = int(time.time())
-    allowed_doms = ("youtube.com", "google.com") if site.key == "youtube" else tuple(d.lstrip(".").lower() for d in site.cookie_domains)
+    allowed_doms = tuple(d.lstrip(".").lower() for d in export_domains_for(site))
     names_found = set()
     for r in rows_list:
         dom = str(r.get("domain") or "").lstrip(".").lower()
@@ -141,7 +150,7 @@ def inspect_netscape(path: Path, target_url: str) -> CookieReport:
         return rep
     site = resolve_site(target_url)
     now = int(time.time())
-    domains = tuple(d.lstrip(".") for d in (site.cookie_domains if site else cookie_domains_for(target_url)))
+    domains = tuple(d.lstrip(".") for d in (export_domains_for(site) if site else cookie_domains_for(target_url)))
     names_seen: Dict[str, int] = {}
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw.strip()
@@ -177,7 +186,7 @@ def inspect_netscape(path: Path, target_url: str) -> CookieReport:
 def netscape_to_header(path: Path, target_url: str) -> str:
     """把 Netscape 文件中属于目标站点的有效 Cookie 拼成 `k=v; k2=v2`，用于登录态探测。"""
     site = resolve_site(target_url)
-    domains = tuple(d.lstrip(".") for d in (site.cookie_domains if site else cookie_domains_for(target_url)))
+    domains = tuple(d.lstrip(".") for d in (export_domains_for(site) if site else cookie_domains_for(target_url)))
     now = int(time.time())
     pairs: List[str] = []
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():

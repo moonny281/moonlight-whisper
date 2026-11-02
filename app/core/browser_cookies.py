@@ -4,7 +4,7 @@
 - 使用独立 --user-data-dir（Chrome 136+ 对默认目录会忽略远程调试开关）；
 - 注入 --disable-blink-features=AutomationControlled，防止 Google / YouTube 登录拦截“此浏览器或应用可能不安全”；
 - Cookies 由浏览器自己解密后经 CDP (Storage.getCookies + Network.getAllCookies) 返回，100% 绕开 App-Bound Encryption (v20)；
-- 只导出目标站点关联域名的 Cookies（如 YouTube 同时包含 .youtube.com 与 .google.com）；调试端口仅绑定 127.0.0.1 随机端口。
+- 只导出目标站点关联域名的 Cookies（如 YouTube 同时包含 .youtube.com 与 .google.com）；调试端口仅绑定 127.0.0.1 随机端口与本地 Origin。
 """
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ class ManagedBrowser:
         args = [
             str(self.exe),
             f"--remote-debugging-port={self.port}",
-            "--remote-allow-origins=*",
+            f"--remote-allow-origins=http://127.0.0.1:{self.port}",
             f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -232,7 +232,7 @@ class ManagedBrowser:
 
 
 def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: Iterable[str]) -> Tuple[str, int]:
-    """CDP 的 cookie 列表 -> Netscape 文本；仅保留 allowed_domains（如 ['.youtube.com', '.google.com']）。"""
+    """CDP 的 cookie 列表 -> Netscape 文本；仅保留 allowed_domains（保留 host-only 与 domain cookie 原始语义）。"""
     allow = tuple(d.lstrip(".").lower() for d in allowed_domains)
     session_exp = int(time.time()) + 86400 * 30
     lines = ["# Netscape HTTP Cookie File", "# Exported from managed browser profile by Moonlight Whisper", ""]
@@ -245,8 +245,6 @@ def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: 
         name, value = str(c.get("name") or "").strip(), str(c.get("value") or "")
         if not dom or not name:
             continue
-        if not dom.startswith(".") and dom.count(".") >= 1 and not dom.startswith("localhost"):
-            dom = "." + dom
         exp = c.get("expires")
         exp_i = int(exp) if isinstance(exp, (int, float)) and exp > 0 else session_exp
         prefix = "#HttpOnly_" if c.get("httpOnly") else ""
@@ -277,7 +275,7 @@ def export_site_cookies(browser: ManagedBrowser, out_file: Path, allowed_domains
 
 def refresh_managed_cookies(site_key: str, paths, browser_kind: str = "edge", spawn_browser: bool = False) -> Optional[Path]:
     """返回已导出的站点 Cookies 文件路径；默认绝不在后台启动新的 Edge/Chrome 浏览器进程（避免每次下载弹出新 Edge 窗口）。"""
-    from app.core.site_cookies import SITES
+    from app.core.site_cookies import SITES, export_domains_for
 
     site = next((s for s in SITES if s.key == site_key), None)
     if site is None:
@@ -291,7 +289,7 @@ def refresh_managed_cookies(site_key: str, paths, browser_kind: str = "edge", sp
     browser = ManagedBrowser(exe, paths.data_root / "browser_profile", headless=True)
     try:
         browser.start()
-        export_site_cookies(browser, out, site.cookie_domains)
+        export_site_cookies(browser, out, export_domains_for(site))
         return out
     except Exception:
         return out if out.exists() else None

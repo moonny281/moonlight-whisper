@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -61,6 +62,69 @@ _AGE_OR_AUTH_PATTERNS = (
 
 _DOMESTIC_NO_AUTO_PROXY = ("bilibili.com", "b23.tv", "douyin.com", "iqiyi.com", "qq.com", "youku.com")
 _DENO_DOWNLOAD_ATTEMPTED: bool = False
+_MIN_VERSIONS: Dict[str, Tuple[int, ...]] = {
+    "deno": (2, 3, 0),
+    "node": (22, 0, 0),
+    "bun": (1, 2, 11),
+}
+_ROOT_CAUSE_KEYS: Tuple[str, ...] = (
+    "n challenge solving failed",
+    "no supported javascript runtime",
+    "no usable challenge solver",
+    "failed to decrypt with dpapi",
+    "could not copy",
+    "unsupported url",
+)
+
+
+def _probe_version(exe: Path, name: str = "") -> Optional[Tuple[int, ...]]:
+    """Probe the semantic version tuple `(major, minor, patch)` of a JS runtime binary (`deno`, `node`, `bun`)."""
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        out = subprocess.run(
+            [str(exe), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=flags,
+            check=False,
+        ).stdout
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+        return tuple(int(x) for x in m.groups()) if m else None
+    except Exception:
+        return None
+
+
+def _usable(exe: Optional[Path], name: str, on_log: Optional[LogCallback] = None) -> Optional[Path]:
+    """Return `exe` only if it exists and satisfies yt-dlp's minimum version requirement in `_MIN_VERSIONS`."""
+    if not exe or not exe.exists():
+        return None
+    ver = _probe_version(exe, name)
+    min_ver = _MIN_VERSIONS.get(name.lower())
+    if min_ver is None:
+        return exe
+    if ver is not None and ver >= min_ver:
+        return exe
+    if on_log and ver is not None:
+        ver_s = ".".join(map(str, ver))
+        min_s = ".".join(map(str, min_ver))
+        on_log(f"[YouTube 运行时] 检测到 {name} ({exe}) 版本 v{ver_s} 低于 yt-dlp 最低要求 v{min_s}，已忽略。")
+    return None
+
+
+def _pick_root_exc(excs: List[BaseException]) -> BaseException:
+    """Select the most informative root-cause exception across fallback retry attempts."""
+    for e in excs:
+        if any(k in str(e).lower() for k in _ROOT_CAUSE_KEYS):
+            return e
+    return excs[0]
+
+
+def _redact_proxy_url(proxy_url: str) -> str:
+    """Mask credentials (`user:pass@`) in a proxy URL before logging."""
+    if not proxy_url or "@" not in proxy_url:
+        return proxy_url
+    return re.sub(r"(://)([^/@:]+):([^/@]+)@", r"\1***:***@", proxy_url)
 
 
 @dataclass
@@ -463,19 +527,17 @@ def ensure_deno_binary(
     token: Optional[CancelToken] = None,
     paths: AppPaths = PATHS,
 ) -> Optional[Path]:
-    """Auto-download `deno.exe` on Windows into `paths.user_bin_dir` if no JS runtime (`deno`/`node`/`bun`) is present."""
+    """Auto-download `deno.exe` on Windows into `paths.user_bin_dir` if no usable JS runtime (`deno>=2.3`/`node>=22`/`bun>=1.2.11`) is present."""
     global _DENO_DOWNLOAD_ATTEMPTED
-    existing = paths.find_binary("deno")
-    if existing and existing.exists():
+    existing = _usable(paths.find_binary("deno"), "deno")
+    if existing:
         return existing
     if sys.platform != "win32" or _DENO_DOWNLOAD_ATTEMPTED:
         return None
 
-    _DENO_DOWNLOAD_ATTEMPTED = True
     eff_proxy = resolve_effective_proxy(proxy)
     deno_urls = [
         "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
-        "https://mirror.ghproxy.com/https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
     ]
     dest_dir = paths.user_bin_dir
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -484,7 +546,7 @@ def ensure_deno_binary(
     for dl_url in deno_urls:
         try:
             if on_log:
-                on_log("[YouTube 运行时] 本地未找到 deno.exe，正在自动下载 YouTube JS 解算组件 (deno.exe)...")
+                on_log("[YouTube 运行时] 本地未找到满足版本要求的 deno.exe (>=2.3.0)，正在自动下载...")
             with tempfile.TemporaryDirectory(prefix="deno_dl_") as tmp:
                 zip_path = Path(tmp) / "deno.zip"
                 http_client.stream_download_with_resume(
@@ -504,9 +566,13 @@ def ensure_deno_binary(
                     return dest_exe
         except CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if on_log:
+                on_log(f"[YouTube 运行时] deno 下载失败（{dl_url}）：{exc}（可手动下载 deno.exe 放入 bin/ 目录）")
             continue
-    return None
+    else:
+        _DENO_DOWNLOAD_ATTEMPTED = True
+        return None
 
 
 def _apply_js_runtime_opts(
@@ -518,12 +584,17 @@ def _apply_js_runtime_opts(
     token: Optional[CancelToken] = None,
     on_log: Optional[LogCallback] = None,
 ) -> None:
-    """Configure `js_runtimes` (`deno`, `node`, `bun`, or `qjs`) and `remote_components` for YouTube EJS solving."""
-    resolved_deno = deno_bin if (deno_bin and deno_bin.exists()) else paths.find_binary("deno")
-    resolved_node = paths.find_binary("node")
-    resolved_bun = paths.find_binary("bun")
+    """Configure `js_runtimes` (`deno>=2.3.0`, `node>=22.0.0`, `bun>=1.2.11`) and `remote_components` for YouTube EJS solving."""
+    raw_deno = deno_bin if (deno_bin and deno_bin.exists()) else paths.find_binary("deno")
+    raw_node = paths.find_binary("node")
+    raw_bun = paths.find_binary("bun")
 
-    # If downloading YouTube and neither deno nor node nor bun is available, try auto-installing deno.exe on Windows
+    log_cb = on_log if _is_youtube_url(target_url) else None
+    resolved_deno = _usable(raw_deno, "deno", on_log=log_cb)
+    resolved_node = _usable(raw_node, "node", on_log=log_cb)
+    resolved_bun = _usable(raw_bun, "bun", on_log=log_cb)
+
+    # If downloading YouTube and neither deno>=2.3 nor node>=22 nor bun>=1.2.11 is available, try auto-installing deno.exe on Windows
     if (
         resolved_deno is None
         and resolved_node is None
@@ -537,13 +608,13 @@ def _apply_js_runtime_opts(
     elif resolved_node and resolved_node.exists():
         ydl_opts["js_runtimes"] = {"node": {"path": str(resolved_node)}}
         if on_log and _is_youtube_url(target_url):
-            on_log(f"[YouTube 运行时] 已启用系统 Node.js 作为 JS 挑战解析引擎：{resolved_node}")
+            on_log(f"[YouTube 运行时] 已启用系统 Node.js (>=22) 作为 JS 挑战解析引擎：{resolved_node}")
     elif resolved_bun and resolved_bun.exists():
         ydl_opts["js_runtimes"] = {"bun": {"path": str(resolved_bun)}}
     else:
         ydl_opts["js_runtimes"] = {"deno": {}, "node": {}, "bun": {}, "quickjs": {}}
         if on_log and _is_youtube_url(target_url):
-            on_log("[YouTube 警告] 未找到 deno 或 node，YouTube 部分格式可能受限；程序将自动启用多客户端与备用直链通道。")
+            on_log("[YouTube 警告] 未找到满足最低版本要求的 deno (>=2.3.0) 或 node (>=22.0.0)，请将 deno.exe 放入 bin/。")
 
     try:
         import yt_dlp_ejs  # noqa: F401
@@ -605,7 +676,7 @@ def _build_common_ydl_opts(
     if eff_proxy:
         ydl_opts["proxy"] = eff_proxy
         if on_log and not opts.proxy.strip():
-            on_log(f"[网络] 已自动检测并启用系统代理：{eff_proxy}")
+            on_log(f"[网络] 已自动检测并启用系统代理：{_redact_proxy_url(eff_proxy)}")
 
     deno_bin = opts.deno_path or paths.find_binary("deno")
     _apply_js_runtime_opts(
@@ -812,14 +883,17 @@ def _fallback_youtube_direct(
             for f in formats:
                 if not isinstance(f, dict):
                     continue
+                ftype = str(f.get("type") or "").lower()
+                if not ftype.startswith("audio/"):
+                    continue
                 u = str(f.get("url") or "").strip()
                 if not u:
                     continue
                 if u.startswith("/"):
                     u = base + u
-                ftype = str(f.get("type") or "").lower()
-                if "audio" in ftype or "mp4" in ftype:
-                    audio_candidates.append((int(f.get("bitrate") or 0), u, ftype))
+                if urllib.parse.urlparse(u).scheme not in ("http", "https"):
+                    continue
+                audio_candidates.append((int(f.get("bitrate") or 0), u, ftype))
             if not audio_candidates:
                 continue
             audio_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -980,10 +1054,15 @@ def _run_ydl_extract_with_fallbacks(
     except CancelledError:
         raise
     except Exception as first_exc:
-        if cookies_dropped:
-            first_exc.cookies_dropped = True  # type: ignore[attr-defined]
-        if rookie_err_msg:
-            first_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
+        def _tag_exc(e: BaseException) -> BaseException:
+            if cookies_dropped:
+                e.cookies_dropped = True  # type: ignore[attr-defined]
+            if rookie_err_msg:
+                e.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
+            return e
+
+        _tag_exc(first_exc)
+        attempts: List[BaseException] = [first_exc]
         err_str = str(first_exc)
         err_lower = err_str.lower()
 
@@ -1002,21 +1081,21 @@ def _run_ydl_extract_with_fallbacks(
             except CancelledError:
                 raise
             except Exception as retry_exc:
-                retry_exc.cookies_dropped = True  # type: ignore[attr-defined]
-                first_exc = retry_exc
-                err_str = str(first_exc)
+                _tag_exc(retry_exc)
+                attempts.append(retry_exc)
+                err_str = str(retry_exc)
                 err_lower = err_str.lower()
 
-        # Fallback 2: YouTube multi-client & cookie-free `web_embedded,tv,mweb,web_safari,android_vr,ios` fallback
+        # Fallback 2: YouTube fallback appending `web_embedded` to yt-dlp's maintained `default` client list
         if _is_youtube_url(url) and "failed to decrypt with dpapi" not in err_lower and not (
             "could not find" in err_lower and "cookies database" in err_lower
         ):
             had_cookies = "cookiefile" in current_opts or "cookiesfrombrowser" in current_opts
 
-            # 2A: If cookies were used, try cookie-compatible player_clients (`web`, `mweb`, `tv`, `web_safari`, `ios`)
+            # 2A: If cookies were used, keep yt-dlp's default clients and append `web_embedded`
             if had_cookies:
                 if on_log:
-                    on_log("[YouTube 兼容重试 1/2] 正在切换 YouTube 多客户端 (web/mweb/tv/web_safari) 与复合流模式重试...")
+                    on_log("[YouTube 兼容重试 1/2] 正在切换 YouTube 默认+嵌入式客户端 (default, web_embedded) 与复合流模式重试...")
                 yt_cookie_opts = copy.copy(current_opts)
                 if opts.cookies_file.strip():
                     fresh_c = prepare_cookie_file(
@@ -1028,7 +1107,7 @@ def _run_ydl_extract_with_fallbacks(
                     if fresh_c and fresh_c.exists():
                         yt_cookie_opts["cookiefile"] = str(fresh_c)
                 yt_cookie_opts["extractor_args"] = {
-                    "youtube": {"player_client": ["web", "mweb", "tv", "web_safari", "ios"]}
+                    "youtube": {"player_client": ["default", "web_embedded"]}
                 }
                 if download:
                     yt_cookie_opts["format"] = "bestaudio/best*"
@@ -1038,20 +1117,19 @@ def _run_ydl_extract_with_fallbacks(
                 except CancelledError:
                     raise
                 except Exception as yt_c_exc:
-                    if cookies_dropped:
-                        yt_c_exc.cookies_dropped = True  # type: ignore[attr-defined]
-                    if rookie_err_msg:
-                        yt_c_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
-                    first_exc = yt_c_exc
+                    _tag_exc(yt_c_exc)
+                    attempts.append(yt_c_exc)
+                    if on_log:
+                        on_log(f"[尝试 {len(attempts)}] {yt_c_exc}")
 
-            # 2B: Try cookie-free `web_embedded,tv,mweb,web_safari,android_vr,ios`
+            # 2B: Try cookie-free `default, web_embedded, tv`
             if on_log:
-                on_log("[YouTube 兼容重试 2/2] 正在尝试 YouTube 免 Cookie 嵌入式/移动端通道 (web_embedded / tv / android_vr / ios)...")
+                on_log("[YouTube 兼容重试 2/2] 正在尝试 YouTube 免 Cookie 嵌入式/TV 通道 (default, web_embedded, tv)...")
             yt_nocookie_opts = copy.copy(current_opts)
             yt_nocookie_opts.pop("cookiefile", None)
             yt_nocookie_opts.pop("cookiesfrombrowser", None)
             yt_nocookie_opts["extractor_args"] = {
-                "youtube": {"player_client": ["web_embedded", "tv", "mweb", "web_safari", "android_vr", "ios"]}
+                "youtube": {"player_client": ["default", "web_embedded", "tv"]}
             }
             if download:
                 yt_nocookie_opts["format"] = "bestaudio/best*"
@@ -1061,11 +1139,10 @@ def _run_ydl_extract_with_fallbacks(
             except CancelledError:
                 raise
             except Exception as yt_nc_exc:
-                if cookies_dropped:
-                    yt_nc_exc.cookies_dropped = True  # type: ignore[attr-defined]
-                if rookie_err_msg:
-                    yt_nc_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
-                first_exc = yt_nc_exc
+                _tag_exc(yt_nc_exc)
+                attempts.append(yt_nc_exc)
+                if on_log:
+                    on_log(f"[尝试 {len(attempts)}] {yt_nc_exc}")
 
         # Fallback 3: TikTok webpage anti-bot challenge (`Unexpected response from webpage request`)
         if _is_tiktok_url(url) and (
@@ -1107,13 +1184,12 @@ def _run_ydl_extract_with_fallbacks(
                 except CancelledError:
                     raise
                 except Exception as tk_exc:
-                    if cookies_dropped:
-                        tk_exc.cookies_dropped = True  # type: ignore[attr-defined]
-                    if rookie_err_msg:
-                        tk_exc.rookie_error_msg = rookie_err_msg  # type: ignore[attr-defined]
-                    first_exc = tk_exc
+                    _tag_exc(tk_exc)
+                    attempts.append(tk_exc)
 
-        raise first_exc
+        chosen = _pick_root_exc(attempts)
+        _tag_exc(chosen)
+        raise chosen
 
 
 def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> DownloadError:
@@ -1504,12 +1580,20 @@ def get_yt_dlp_version(paths: AppPaths = PATHS) -> str:
 
 
 def diagnose_youtube_runtime(paths: AppPaths = PATHS) -> Dict[str, str]:
-    """供「关于/诊断」按钮和 `cli.py --diagnose` 使用。"""
+    """供「关于/诊断」按钮和 `cli.py --diagnose` 使用（包含 deno/node/bun 最低版本合规检查）。"""
     yt = _import_yt_dlp(paths)
     report: Dict[str, str] = {"yt-dlp": str(getattr(yt.version, "__version__", "?"))}
-    deno = paths.find_binary("deno")
-    node = paths.find_binary("node")
-    report["deno"] = str(deno) if deno else (f"未找到 (已启用 node: {node})" if node else "未找到 (首次解析 YouTube 时自动下载)")
+    for name in ("deno", "node", "bun"):
+        exe = paths.find_binary(name)
+        ver = _probe_version(exe, name) if exe else None
+        min_v = _MIN_VERSIONS[name]
+        ok = ver is not None and ver >= min_v
+        if exe:
+            ver_s = ".".join(map(str, ver)) if ver else "?"
+            min_s = ".".join(map(str, min_v))
+            report[name] = f"{exe} (v{ver_s}) {'✓' if ok else f'✗ 低于要求 v{min_s}，yt-dlp 不会使用'}"
+        else:
+            report[name] = "未找到" 
     try:
         import yt_dlp_ejs
         report["yt-dlp-ejs"] = str(getattr(yt_dlp_ejs, "version", "?"))

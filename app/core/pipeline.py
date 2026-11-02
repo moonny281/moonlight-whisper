@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.config import Config
-from app.core import audio, browser_cookies, downloader, gpu_runtime, md_writer, model_manager, summarizer, transcriber
+from app.core import audio, downloader, gpu_runtime, md_writer, model_manager, summarizer, transcriber
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions, MediaInfo
 from app.core.errors import CancelledError, MoonlightError, TranscribeError
