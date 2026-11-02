@@ -9,7 +9,7 @@ block_cipher = None
 project_root = Path(SPECPATH).resolve().parent
 
 # Generate Windows file_version_info.txt in pure Python (UTF-8 without BOM)
-ver_str = os.environ.get("APP_VERSION", "1.2.5").strip() or "1.2.5"
+ver_str = os.environ.get("APP_VERSION", "1.2.6").strip() or "1.2.6"
 ver_parts = (ver_str.split(".") + ["0", "0", "0", "0"])[:4]
 ver_nums = tuple(int(x) if x.isdigit() else 0 for x in ver_parts)
 version_file = project_root / "build" / "file_version_info.txt"
@@ -61,6 +61,8 @@ hiddenimports = [
     "certifi",
     "brotli",
     "websockets",
+    "websockets.sync",
+    "websockets.sync.client",
     "mutagen",
     "faster_whisper",
     "ctranslate2",
@@ -86,6 +88,7 @@ for pkg in (
     "Cryptodome",
     "curl_cffi",
     "certifi",
+    "websockets",
 ):
     try:
         pkg_datas, pkg_bins, pkg_hidden = collect_all(pkg)

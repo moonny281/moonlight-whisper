@@ -1,3 +1,4 @@
+import ast
 import os
 import tempfile
 import time
@@ -57,6 +58,32 @@ class CookieHardeningTests(unittest.TestCase):
     def test_domain_binding(self):
         self.assertEqual(cookie_domains_for("https://youtu.be/xxxxxxxxxxx"), [".youtube.com"])
         self.assertEqual(cookie_domains_for("https://b23.tv/abc"), [".bilibili.com"])
+
+    def test_task_queue_and_main_window_signal_attributes(self):
+        root = Path(__file__).resolve().parent.parent
+        mw_tree = ast.parse((root / "app" / "ui" / "main_window.py").read_text(encoding="utf-8"))
+        wk_tree = ast.parse((root / "app" / "workers.py").read_text(encoding="utf-8"))
+
+        tq_attrs = {"cfg", "paths"}
+        for node in ast.walk(wk_tree):
+            if isinstance(node, ast.ClassDef) and node.name == "TaskQueue":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        tq_attrs.add(item.name)
+                    elif isinstance(item, ast.Assign):
+                        for t in item.targets:
+                            if isinstance(t, ast.Name):
+                                tq_attrs.add(t.id)
+
+        referenced = set()
+        for node in ast.walk(mw_tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute):
+                if isinstance(node.value.value, ast.Name) and node.value.value.id == "self" and node.value.attr == "queue":
+                    referenced.add(node.attr)
+
+        self.assertTrue(referenced.issubset(tq_attrs), f"Missing TaskQueue attributes: {referenced - tq_attrs}")
+        for required_method in ("cancel_current", "cancel_all", "cancel_task", "clear_inactive_tasks", "retry_failed_tasks", "shutdown_and_wait", "stats"):
+            self.assertIn(required_method, tq_attrs)
 
 
 if __name__ == "__main__":
