@@ -45,12 +45,8 @@ class TestRookieIntegration(unittest.TestCase):
         migrated_cfg = Config.from_dict({"version": 1, "cookies_from_browser": "edge", "cookies_app_bound": "injection_only"})
         self.assertEqual(migrated_cfg.cookies_app_bound, "disabled")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = AppPaths(app_dir=Path(tmp))
-            with patch("app.core.browser_cookies.ManagedBrowser") as mock_mb:
-                res = browser_cookies.refresh_managed_cookies("bilibili", paths)
-                self.assertIsNone(res)
-                mock_mb.assert_not_called()
+        # Verify dead code refresh_managed_cookies has been removed so nothing reuses a fixed browser_profile
+        self.assertFalse(hasattr(browser_cookies, "refresh_managed_cookies"))
 
     def test_youtube_dual_domain_extraction_and_netscape_output(self) -> None:
         self.assertEqual(
@@ -482,6 +478,76 @@ class TestRookieIntegration(unittest.TestCase):
             loaded = Config.load(paths=paths)
             self.assertEqual(loaded.cookies_app_bound, "disabled")
             self.assertTrue(bad_cfg.with_suffix(".json.bak").is_file())
+
+
+    def test_v1_3_3_ephemeral_login_profile_and_rotated_cookie_writeback(self) -> None:
+        """Regression tests for v1.3.3:
+        1) ManagedBrowser & purge_stale_cookie_files clean up ephemeral login_profile_<uuid> directories and stale owners;
+        2) Rotated cookies written by yt-dlp to the session cookiefile are atomically synced back to the source cookie file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp) / "temp"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            stale_prof = temp_dir / "login_profile_deadbeef"
+            stale_prof.mkdir()
+            (stale_prof / "LockFile").write_text("locked", encoding="utf-8")
+            # Backdate mtime so purge_stale_cookie_files cleans it up
+            import os
+            old_ts = 1000000000
+            os.utime(stale_prof, (old_ts, old_ts))
+            removed = downloader.purge_stale_cookie_files(temp_dir, max_age_sec=3600)
+            self.assertGreaterEqual(removed, 1)
+            self.assertFalse(stale_prof.exists())
+
+            # Verify _sync_rotated_cookies_back updates source cookie file when yt-dlp rotates tokens during extract_info
+            src_cookie = Path(tmp) / "youtube.txt"
+            src_cookie.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\told_sapi_val\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t1999999999\t__Secure-1PSIDTS\told_rotated_ts_1\n",
+                encoding="utf-8",
+            )
+
+            class RotatingCookieYoutubeDL:
+                def __init__(self, opts):
+                    self.opts = opts
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    # Simulate yt-dlp flushing rotated Set-Cookie values into cookiefile on close
+                    cf = self.opts.get("cookiefile")
+                    if cf:
+                        Path(cf).write_text(
+                            "# Netscape HTTP Cookie File\n"
+                            ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\told_sapi_val\n"
+                            ".youtube.com\tTRUE\t/\tTRUE\t1999999999\t__Secure-1PSIDTS\tnew_rotated_ts_999\n",
+                            encoding="utf-8",
+                        )
+
+                def extract_info(self, url, download=False):
+                    return {"id": "dQw4w9WgXcQ", "title": "Rotated Cookie Test", "uploader": "YT", "duration": 60.0}
+
+            fake_ytdlp = type(sys)("yt_dlp")
+            fake_ytdlp.YoutubeDL = RotatingCookieYoutubeDL  # type: ignore[attr-defined]
+
+            paths = AppPaths(app_dir=Path(tmp))
+            dl_opts = DownloadOptions(cookies_file=str(src_cookie))
+            logs: list[str] = []
+            with _patch_sys_module("yt_dlp", fake_ytdlp):
+                info = downloader.fetch_info(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    dl_opts,
+                    token=CancelToken(),
+                    on_log=logs.append,
+                    paths=paths,
+                )
+                self.assertEqual(info.id, "dQw4w9WgXcQ")
+
+            updated_src = src_cookie.read_text(encoding="utf-8")
+            self.assertIn("new_rotated_ts_999", updated_src)
+            self.assertNotIn("old_rotated_ts_1", updated_src)
+            self.assertTrue(any("自动续期" in l for l in logs))
 
 
 if __name__ == "__main__":

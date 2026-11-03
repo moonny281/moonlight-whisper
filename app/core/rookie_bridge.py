@@ -31,10 +31,10 @@ from app.core.site_cookies import (
 LogCallback = Callable[[str], None]
 
 APP_BOUND_POLICIES: Tuple[Tuple[str, str], ...] = (
-    ("disabled", "完全禁用 v20 解密（默认推荐：仅用明文库 / DPAPI v10 / 本地缓存，绝不启动浏览器）"),
-    ("smart", "智能缓存优先（缺失时自动解锁解密一次并永久缓存）"),
-    ("injection_only", "无特权实时解密 v20 (injection_only)"),
-    ("allow_elevated_fallback", "允许管理员提权解密 v20 (allow_elevated_fallback)"),
+    ("disabled", "仅明文库 / DPAPI v10 / 本地缓存 (disabled：跳过 v20 实时解密)"),
+    ("smart", "智能缓存优先 (smart：优先复用缓存，缺失时挂起态无窗口解密 v20 并持久化)"),
+    ("injection_only", "无特权挂起态解密 v20 (injection_only：CREATE_SUSPENDED 约50ms提取密钥，无UI窗口)"),
+    ("allow_elevated_fallback", "进程内提权解密 v20 (allow_elevated_fallback：优先同权限，支持进程内 DPAPI/CNG 兜底)"),
 )
 
 DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (

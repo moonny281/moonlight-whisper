@@ -1,7 +1,8 @@
-"""通过 Chrome DevTools Protocol 从“程序专用浏览器配置目录”读取 Cookies。
+"""通过 Chrome DevTools Protocol 从一次性独立浏览器配置目录读取 Cookies。
 
 要点：
-- 使用独立 --user-data-dir（Chrome 136+ 对默认目录会忽略远程调试开关）；
+- 每次启动使用全新的一次性临时 --user-data-dir（彻底消除固定目录残留进程引起的 Chromium 单实例转发与标签页堆积）；
+- 启动前与关闭后自动清理占用该配置目录的残留进程；
 - 注入 --disable-blink-features=AutomationControlled，防止 Google / YouTube 登录拦截“此浏览器或应用可能不安全”；
 - Cookies 由浏览器自己解密后经 CDP (Storage.getCookies + Network.getAllCookies) 返回，100% 绕开 App-Bound Encryption (v20)；
 - 只导出目标站点关联域名的 Cookies（如 YouTube 同时包含 .youtube.com 与 .google.com）；调试端口仅绑定 127.0.0.1 随机端口与本地 Origin。
@@ -103,8 +104,51 @@ def _cdp_call(ws_url: str, method: str, call_id: int = 1, timeout: float = 10.0)
     raise BrowserCookieError(f"CDP 调用 {method} 超时")
 
 
+def _kill_stale_profile_owner(profile_dir: Path) -> None:
+    """Windows 下按命令行里是否包含该 profile 路径来清理残留浏览器进程，防止僵尸进程占资源或单实例转发。"""
+    if sys.platform != "win32":
+        return
+    needle = str(profile_dir).strip().lower()
+    if not needle:
+        return
+    try:
+        import psutil  # type: ignore
+
+        for p in psutil.process_iter(["name", "cmdline"]):
+            try:
+                cmdline = " ".join(p.info.get("cmdline") or []).lower()
+                if needle in cmdline:
+                    p.terminate()
+            except Exception:
+                continue
+        return
+    except ImportError:
+        pass
+    except Exception:
+        return
+
+    try:
+        escaped = str(profile_dir).replace("'", "''").replace("\\", "\\\\")
+        ps_cmd = (
+            "Get-CimInstance Win32_Process | "
+            f"Where-Object {{ $_.CommandLine -match '{escaped}' }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+            creationflags=flags,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 class ManagedBrowser:
-    """启动并控制一个使用独立配置目录的 Edge/Chrome 进程。"""
+    """启动并控制一个使用一次性独立配置目录的 Edge/Chrome 进程。"""
 
     def __init__(self, exe: Path, profile_dir: Path, headless: bool = False, proxy: str = "") -> None:
         self.exe, self.profile_dir, self.headless = exe, profile_dir, headless
@@ -113,6 +157,7 @@ class ManagedBrowser:
         self._proc: Optional[subprocess.Popen] = None
 
     def start(self, start_url: str = "about:blank", timeout: float = 18.0) -> None:
+        _kill_stale_profile_owner(self.profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         args = [
             str(self.exe),
@@ -152,7 +197,7 @@ class ManagedBrowser:
         sess = _local_session()
         while time.time() < deadline:
             if self._proc.poll() is not None:
-                raise BrowserCookieError("浏览器进程已退出（该专用配置目录可能正被另一个窗口占用，请先关闭后重试）")
+                raise BrowserCookieError("浏览器进程已退出，请重试打开登录窗口")
             try:
                 r = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=1.5)
                 if r.ok:
@@ -227,8 +272,13 @@ class ManagedBrowser:
                     ws.close()
                 self._proc.wait(timeout=8)
             except Exception:
-                self._proc.terminate()
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=3)
+                except Exception:
+                    pass
         self._proc = None
+        _kill_stale_profile_owner(self.profile_dir)
 
 
 def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: Iterable[str]) -> Tuple[str, int]:
@@ -271,27 +321,3 @@ def export_site_cookies(browser: ManagedBrowser, out_file: Path, allowed_domains
     except OSError:
         pass
     return count
-
-
-def refresh_managed_cookies(site_key: str, paths, browser_kind: str = "edge", spawn_browser: bool = False) -> Optional[Path]:
-    """返回已导出的站点 Cookies 文件路径；默认绝不在后台启动新的 Edge/Chrome 浏览器进程（避免每次下载弹出新 Edge 窗口）。"""
-    from app.core.site_cookies import SITES, export_domains_for
-
-    site = next((s for s in SITES if s.key == site_key), None)
-    if site is None:
-        return None
-    out = paths.data_root / "cookies" / f"{site_key}.txt"
-    if not spawn_browser:
-        return out if out.exists() else None
-    exe = find_browser(browser_kind) or find_browser("chrome")
-    if exe is None:
-        return out if out.exists() else None
-    browser = ManagedBrowser(exe, paths.data_root / "browser_profile", headless=True)
-    try:
-        browser.start()
-        export_site_cookies(browser, out, export_domains_for(site))
-        return out
-    except Exception:
-        return out if out.exists() else None
-    finally:
-        browser.close()

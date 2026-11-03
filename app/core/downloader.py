@@ -262,12 +262,20 @@ def _infer_cookie_domains(target_url: str) -> List[str]:
 
 
 def purge_stale_cookie_files(temp_dir: Path, max_age_sec: int = 3600) -> int:
-    """删除超过 max_age_sec 的临时 Cookie 副本，避免凭据明文长期残留在临时目录。"""
+    """删除超过 max_age_sec 的临时 Cookie 副本及残留的一次性 login_profile_* 目录。"""
     removed = 0
+    now = time.time()
+    if temp_dir.is_dir():
+        for prof_dir in temp_dir.glob("login_profile_*"):
+            try:
+                if prof_dir.is_dir() and now - prof_dir.stat().st_mtime > max_age_sec:
+                    shutil.rmtree(prof_dir, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                pass
     cookie_dir = temp_dir / "cookies"
     if not cookie_dir.is_dir():
-        return 0
-    now = time.time()
+        return removed
     for f in cookie_dir.glob("cookies_session_*.txt"):
         try:
             if now - f.stat().st_mtime > max_age_sec:
@@ -276,6 +284,44 @@ def purge_stale_cookie_files(temp_dir: Path, max_age_sec: int = 3600) -> int:
         except OSError:
             pass
     return removed
+
+
+def _sync_rotated_cookies_back(
+    session_cookie_file: Optional[Path],
+    source_cookie_file: Optional[Path],
+    target_url: str = "",
+    on_log: Optional[LogCallback] = None,
+) -> bool:
+    """将 yt-dlp 会话期间通过 Set-Cookie 轮换刷新后的临时 Cookie 副本原子回写至源 Cookie 文件，防止原凭据因未回写而过期失效。"""
+    if session_cookie_file is None or source_cookie_file is None:
+        return False
+    try:
+        sess_p = session_cookie_file.resolve()
+        src_p = source_cookie_file.resolve()
+        if sess_p == src_p or not sess_p.is_file() or not src_p.is_file():
+            return False
+        if target_url:
+            rep = inspect_netscape(sess_p, target_url)
+            if not rep.ok:
+                return False
+        new_text = sess_p.read_text(encoding="utf-8", errors="replace")
+        if not new_text.strip() or "# Netscape HTTP Cookie File" not in new_text:
+            return False
+        old_text = src_p.read_text(encoding="utf-8", errors="replace")
+        if new_text == old_text:
+            return False
+        tmp_out = src_p.with_suffix(src_p.suffix + ".rot.tmp")
+        tmp_out.write_text(new_text, encoding="utf-8")
+        try:
+            os.chmod(tmp_out, 0o600)
+        except OSError:
+            pass
+        tmp_out.replace(src_p)
+        if on_log:
+            on_log(f"[Cookies 自动续期] 已将站点轮换更新的 Cookie 令牌回写保存至：{src_p.name}")
+        return True
+    except Exception:
+        return False
 
 
 def _register_cookie_dir_cleanup(cookie_dir: Path) -> None:
@@ -695,6 +741,7 @@ def _build_common_ydl_opts(
         prepared = prepare_cookie_file(cookie_path, paths.temp_dir, on_log=on_log, target_url=target_url)
         if prepared is not None and prepared.exists():
             ydl_opts["cookiefile"] = str(prepared)
+            ydl_opts["_cookie_source_path"] = str(cookie_path)
             loaded_cookiefile = True
             if target_url and on_log:
                 report = inspect_netscape(prepared, target_url)
@@ -721,6 +768,11 @@ def _build_common_ydl_opts(
                 if rookie_cookie_file is not None and rookie_cookie_file.exists():
                     ydl_opts["cookiefile"] = str(rookie_cookie_file)
                     opts.cookies_file = str(rookie_cookie_file)
+                    site_obj = resolve_site(target_url)
+                    if site_obj is not None:
+                        pers_c = paths.data_root / "cookies" / f"{site_obj.key}.txt"
+                        if pers_c.is_file():
+                            ydl_opts["_cookie_source_path"] = str(pers_c)
                     loaded_cookiefile = True
                 else:
                     ydl_opts["_rookie_cookie_dropped"] = True
@@ -743,6 +795,7 @@ def _build_common_ydl_opts(
                     prepared_fb = prepare_cookie_file(cached_fb, paths.temp_dir, on_log=None, target_url=target_url)
                     if prepared_fb is not None and prepared_fb.exists():
                         ydl_opts["cookiefile"] = str(prepared_fb)
+                        ydl_opts["_cookie_source_path"] = str(cached_fb)
                         opts.cookies_file = str(prepared_fb)
                         loaded_cookiefile = True
                         ydl_opts.pop("_rookie_cookie_dropped", None)
@@ -1047,10 +1100,21 @@ def _run_ydl_extract_with_fallbacks(
     current_opts = copy.copy(ydl_opts)
     cookies_dropped = bool(current_opts.pop("_rookie_cookie_dropped", False))
     rookie_err_msg = str(current_opts.pop("_rookie_error_msg", "") or "")
+    cookie_source_str = str(current_opts.pop("_cookie_source_path", "") or "")
+    cookie_source_path = Path(cookie_source_str) if cookie_source_str else None
+
+    def _run_ydl_once(run_opts: Dict[str, Any]) -> Tuple[Any, Any]:
+        cf_str = str(run_opts.get("cookiefile") or "")
+        try:
+            with yt_dlp.YoutubeDL(run_opts) as ydl_inst:
+                res_info = ydl_inst.extract_info(url, download=download)
+                return res_info, ydl_inst
+        finally:
+            if cf_str and cookie_source_path is not None:
+                _sync_rotated_cookies_back(Path(cf_str), cookie_source_path, target_url=url, on_log=on_log)
 
     try:
-        with yt_dlp.YoutubeDL(current_opts) as ydl:
-            return ydl.extract_info(url, download=download), ydl
+        return _run_ydl_once(current_opts)
     except CancelledError:
         raise
     except Exception as first_exc:
@@ -1112,8 +1176,7 @@ def _run_ydl_extract_with_fallbacks(
                 if download:
                     yt_cookie_opts["format"] = "bestaudio/best*"
                 try:
-                    with yt_dlp.YoutubeDL(yt_cookie_opts) as ydl:
-                        return ydl.extract_info(url, download=download), ydl
+                    return _run_ydl_once(yt_cookie_opts)
                 except CancelledError:
                     raise
                 except Exception as yt_c_exc:
