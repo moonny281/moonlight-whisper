@@ -1,11 +1,11 @@
-"""专用登录小窗（v1.4.0）。
+"""专用登录小窗（v1.4.0，v1.4.1 起修复依赖提示）。
 
 在应用内弹出一个独立的小窗口（QtWebEngine）完成网站登录并直接获取登录凭证：
 - 与用户日常浏览器的窗口、标签页完全无关，不会打断正在浏览的页面；
 - 不是浏览器配置目录（不使用 Edge/Chrome 的 `--user-data-dir`），因此不会触发 Edge 账号同步弹出多个窗口和标签页；
 - Cookie 通过 `QWebEngineCookieStore` 事件以明文直接回传，不受 App-Bound (v20) 加密、数据库占用、Cookie 延迟落盘影响。
 
-本模块顶层直接导入 QtWebEngine；若环境未安装 `PySide6-Addons`，导入会抛 ImportError，由调用方降级到备用方式。
+本模块顶层直接导入 QtWebEngine；若环境未安装 `PySide6-Addons`，导入会抛 ImportError，由调用方提示安装命令。
 """
 from __future__ import annotations
 

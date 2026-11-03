@@ -18,9 +18,9 @@ certifi>=2023.5.7
 brotli>=1.1.0
 websockets>=12.0
 mutagen>=1.47.0
-PySide6-Essentials>=6.6.0
-# v1.4.0 专用登录小窗使用 QtWebEngine（位于 PySide6-Addons）；缺失时自动降级为「现有浏览器 / 剪贴板」备用方式
-PySide6-Addons>=6.6.0
+# 使用 PySide6 元包：自动安装版本严格一致的 Essentials + Addons（登录小窗需要 Addons 中的 QtWebEngine）。
+# 若环境里已单独装过 PySide6-Essentials，版本不一致会导致 QtWebEngine 无法加载，请重新执行 pip install -r requirements.txt
+PySide6>=6.6.0
 opencc-python-reimplemented>=0.1.7
 requests>=2.31.0
 PySocks>=1.7.1
