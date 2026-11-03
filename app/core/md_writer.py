@@ -1,4 +1,4 @@
-"""Markdown and SRT writer with paragraph merging, deduplication, and filename sanitization."""
+"""Markdown and SRT writer with optional timestamps, optional video metadata table, conditional LLM summary section, paragraph merging, deduplication, and filename sanitization."""
 
 from __future__ import annotations
 
@@ -143,10 +143,12 @@ def render_markdown(
     info: MediaInfo,
     segments: List[Segment],
     meta: Dict[str, Any],
-    summary_text: str = PLACEHOLDER_SUMMARY,
+    summary_text: Optional[str] = "",
     transcribed_at: Optional[dt.datetime] = None,
+    include_timestamps: bool = True,
+    include_video_info: bool = True,
 ) -> str:
-    """Render the complete Markdown document according to §5.6 template."""
+    """Render the Markdown document with optional video info table, conditional LLM summary, and optional timestamps."""
     now_str = (transcribed_at or dt.datetime.now()).strftime("%Y-%m-%d %H:%M")
     duration_val = float(info.duration or meta.get("duration") or 0.0)
     duration_str = format_timestamp(duration_val, srt=False)
@@ -158,31 +160,39 @@ def render_markdown(
 
     paragraphs = merge_segments_to_paragraphs(segments)
     if paragraphs:
-        body_lines = [
-            f"**[{format_timestamp(ts)}]** {para_text}"
-            for ts, para_text in paragraphs
-        ]
+        if include_timestamps:
+            body_lines = [
+                f"**[{format_timestamp(ts)}]** {para_text}"
+                for ts, para_text in paragraphs
+            ]
+        else:
+            body_lines = [para_text for _ts, para_text in paragraphs]
         body_str = "\n\n".join(body_lines)
     else:
         body_str = "*（未检测到有效语音内容）*"
 
-    summary_block = (summary_text or PLACEHOLDER_SUMMARY).strip()
+    sections: List[str] = [f"# {info.title}"]
 
-    return (
-        f"# {info.title}\n\n"
-        f"| 项目 | 内容 |\n"
-        f"|---|---|\n"
-        f"| 来源 | {info.url} |\n"
-        f"| 作者 | {info.uploader} |\n"
-        f"| 时长 | {duration_str} |\n"
-        f"| 模型 | {model_name}（{device}/{compute_type}） |\n"
-        f"| 语言 | {language}（置信度 {prob:.2f}） |\n"
-        f"| 转录时间 | {now_str} |\n\n"
-        f"## 摘要\n\n"
-        f"{summary_block}\n\n"
-        f"## 转录正文\n\n"
-        f"{body_str}\n"
-    )
+    if include_video_info:
+        info_table = (
+            f"| 项目 | 内容 |\n"
+            f"|---|---|\n"
+            f"| 来源 | {info.url} |\n"
+            f"| 作者 | {info.uploader} |\n"
+            f"| 时长 | {duration_str} |\n"
+            f"| 模型 | {model_name}（{device}/{compute_type}） |\n"
+            f"| 语言 | {language}（置信度 {prob:.2f}） |\n"
+            f"| 转录时间 | {now_str} |"
+        )
+        sections.append(info_table)
+
+    summary_clean = (summary_text or "").strip()
+    if summary_clean and summary_clean != PLACEHOLDER_SUMMARY:
+        sections.append(f"## 摘要\n\n{summary_clean}")
+
+    sections.append(f"## 转录正文\n\n{body_str}")
+
+    return "\n\n".join(sections) + "\n"
 
 
 def format_filename_from_template(template: str, info: MediaInfo, meta: Dict[str, Any]) -> str:
@@ -209,12 +219,21 @@ def write_markdown(
     info: MediaInfo,
     segments: List[Segment],
     meta: Dict[str, Any],
-    summary_text: str = PLACEHOLDER_SUMMARY,
+    summary_text: Optional[str] = "",
+    include_timestamps: bool = True,
+    include_video_info: bool = True,
 ) -> Path:
     """Write the Markdown file to `output_dir` with automatic collision avoidance."""
     stem = format_filename_from_template(filename_template, info, meta)
     md_path = resolve_unique_path(output_dir, stem, ".md")
-    content = render_markdown(info=info, segments=segments, meta=meta, summary_text=summary_text)
+    content = render_markdown(
+        info=info,
+        segments=segments,
+        meta=meta,
+        summary_text=summary_text,
+        include_timestamps=include_timestamps,
+        include_video_info=include_video_info,
+    )
     md_path.write_text(content, encoding="utf-8")
     return md_path
 

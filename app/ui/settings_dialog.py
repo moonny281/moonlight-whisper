@@ -224,6 +224,12 @@ class SettingsDialog(QDialog):
         self.chk_allow_playlist = QCheckBox("允许解析播放列表 / 多 P 视频（自动展开加入任务队列）")
         tr_form.addRow("播放列表：", self.chk_allow_playlist)
 
+        self.chk_include_timestamps = QCheckBox("在输出的 Markdown 正文中保留段落时间轴（如 **[00:01:23]**）")
+        tr_form.addRow("正文时间轴：", self.chk_include_timestamps)
+
+        self.chk_include_video_info = QCheckBox("在输出的 Markdown 顶部保留视频元数据信息表（来源/作者/时长/模型等）")
+        tr_form.addRow("视频信息表：", self.chk_include_video_info)
+
         self.chk_vad = QCheckBox("开启 VAD 静音过滤（有效减少静音段幻觉与重复循环）")
         tr_form.addRow("静音过滤：", self.chk_vad)
 
@@ -564,6 +570,8 @@ class SettingsDialog(QDialog):
         self._refresh_vault_status_label()
 
         self.chk_allow_playlist.setChecked(self.cfg.allow_playlist)
+        self.chk_include_timestamps.setChecked(self.cfg.include_timestamps)
+        self.chk_include_video_info.setChecked(self.cfg.include_video_info)
         self.chk_vad.setChecked(self.cfg.vad)
         self.spin_vad_ms.setValue(self.cfg.min_silence_duration_ms)
         self.spin_cpu_threads.setValue(self.cfg.cpu_threads)
@@ -648,6 +656,8 @@ class SettingsDialog(QDialog):
         self.cfg.auto_refresh_cookies = self.chk_auto_refresh_cookies.isChecked()
 
         self.cfg.allow_playlist = self.chk_allow_playlist.isChecked()
+        self.cfg.include_timestamps = self.chk_include_timestamps.isChecked()
+        self.cfg.include_video_info = self.chk_include_video_info.isChecked()
         self.cfg.vad = self.chk_vad.isChecked()
         self.cfg.min_silence_duration_ms = self.spin_vad_ms.value()
         self.cfg.cpu_threads = self.spin_cpu_threads.value()

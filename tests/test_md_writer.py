@@ -105,5 +105,46 @@ class TestMdWriter(unittest.TestCase):
             self.assertIn("00:00:00,000 --> 00:00:03,500", srt_text)
 
 
+    def test_optional_timestamps_video_info_and_omitted_summary(self) -> None:
+        info = MediaInfo(
+            url="https://example.com/v2",
+            id="v2",
+            title="可选输出项测试",
+            uploader="UP",
+            duration=60.0,
+            extractor="Youtube",
+        )
+        segs = [
+            Segment(0.0, 3.0, "第一段无时间轴文本。"),
+            Segment(6.0, 9.0, "第二段无时间轴文本。"),
+        ]
+        meta = {"model": "small", "device": "cpu", "compute_type": "int8", "language": "zh", "language_probability": 0.95}
+
+        # Case 1: Default (timestamps=True, video_info=True) but no LLM summary configured -> summary section omitted!
+        md_no_llm = md_writer.render_markdown(info=info, segments=segs, meta=meta, summary_text="")
+        self.assertIn("| 来源 | https://example.com/v2 |", md_no_llm)
+        self.assertIn("**[00:00:00]** 第一段无时间轴文本。", md_no_llm)
+        self.assertNotIn("## 摘要", md_no_llm)
+
+        # Also omitted if summary_text is PLACEHOLDER_SUMMARY
+        md_placeholder = md_writer.render_markdown(info=info, segments=segs, meta=meta)
+        self.assertNotIn("## 摘要", md_placeholder)
+
+        # Case 2: include_timestamps=False and include_video_info=False
+        md_minimal = md_writer.render_markdown(
+            info=info,
+            segments=segs,
+            meta=meta,
+            summary_text="",
+            include_timestamps=False,
+            include_video_info=False,
+        )
+        self.assertNotIn("| 项目 | 内容 |", md_minimal)
+        self.assertNotIn("**[00:00:00]**", md_minimal)
+        self.assertNotIn("## 摘要", md_minimal)
+        self.assertIn("# 可选输出项测试", md_minimal)
+        self.assertIn("## 转录正文\n\n第一段无时间轴文本。\n\n第二段无时间轴文本。", md_minimal)
+
+
 if __name__ == "__main__":
     unittest.main()

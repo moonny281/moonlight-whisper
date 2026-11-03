@@ -237,6 +237,8 @@ class MainWindow(QMainWindow):
         self.chk_keep_audio = QCheckBox("保留下载的原始音频文件")
         self.chk_allow_playlist = QCheckBox("允许解析播放列表 / 多 P 视频")
         self.chk_llm_summary = QCheckBox("启用 AI 自动生成摘要 (OpenAI 兼容)")
+        self.chk_include_timestamps = QCheckBox("文档包含时间轴 ([00:00:00])")
+        self.chk_include_video_info = QCheckBox("文档包含视频信息表")
 
         toggles_grid.addWidget(self.chk_gpu, 0, 0)
         toggles_grid.addWidget(self.chk_to_simplified, 0, 1)
@@ -244,6 +246,8 @@ class MainWindow(QMainWindow):
         toggles_grid.addWidget(self.chk_keep_audio, 1, 0)
         toggles_grid.addWidget(self.chk_allow_playlist, 1, 1)
         toggles_grid.addWidget(self.chk_llm_summary, 1, 2)
+        toggles_grid.addWidget(self.chk_include_timestamps, 2, 0)
+        toggles_grid.addWidget(self.chk_include_video_info, 2, 1)
         toggles_grid.setColumnStretch(0, 1)
         toggles_grid.setColumnStretch(1, 1)
         toggles_grid.setColumnStretch(2, 1)
@@ -347,6 +351,8 @@ class MainWindow(QMainWindow):
         self.chk_write_srt.toggled.connect(self._on_options_changed)
         self.chk_to_simplified.toggled.connect(self._on_options_changed)
         self.chk_allow_playlist.toggled.connect(self._on_options_changed)
+        self.chk_include_timestamps.toggled.connect(self._on_options_changed)
+        self.chk_include_video_info.toggled.connect(self._on_options_changed)
         self.chk_llm_summary.toggled.connect(self._on_llm_summary_toggled)
 
         self.btn_toggle_log.toggled.connect(self._on_toggle_log)
@@ -391,6 +397,8 @@ class MainWindow(QMainWindow):
             self.chk_write_srt.setChecked(self.cfg.write_srt)
             self.chk_to_simplified.setChecked(self.cfg.to_simplified)
             self.chk_allow_playlist.setChecked(self.cfg.allow_playlist)
+            self.chk_include_timestamps.setChecked(self.cfg.include_timestamps)
+            self.chk_include_video_info.setChecked(self.cfg.include_video_info)
             self.chk_llm_summary.setChecked(self.cfg.llm.enabled)
 
             effective = resolve_effective_theme(self.cfg.ui.theme)
@@ -531,6 +539,8 @@ class MainWindow(QMainWindow):
         self.cfg.write_srt = self.chk_write_srt.isChecked()
         self.cfg.to_simplified = self.chk_to_simplified.isChecked()
         self.cfg.allow_playlist = self.chk_allow_playlist.isChecked()
+        self.cfg.include_timestamps = self.chk_include_timestamps.isChecked()
+        self.cfg.include_video_info = self.chk_include_video_info.isChecked()
         self.cfg.save(paths=self.paths)
 
     def _on_output_dir_edited(self) -> None:

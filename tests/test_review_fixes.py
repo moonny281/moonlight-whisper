@@ -128,7 +128,7 @@ class TestReviewFixes(unittest.TestCase):
         import app
         from app.config import LlmConfig
         from app.core import summarizer
-        self.assertEqual(app.__version__, "1.3.8")
+        self.assertEqual(app.__version__, "1.3.9")
 
         empty_cfg = LlmConfig(enabled=True, api_key="")
         ok, msg = summarizer.test_llm_connection(empty_cfg)

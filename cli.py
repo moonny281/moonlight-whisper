@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-audio", action="store_true", help="保留下载的原始音频文件")
     parser.add_argument("--playlist", action="store_true", help="允许展开播放列表 / 多 P 视频")
     parser.add_argument("--no-vad", action="store_true", help="关闭 VAD 静音过滤")
+    parser.add_argument("--no-timestamps", action="store_true", help="输出的 Markdown 文档不包含段落时间轴")
+    parser.add_argument("--no-video-info", action="store_true", help="输出的 Markdown 文档不包含顶部视频元数据信息表")
     parser.add_argument("--proxy", help="HTTP/SOCKS5 代理地址")
     parser.add_argument("--cookies", help="可选：显式指定 Cookies 文件（Netscape / JSON / 原始 Cookie 头）")
     parser.add_argument(
@@ -85,6 +87,10 @@ def main(argv: List[str] | None = None) -> int:
         cfg.allow_playlist = True
     if args.no_vad:
         cfg.vad = False
+    if args.no_timestamps:
+        cfg.include_timestamps = False
+    if args.no_video_info:
+        cfg.include_video_info = False
     if args.proxy is not None:
         cfg.proxy = args.proxy
     if args.cookies:

@@ -49,6 +49,8 @@ class Config:
     write_srt: bool = False
     to_simplified: bool = True
     allow_playlist: bool = False
+    include_timestamps: bool = True
+    include_video_info: bool = True
     model: str = "large-v3-turbo"
     language: Optional[str] = None
     use_gpu: bool = True
@@ -139,6 +141,8 @@ class Config:
             write_srt=bool(data.get("write_srt", defaults.write_srt)),
             to_simplified=bool(data.get("to_simplified", defaults.to_simplified)),
             allow_playlist=bool(data.get("allow_playlist", defaults.allow_playlist)),
+            include_timestamps=bool(data.get("include_timestamps", defaults.include_timestamps)),
+            include_video_info=bool(data.get("include_video_info", defaults.include_video_info)),
             model=_str("model", defaults.model).strip() or defaults.model,
             language=_opt_str("language", defaults.language),
             use_gpu=bool(data.get("use_gpu", defaults.use_gpu)),

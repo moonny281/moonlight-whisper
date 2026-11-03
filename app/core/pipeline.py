@@ -295,10 +295,10 @@ def run(
         token.check()
 
         # Step 8: Optional LLM Summary + Write Markdown & SRT (95% - 100%)
-        summary_text = summarizer.PLACEHOLDER_SUMMARY
+        summary_text = ""
         if cfg.llm.enabled and cfg.llm.api_key.strip() and segments:
             _emit_stage("生成摘要")
-            summary_text = summarizer.generate_summary(
+            gen_summary = summarizer.generate_summary(
                 segments=segments,
                 title=info.title,
                 llm_cfg=cfg.llm,
@@ -306,6 +306,8 @@ def run(
                 on_log=_emit_log,
                 token=token,
             )
+            if gen_summary and gen_summary.strip() != summarizer.PLACEHOLDER_SUMMARY:
+                summary_text = gen_summary
 
         _emit_stage("写入文档")
         md_path = md_writer.write_markdown(
@@ -315,6 +317,8 @@ def run(
             segments=segments,
             meta=meta,
             summary_text=summary_text,
+            include_timestamps=cfg.include_timestamps,
+            include_video_info=cfg.include_video_info,
         )
         _emit_log(f"已生成 Markdown 文档：{md_path}")
 

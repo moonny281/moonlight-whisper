@@ -1,11 +1,13 @@
-"""网站账号托管与自动续期中心对话框（YouTube 首选：独立持久化 Account Vault + CDP 明文提取 + 无头静默刷新）。"""
+"""网站账号托管与登录对话框（直接在当前现有浏览器打开新标签页登录 + 零新窗口提取托管 + 剪贴板一键托管）。"""
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -16,20 +18,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.core import downloader
+from app.core import downloader, rookie_bridge
 from app.core.browser_cookies import (
-    ManagedBrowser,
-    _kill_stale_profile_owner,
     clear_hosted_site_cookies,
-    export_logged_in_sites_from_browser,
-    find_browser,
     get_custom_sites_file,
     get_site_cookie_path,
-    get_vault_profile_dir,
     list_hosted_sites_status,
-    refresh_hosted_site_cookies,
+    open_url_in_existing_browser,
 )
-from app.core.site_cookies import SITES, CookieReport, SiteProfile, load_all_sites
+from app.core.site_cookies import SITES, SiteProfile, inspect_netscape, load_all_sites
 
 LOGIN_URLS = {s.key: s.effective_login_url for s in SITES}
 SITE_LABELS = {s.key: s.display_label for s in SITES}
@@ -53,14 +50,13 @@ class _Call(QThread):
 class CookieLoginDialog(QDialog):
     def __init__(self, paths, parent=None, proxy: str = "", preferred_browser: str = "edge") -> None:
         super().__init__(parent)
-        self.setWindowTitle("网站账号托管与自动续期中心")
+        self.setWindowTitle("网站账号登录与凭据托管")
         self.setMinimumWidth(600)
         self.paths = paths
         self.proxy = proxy
         self.preferred_browser = (preferred_browser or "edge").strip().lower() or "edge"
         self.exported_path: Optional[str] = None
         self.exported_site_key: str = ""
-        self._browser: Optional[ManagedBrowser] = None
         self._worker: Optional[_Call] = None
         self._sites = load_all_sites(get_custom_sites_file(self.paths))
 
@@ -69,9 +65,9 @@ class CookieLoginDialog(QDialog):
         lay.setSpacing(10)
 
         lbl_intro = QLabel(
-            "在此将 YouTube 等网站账号直接托管到程序专用的隔离浏览器库中（与日常浏览器完全独立、互不干扰）：\n"
-            "• 首次使用点击「步骤 1」打开托管浏览器完成登录，再点击「步骤 2」提取并保存凭据；\n"
-            "• YouTube 下载将专属使用此托管账号，当 Cookie 过期失效时自动在后台以无头模式静默刷新提取新 Cookie（B站 / TikTok 则优先使用日常浏览器读取，也可在此托管作为兜底）。"
+            "直接在你当前正在使用的浏览器中打开一个新标签页完成登录（绝不新建独立浏览器配置、绝不触发账号同步多窗口弹窗）：\n"
+            "• 步骤 1：点击下方按钮在现有浏览器中打开目标网站的新标签页并登录；\n"
+            "• 步骤 2：登录完成后，点击「立即从当前浏览器提取并托管凭据」（或复制 Cookie 后点击「从剪贴板一键托管」），凭据将保存在本机并在每次下载时自动回写刷新令牌。"
         )
         lbl_intro.setWordWrap(True)
         lay.addWidget(lbl_intro)
@@ -87,17 +83,28 @@ class CookieLoginDialog(QDialog):
         site_row.addWidget(self.combo_site, 1)
         lay.addLayout(site_row)
 
-        self.btn_open = QPushButton("🌐 步骤 1：打开托管浏览器窗口登录账号")
-        self.btn_export = QPushButton("✅ 步骤 2：我已在窗口中完成登录，立即提取并托管凭据")
+        browser_row = QHBoxLayout()
+        browser_row.addWidget(QLabel("当前浏览器："))
+        self.combo_browser = QComboBox()
+        for b_info in rookie_bridge.list_supported_browsers():
+            self.combo_browser.addItem(b_info["display_name"], b_info["id"])
+        idx_b = self.combo_browser.findData(self.preferred_browser)
+        if idx_b >= 0:
+            self.combo_browser.setCurrentIndex(idx_b)
+        browser_row.addWidget(self.combo_browser, 1)
+        lay.addLayout(browser_row)
+
+        self.btn_open = QPushButton("🌐 步骤 1：在当前浏览器中打开新标签页登录")
+        self.btn_export = QPushButton("✅ 步骤 2：我已在浏览器标签页中登录，立即提取并托管凭据")
         self.btn_export.setObjectName("PrimaryButton")
-        self.btn_export.setEnabled(False)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
-        self.btn_refresh_silent = QPushButton("🔄 后台无头静默刷新当前站点 Cookie")
+        self.btn_paste_host = QPushButton("📋 从剪贴板一键导入并托管当前站点")
+        self.btn_paste_host.setToolTip("若浏览器开启了严格保护，可在该标签页使用扩展或 F12 复制 Cookie 后点击此按钮直接托管")
         self.btn_clear_site = QPushButton("🗑️ 清除当前站点凭据")
         self.btn_clear_site.setObjectName("GhostButton")
-        action_row.addWidget(self.btn_refresh_silent)
+        action_row.addWidget(self.btn_paste_host)
         action_row.addWidget(self.btn_clear_site)
         action_row.addStretch(1)
 
@@ -109,9 +116,9 @@ class CookieLoginDialog(QDialog):
         lay.addLayout(action_row)
         lay.addWidget(self.lbl_status)
 
-        self.btn_open.clicked.connect(self._open_browser)
-        self.btn_export.clicked.connect(self._export)
-        self.btn_refresh_silent.clicked.connect(self._refresh_current_site_silently)
+        self.btn_open.clicked.connect(self._open_tab_in_existing_browser)
+        self.btn_export.clicked.connect(self._extract_from_existing_browser)
+        self.btn_paste_host.clicked.connect(self._import_from_clipboard_for_site)
         self.btn_clear_site.clicked.connect(self._clear_current_site)
 
         self._refresh_site_combo_and_overview()
@@ -122,6 +129,9 @@ class CookieLoginDialog(QDialog):
             if s.key == key:
                 return s
         return self._sites[0]
+
+    def _selected_browser_id(self) -> str:
+        return str(self.combo_browser.currentData() or self.preferred_browser or "edge").strip().lower()
 
     def _refresh_site_combo_and_overview(self, keep_key: str = "") -> None:
         current_key = keep_key or str(self.combo_site.currentData() or "")
@@ -137,7 +147,7 @@ class CookieLoginDialog(QDialog):
                     tag = "✓ 已托管"
                     ok_names.append(site.display_label)
                 elif c_path.is_file():
-                    tag = "⚠ 凭据已过期/待刷新"
+                    tag = "⚠ 凭据已过期/待更新"
                 else:
                     tag = "未托管"
                 self.combo_site.addItem(f"{site.display_label}  [{tag}]", site.key)
@@ -151,137 +161,128 @@ class CookieLoginDialog(QDialog):
         if ok_names:
             self.lbl_vault_overview.setText(f"当前已托管有效站点（{len(ok_names)} 个）：{'、'.join(ok_names)}")
         else:
-            self.lbl_vault_overview.setText("当前尚未托管任何站点账号，请选择下方网站并点击「步骤 1」登录托管。")
+            self.lbl_vault_overview.setText("当前尚未托管任何站点账号，请选择下方网站并在现有浏览器打开标签页登录。")
 
     def _run(self, fn, on_done) -> None:
         self._worker = _Call(fn, self)
         self._worker.done.connect(on_done)
         self._worker.start()
 
-    def _close_active_browser(self) -> None:
-        """关闭当前打开的托管浏览器窗口，并清理旧版遗留目录（保留持久化 account_vault/browser_profile 登录态）。"""
-        if self._browser is not None:
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        legacy_profile = self.paths.data_root / "browser_profile"
-        if legacy_profile.exists():
-            _kill_stale_profile_owner(legacy_profile)
-            shutil.rmtree(legacy_profile, ignore_errors=True)
-
-    def _open_browser(self) -> None:
-        exe = find_browser("edge") or find_browser("chrome")
-        if exe is None:
-            QMessageBox.warning(self, "未找到浏览器", "未检测到 Microsoft Edge 或 Google Chrome，请先安装其中任意一款浏览器。")
-            return
-        self._close_active_browser()
+    def _open_tab_in_existing_browser(self) -> None:
+        """直接在用户已有的浏览器窗口中打开一个新标签页，绝不创建新的 --user-data-dir。"""
         site = self._site()
+        b_id = self._selected_browser_id()
         url = site.effective_login_url
-        eff_proxy = downloader.resolve_effective_proxy(self.proxy, target_url=url)
-        vault_profile = get_vault_profile_dir(self.paths)
-        self._browser = ManagedBrowser(exe, vault_profile, headless=False, proxy=eff_proxy)
-        self.btn_open.setEnabled(False)
-        self.btn_refresh_silent.setEnabled(False)
-        self.lbl_status.setText(f"正在启动托管浏览器并打开 {site.display_label}…")
-        self._run(lambda: self._browser.start(url), self._on_opened)
+        ok = open_url_in_existing_browser(url, preferred_browser=b_id)
+        if ok:
+            self.lbl_status.setText(
+                f"已在你当前的浏览器（{b_id}）中打开 {site.display_label} 新标签页。\n"
+                "请在该标签页中确认处于已登录状态，然后直接点击上方「步骤 2：立即提取并托管凭据」。"
+            )
+        else:
+            QMessageBox.warning(self, "打开标签页失败", f"未能自动调用系统浏览器打开链接，请手动在浏览器打开：\n{url}")
 
-    def _on_opened(self, _res, err) -> None:
-        if err:
-            self._close_active_browser()
-            self.btn_open.setEnabled(True)
-            self.btn_refresh_silent.setEnabled(True)
-            self.lbl_status.setText(f"启动失败：{err}")
-            return
-        self.btn_export.setEnabled(True)
-        self.lbl_status.setText(
-            "请在弹出的托管浏览器窗口中登录目标网站（如 YouTube），"
-            "确认已登录后点击上方「步骤 2：立即提取并托管凭据」。"
-        )
-
-    def _export(self) -> None:
-        if self._browser is None:
-            return
+    def _extract_from_existing_browser(self) -> None:
         site = self._site()
+        b_id = self._selected_browser_id()
+        url = site.effective_refresh_url
         self.btn_export.setEnabled(False)
-        self.lbl_status.setText("正在从托管浏览器提取登录凭据并同步落盘…")
-        self._run(
-            lambda: export_logged_in_sites_from_browser(self._browser, paths=self.paths, primary_site_key=site.key),
-            lambda reports, err: self._on_exported(site, reports, err),
-        )
+        self.lbl_status.setText(f"正在从当前浏览器 ({b_id}) 提取 {site.display_label} 的登录凭据…")
 
-    def _on_exported(self, site: SiteProfile, reports: Optional[Dict[str, CookieReport]], err) -> None:
-        if err or not reports:
-            self.btn_export.setEnabled(True)
-            self.lbl_status.setText(f"提取失败：{err or '未获取到任何 Cookie'}")
+        def _do_extract() -> Path:
+            out_dir = self.paths.data_root / "cookies"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = get_site_cookie_path(site.key, self.paths)
+            extracted = rookie_bridge.extract_to_netscape_file(
+                browser=b_id,
+                target_url=url,
+                temp_dir=self.paths.temp_dir,
+                app_bound="smart",
+                force_refresh=True,
+            )
+            if extracted is None or not extracted.is_file():
+                raise RuntimeError(
+                    f"未能从 {b_id} 直接解密提取到 {site.display_label} 的登录凭据。\n"
+                    "若当前使用的是启用了 v20 保护的 Edge/Chrome，可直接在刚打开的浏览器标签页中用扩展（如 Cookie-Editor / Get cookies.txt）"
+                    "或按 F12 复制 Cookie，然后点击下方「📋 从剪贴板一键导入并托管当前站点」（仅需一次，永久自动续期）。"
+                )
+            shutil.copy2(extracted, dest)
+            try:
+                os.chmod(dest, 0o600)
+            except OSError:
+                pass
+            return dest
+
+        self._run(_do_extract, lambda out_p, err: self._on_extracted(site, out_p, err))
+
+    def _on_extracted(self, site: SiteProfile, out: Optional[Path], err) -> None:
+        self.btn_export.setEnabled(True)
+        if err or out is None:
+            self.lbl_status.setText(f"提取未成功：{err}")
             return
-
-        primary_rep = reports.get(site.key) or CookieReport()
+        custom_file = get_custom_sites_file(self.paths)
+        report = inspect_netscape(out, site.effective_refresh_url, custom_sites_file=custom_file)
         self._refresh_site_combo_and_overview(keep_key=site.key)
-
-        if primary_rep.ok:
-            out_path = get_site_cookie_path(site.key, self.paths)
-            self.exported_path = str(out_path)
+        self.lbl_status.setText(report.summary())
+        if report.ok:
+            self.exported_path = str(out)
             self.exported_site_key = site.key
-            self._close_active_browser()
-            self.btn_open.setEnabled(True)
-            self.btn_refresh_silent.setEnabled(True)
-
-            all_ok_keys = [k for k, r in reports.items() if r.ok]
-            extra_msg = f"\n同时已自动识别并托管站点：{', '.join(all_ok_keys)}" if len(all_ok_keys) > 1 else ""
-            self.lbl_status.setText(f"✓ 托管成功：{primary_rep.summary()}{extra_msg}")
             QMessageBox.information(
                 self,
-                "账号托管成功",
-                f"已成功提取并托管 {site.display_label} 的登录凭据！\n\n"
-                f"{primary_rep.summary()}{extra_msg}\n\n"
-                "后续下载将自动使用该凭据，并在过期时由程序后台无头静默刷新。",
+                "账号凭据托管成功",
+                f"已成功从浏览器提取并托管 {site.display_label} 登录凭据：\n{out}\n\n{report.summary()}",
+            )
+            self.accept()
+
+    def _import_from_clipboard_for_site(self) -> None:
+        site = self._site()
+        cb = QGuiApplication.clipboard()
+        clip_text = cb.text().strip() if cb is not None else ""
+        if not clip_text:
+            QMessageBox.warning(
+                self,
+                "剪贴板为空",
+                f"当前剪贴板中没有文本内容。\n请先在浏览器已打开的 {site.display_label} 标签页中复制 Cookie（支持 Netscape、JSON 或 F12 原始 Cookie 请求头）。",
+            )
+            return
+        netscape_text, count, _sites = downloader.normalize_cookie_text(
+            clip_text,
+            target_url=site.effective_refresh_url,
+        )
+        if count <= 0 or not netscape_text:
+            QMessageBox.warning(
+                self,
+                "未能识别 Cookie",
+                "剪贴板中的文本不是有效的 Cookie 格式（支持 Netscape .txt、JSON 或 F12 原始 Cookie 字符串）。",
+            )
+            return
+
+        dest = get_site_cookie_path(site.key, self.paths)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(netscape_text, encoding="utf-8")
+        try:
+            os.chmod(dest, 0o600)
+        except OSError:
+            pass
+
+        custom_file = get_custom_sites_file(self.paths)
+        report = inspect_netscape(dest, site.effective_refresh_url, custom_sites_file=custom_file)
+        self._refresh_site_combo_and_overview(keep_key=site.key)
+        self.lbl_status.setText(report.summary())
+        if report.ok:
+            self.exported_path = str(dest)
+            self.exported_site_key = site.key
+            QMessageBox.information(
+                self,
+                "剪贴板托管成功",
+                f"已将剪贴板中的 {site.display_label} 登录凭据托管保存至：\n{dest}\n\n{report.summary()}",
             )
             self.accept()
         else:
-            self.btn_export.setEnabled(True)
-            self.lbl_status.setText(
-                f"当前窗口尚未检测到 {site.display_label} 的有效登录凭据（{primary_rep.summary()}）。\n"
-                "请先在弹出的托管浏览器窗口中完成登录，再点击「步骤 2」。"
-            )
-
-    def _refresh_current_site_silently(self) -> None:
-        self._close_active_browser()
-        site = self._site()
-        eff_proxy = downloader.resolve_effective_proxy(self.proxy, target_url=site.effective_refresh_url)
-        self.btn_refresh_silent.setEnabled(False)
-        self.btn_open.setEnabled(False)
-        self.lbl_status.setText(f"正在后台无头启动托管浏览器，静默提取 {site.display_label} 的最新 Cookie…")
-
-        logs: list[str] = []
-
-        def _do_refresh() -> Optional[Path]:
-            return refresh_hosted_site_cookies(
-                site,
-                paths=self.paths,
-                proxy=eff_proxy,
-                on_log=logs.append,
-            )
-
-        self._run(_do_refresh, lambda out_p, err: self._on_silent_refreshed(site, out_p, logs, err))
-
-    def _on_silent_refreshed(self, site: SiteProfile, out_path: Optional[Path], logs: list[str], err) -> None:
-        self.btn_refresh_silent.setEnabled(True)
-        self.btn_open.setEnabled(True)
-        self._refresh_site_combo_and_overview(keep_key=site.key)
-        if err:
-            self.lbl_status.setText(f"静默刷新失败：{err}")
-            return
-        if out_path is not None and out_path.is_file():
-            self.exported_path = str(out_path)
-            self.exported_site_key = site.key
-            self.lbl_status.setText("\n".join(logs) or f"✓ 已成功在后台静默刷新 {site.display_label} 凭据！")
-            QMessageBox.information(self, "静默刷新成功", self.lbl_status.text())
-        else:
-            self.lbl_status.setText(
-                "\n".join(logs)
-                or f"未能静默刷新 {site.display_label}：请先点击「步骤 1」在托管浏览器中登录一次该网站。"
+            QMessageBox.warning(
+                self,
+                "缺少关键登录凭据",
+                f"已解析 {count} 条 Cookie，但尚未检测到 {site.display_label} 的登录态：\n{report.summary()}",
             )
 
     def _clear_current_site(self) -> None:
@@ -292,10 +293,6 @@ class CookieLoginDialog(QDialog):
             self.exported_path = None
             self.exported_site_key = ""
         if removed:
-            self.lbl_status.setText(f"已清除 {site.display_label} 的本地导出凭据文件。")
+            self.lbl_status.setText(f"已清除 {site.display_label} 的本地托管凭据文件。")
         else:
             self.lbl_status.setText(f"{site.display_label} 当前没有已保存的凭据文件。")
-
-    def done(self, result: int) -> None:
-        self._close_active_browser()
-        super().done(result)

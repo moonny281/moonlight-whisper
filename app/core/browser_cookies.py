@@ -491,6 +491,28 @@ def refresh_hosted_site_cookies(
         return None
 
     if not has_vault_profile(paths):
+        # 若未创建独立 vault_profile，尝试直接从用户当前现有浏览器静默提取最新 Cookie 更新托管文件
+        try:
+            from app.core import rookie_bridge
+
+            for cand_b in ("edge", "chrome", "firefox"):
+                extracted = rookie_bridge.extract_to_netscape_file(
+                    browser=cand_b,
+                    target_url=site.effective_refresh_url,
+                    temp_dir=paths.temp_dir,
+                    app_bound="smart",
+                    force_refresh=True,
+                    on_log=on_log,
+                )
+                if extracted is not None and extracted.is_file():
+                    out_file = get_site_cookie_path(site.key, paths)
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(extracted, out_file)
+                    rep = inspect_netscape(out_file, site.effective_refresh_url, custom_sites_file=custom_file)
+                    if rep.ok:
+                        return out_file
+        except Exception:
+            pass
         return None
 
     exe = find_browser("edge") or find_browser("chrome")
@@ -551,3 +573,29 @@ def refresh_hosted_site_cookies(
             return None
         finally:
             browser.close()
+
+
+def open_url_in_existing_browser(url: str, preferred_browser: str = "") -> bool:
+    """直接在用户当前已有的浏览器中打开一个新标签页，绝不新建 --user-data-dir 配置目录、绝不触发多窗口同步弹窗。"""
+    import webbrowser
+
+    target_url = (url or "").strip() or "about:blank"
+    kind = (preferred_browser or "").strip().lower()
+    if kind in ("edge", "chrome"):
+        exe = find_browser(kind)
+        if exe is not None and exe.is_file():
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
+                subprocess.Popen(
+                    [str(exe), target_url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+                return True
+            except Exception:
+                pass
+    try:
+        return bool(webbrowser.open(target_url, new=2, autoraise=True))
+    except Exception:
+        return False
