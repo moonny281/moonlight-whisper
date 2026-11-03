@@ -542,3 +542,38 @@ class TestRookieIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsBrowserIdFallbackTests(unittest.TestCase):
+    def test_browser_id_platform_error_falls_back_to_live_extract_once(self) -> None:
+        from app.core import rookie_bridge
+
+        calls = {"path": 0, "live": 0}
+        fake_rc = type(sys)("rookie_cookies")
+
+        def _fake_path(db_p, **kw):
+            calls["path"] += 1
+            if "browser_id" in kw:
+                raise RuntimeError("Chromium path option 'browser_id' is only supported on Linux/macOS")
+            return []
+
+        fake_rc.extract_from_path = _fake_path
+        row = {"domain": ".youtube.com", "name": "__Secure-3PSID", "value": "ok", "path": "/",
+               "secure": True, "http_only": True, "expires": 1999999999}
+
+        def _live():
+            calls["live"] += 1
+            return [row]
+
+        rookie_bridge._PATH_BROWSER_ID_UNSUPPORTED = False
+        try:
+            r1 = rookie_bridge._call_extract_from_path(fake_rc, Path("x.db"), "edge", None, None, "injection_only", live_extract=_live)
+            r2 = rookie_bridge._call_extract_from_path(fake_rc, Path("x.db"), "edge", None, None, "injection_only", live_extract=_live)
+        finally:
+            flag = rookie_bridge._PATH_BROWSER_ID_UNSUPPORTED
+            rookie_bridge._PATH_BROWSER_ID_UNSUPPORTED = False
+        self.assertEqual(r1, [row])
+        self.assertEqual(r2, [row])
+        self.assertTrue(flag)
+        self.assertEqual(calls["path"], 1)  # 第二次不再重复尝试不支持的参数
+        self.assertEqual(calls["live"], 2)

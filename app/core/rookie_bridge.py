@@ -864,6 +864,17 @@ def _save_to_persistent_cookie_cache(
         pass
 
 
+# rookie-cookies 在 Windows 上不支持 extract_from_path(browser_id=...)，会抛出
+# "Chromium path option 'browser_id' is only supported on Linux/macOS"。
+# 探测到一次后记住，之后不再白白重试，直接走 Windows 支持的实时提取路径。
+_PATH_BROWSER_ID_UNSUPPORTED = False
+
+
+def _is_browser_id_platform_error(exc: BaseException) -> bool:
+    low = str(exc).lower()
+    return "browser_id" in low and "only supported on" in low
+
+
 def _call_extract_from_path(
     rc: Any,
     snap_db: Path,
@@ -872,44 +883,67 @@ def _call_extract_from_path(
     domains: Optional[List[str]],
     app_bound_policy: str,
     on_log: Optional[LogCallback] = None,
+    live_extract: Optional[Callable[[], List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Call `rookie_cookies.extract_from_path` properly:
-    IMPORTANT: `browser_id` and `local_state_path` are mutually exclusive in `rookie-cookies`.
-    Passing `browser_id=b_id` is required for `v20` App-Bound decryption; `local_state_path` only supports legacy `v10`.
-    """
-    extract_path_fn = getattr(rc, "extract_from_path", None)
-    if not callable(extract_path_fn):
-        return []
+    """Call `rookie_cookies.extract_from_path` with platform-aware fallbacks.
 
-    try:
-        kw_browser: Dict[str, Any] = {
-            "domains": domains,
-            "browser_id": b_id,
-            "app_bound": app_bound_policy,
-        }
-        res = list(extract_path_fn(str(snap_db), **kw_browser) or [])
-        if res:
-            return res
-    except TypeError:
+    - Linux/macOS: `browser_id=` enables v20 decryption on the snapshot DB.
+    - Windows: `browser_id=` is rejected by rookie-cookies, so we remember that and fall back to
+      `live_extract` (rookie's own `extract(browser=...)`, which is the Windows-supported v20 path),
+      then to the legacy `local_state_path` (v10 only) form.
+    """
+    global _PATH_BROWSER_ID_UNSUPPORTED
+    extract_path_fn = getattr(rc, "extract_from_path", None)
+
+    if callable(extract_path_fn) and not _PATH_BROWSER_ID_UNSUPPORTED:
         try:
-            res = list(extract_path_fn(str(snap_db), domains=domains, browser_id=b_id) or [])
+            res = list(
+                extract_path_fn(
+                    str(snap_db), domains=domains, browser_id=b_id, app_bound=app_bound_policy
+                )
+                or []
+            )
             if res:
                 return res
-        except Exception as exc2:
-            if on_log:
-                on_log(f"[rookie-cookies 调试] extract_from_path(browser_id={b_id}) 回退重试异常: {exc2}")
-    except Exception as exc1:
-        if on_log:
-            on_log(f"[rookie-cookies 调试] extract_from_path(browser_id={b_id}, app_bound={app_bound_policy}) 异常: {exc1}")
+        except TypeError:
+            try:
+                res = list(extract_path_fn(str(snap_db), domains=domains, browser_id=b_id) or [])
+                if res:
+                    return res
+            except Exception as exc2:
+                if _is_browser_id_platform_error(exc2):
+                    _PATH_BROWSER_ID_UNSUPPORTED = True
+                elif on_log:
+                    on_log(f"[rookie-cookies 调试] extract_from_path(browser_id={b_id}) 回退重试异常: {exc2}")
+        except Exception as exc1:
+            if _is_browser_id_platform_error(exc1):
+                _PATH_BROWSER_ID_UNSUPPORTED = True
+                if on_log:
+                    on_log("[rookie-cookies] 当前平台不支持 extract_from_path(browser_id)，改用实时提取路径。")
+            elif on_log:
+                on_log(f"[rookie-cookies 调试] extract_from_path(browser_id={b_id}, app_bound={app_bound_policy}) 异常: {exc1}")
 
-    if local_state is not None and local_state.is_file():
+    # Windows-supported route: let rookie read the live browser profile (handles v20 itself).
+    if live_extract is not None:
         try:
-            kw_ls: Dict[str, Any] = {
-                "domains": domains,
-                "local_state_path": str(local_state),
-                "app_bound": app_bound_policy,
-            }
-            res = list(extract_path_fn(str(snap_db), **kw_ls) or [])
+            res = list(live_extract() or [])
+            if res:
+                return res
+        except Exception as exc3:
+            if on_log:
+                on_log(f"[rookie-cookies 调试] 实时提取 {b_id} 失败：{exc3}")
+
+    if callable(extract_path_fn) and local_state is not None and local_state.is_file():
+        try:
+            res = list(
+                extract_path_fn(
+                    str(snap_db),
+                    domains=domains,
+                    local_state_path=str(local_state),
+                    app_bound=app_bound_policy,
+                )
+                or []
+            )
             if res:
                 return res
         except Exception:
@@ -999,6 +1033,11 @@ def extract_to_netscape_file(
         v20_skipped = 0
         extract_fn = getattr(rc, "extract", None)
         read_fn = getattr(rc, "read", None)
+
+        def _live_extract() -> List[Dict[str, Any]]:
+            if not callable(extract_fn):
+                return []
+            return list(extract_fn(**_build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)) or [])
         snap_db: Optional[Path] = None
         local_state: Optional[Path] = None
 
@@ -1010,7 +1049,9 @@ def extract_to_netscape_file(
                 if snap_db is not None and snap_db.is_file():
                     rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains, browser_id=b_id)
                     if not rows_have_site_auth(rows, target_url) and eff_pol != "disabled":
-                        cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol, on_log=on_log)
+                        cand_rows = _call_extract_from_path(
+                            rc, snap_db, b_id, local_state, domains, eff_pol, on_log=on_log, live_extract=_live_extract
+                        )
                         if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
                             rows = cand_rows
                 else:
@@ -1088,7 +1129,9 @@ def extract_to_netscape_file(
                         if snap_db is not None and snap_db.is_file():
                             rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains, browser_id=b_id)
                             if not rows_have_site_auth(rows, target_url) and eff_pol != "disabled":
-                                cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol, on_log=on_log)
+                                cand_rows = _call_extract_from_path(
+                            rc, snap_db, b_id, local_state, domains, eff_pol, on_log=on_log, live_extract=_live_extract
+                        )
                                 if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
                                     rows = cand_rows
                         else:

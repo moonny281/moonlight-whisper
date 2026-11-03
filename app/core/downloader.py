@@ -802,6 +802,36 @@ def _build_common_ydl_opts(
                         ydl_opts.pop("_rookie_error_msg", None)
                         if on_log:
                             on_log(f"[Cookies 自动回退] 浏览器实时提取受限，已自动挂载本地缓存 Cookies：{cached_fb.name}")
+            # Chromium 系 (Edge/Chrome) 的 v20 App-Bound 凭据常常无法后台解密：
+            # 若本机装有 Firefox 且已登录，自动改读 Firefox（明文库，无需解密）。
+            if (
+                not loaded_cookiefile
+                and target_url
+                and browser_name not in ("firefox", "librewolf", "zen", "cachy")
+            ):
+                for alt_browser in ("firefox",):
+                    try:
+                        alt_file = rookie_bridge.extract_to_netscape_file(
+                            browser=alt_browser,
+                            target_url=target_url,
+                            temp_dir=paths.temp_dir,
+                            app_bound="disabled",
+                            token=token,
+                            on_log=None,
+                        )
+                    except CancelledError:
+                        raise
+                    except Exception:
+                        alt_file = None
+                    if alt_file is not None and alt_file.exists():
+                        ydl_opts["cookiefile"] = str(alt_file)
+                        opts.cookies_file = str(alt_file)
+                        loaded_cookiefile = True
+                        ydl_opts.pop("_rookie_cookie_dropped", None)
+                        ydl_opts.pop("_rookie_error_msg", None)
+                        if on_log:
+                            on_log(f"[Cookies 自动回退] {browser_name} 受 v20 加密限制，已改用 {alt_browser} 的登录 Cookies。")
+                        break
             if not loaded_cookiefile and browser_name in ("firefox", "librewolf", "zen", "cachy"):
                 ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
                 if on_log:
@@ -1175,8 +1205,9 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
             msg = f"{rookie_err}（匿名重试后该视频仍要求登录）"
         elif getattr(exc, "cookies_dropped", False):
             msg = (
-                "当前代理节点 IP 被 YouTube 要求验证登录，且 Edge 启用了 v20 (App-Bound) 加密无法在零弹窗模式下后台解密。"
-                "请打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」登录一次（或复制 Cookie 点击「📋 从剪贴板导入」/ 改用 Firefox）。"
+                "当前代理节点 IP 被 YouTube 判定为机器人，要求登录验证；而所选浏览器 (Edge/Chrome) 的 v20 (App-Bound) 加密"
+                "无法在后台解密，未能拿到登录 Cookies。请任选其一：①「偏好设置 -> 网络与认证 -> 登录并获取 Cookies…」登录导出一次；"
+                "②改用 Firefox（登录 YouTube 后在设置里选 Firefox）；③换一个更干净的代理节点（住宅 IP 优先）后重试。"
             )
         elif has_cookies:
             msg = "已使用你导入的 Cookies，但站点仍要求登录：Cookies 可能已过期/被轮换，或不属于该站点账号。请重新导出（YouTube 请用无痕窗口导出并立刻关闭）。"
