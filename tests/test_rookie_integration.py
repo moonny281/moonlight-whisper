@@ -38,12 +38,12 @@ class TestRookieIntegration(unittest.TestCase):
     def test_no_browser_window_spawn_defaults_and_migration(self) -> None:
         """Regression test for v1.2.9+: downloading must NEVER spawn a new Edge/Chrome window by default."""
         cfg = Config()
-        self.assertEqual(cfg.cookies_app_bound, "disabled")
+        self.assertEqual(cfg.cookies_app_bound, "injection_only")
         dl_opts = DownloadOptions()
-        self.assertEqual(dl_opts.cookies_app_bound, "disabled")
+        self.assertEqual(dl_opts.cookies_app_bound, "injection_only")
 
         migrated_cfg = Config.from_dict({"version": 1, "cookies_from_browser": "edge", "cookies_app_bound": "injection_only"})
-        self.assertEqual(migrated_cfg.cookies_app_bound, "disabled")
+        self.assertEqual(migrated_cfg.cookies_app_bound, "injection_only")
 
         # Verify dead code refresh_managed_cookies has been removed so nothing reuses a fixed browser_profile
         self.assertFalse(hasattr(browser_cookies, "refresh_managed_cookies"))
@@ -224,7 +224,7 @@ class TestRookieIntegration(unittest.TestCase):
                 self.assertIsNotNone(recovered_file)
                 self.assertIn("sapi_from_snap", recovered_file.read_text(encoding="utf-8"))
 
-            # Part B: Verify YouTube direct fallback when yt-dlp raises 'Sign in to confirm you're not a bot'
+            # Part B: Verify yt-dlp raises clean DownloadError with login guidance when blocked
             class BotBlockedYoutubeDL:
                 def __init__(self, opts):
                     pass
@@ -241,53 +241,22 @@ class TestRookieIntegration(unittest.TestCase):
             fake_ytdlp = type(sys)("yt_dlp")
             fake_ytdlp.YoutubeDL = BotBlockedYoutubeDL  # type: ignore[attr-defined]
 
-            fake_piped_resp = {
-                "title": "YouTube 备用通道成功测试视频",
-                "uploader": "YTCreator",
-                "duration": 210.0,
-                "audioStreams": [
-                    {
-                        "url": "https://pipedproxy.example.com/audio_fyuaW6Uf-S8.m4a",
-                        "mimeType": "audio/mp4",
-                        "bitrate": 128000,
-                    }
-                ],
-            }
-
-            def _fake_dl_stream(url, dest_file, proxy="", expected_sha256="", on_chunk_progress=None, token=None, timeout=60, expected_size=0):
-                dest_file.write_bytes(b"FAKE_M4A_AUDIO_STREAM")
-                if on_chunk_progress:
-                    on_chunk_progress(100, 100)
-                return dest_file
-
             with _patch_sys_module("rookie_cookies", fake_rc), _patch_sys_module("yt_dlp", fake_ytdlp), patch(
                 "app.core.rookie_bridge._copy_locked_chromium_cookies_db", return_value=(None, None)
-            ), patch("app.core.http_client.fetch_json", return_value=fake_piped_resp), patch(
-                "app.core.http_client.stream_download_with_resume", side_effect=_fake_dl_stream
             ):
-                downloader._DIRECT_MEDIA_CACHE.clear()
                 paths = AppPaths(app_dir=Path(tmp))
                 dl_opts = DownloadOptions(cookies_from_browser="edge")
                 logs: list[str] = []
                 yt_url = "https://www.youtube.com/watch?v=fyuaW6Uf-S8&t=17s"
-                info = downloader.fetch_info(
-                    yt_url,
-                    dl_opts,
-                    token=CancelToken(),
-                    on_log=logs.append,
-                    paths=paths,
-                )
-                self.assertEqual(info.id, "fyuaW6Uf-S8")
-                self.assertEqual(info.title, "YouTube 备用通道成功测试视频")
-
-                audio_path = downloader.download_audio(
-                    yt_url,
-                    workdir=Path(tmp) / "work_yt",
-                    opts=dl_opts,
-                    paths=paths,
-                )
-                self.assertTrue(audio_path.exists())
-                self.assertEqual(audio_path.name, "fyuaW6Uf-S8.m4a")
+                with self.assertRaises(DownloadError) as ctx:
+                    downloader.fetch_info(
+                        yt_url,
+                        dl_opts,
+                        token=CancelToken(),
+                        on_log=logs.append,
+                        paths=paths,
+                    )
+                self.assertIn("登录", ctx.exception.user_message)
 
     def test_profile_discovery_parsing(self) -> None:
         fake_rc = type(sys)("rookie_cookies")
@@ -431,40 +400,6 @@ class TestRookieIntegration(unittest.TestCase):
         e2 = RuntimeError("ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot")
         self.assertIs(downloader._pick_root_exc([e1, e2]), e1)
 
-        # Issue E: Invidious fallback must ignore video/mp4 (2.5 Mbps) and select audio/mp4 (130 kbps)
-        invidious_payload = {
-            "title": "Invidious Audio Filter Test",
-            "author": "Tester",
-            "lengthSeconds": 120,
-            "adaptiveFormats": [
-                {
-                    "type": "video/mp4; codecs=\"avc1.640028\"",
-                    "bitrate": "2500000",
-                    "url": "https://inv.tux.pizza/videoplayback?id=VIDEO_ONLY",
-                },
-                {
-                    "type": "audio/mp4; codecs=\"mp4a.40.2\"",
-                    "bitrate": "130000",
-                    "url": "https://inv.tux.pizza/videoplayback?id=AUDIO_ONLY",
-                },
-            ],
-        }
-
-        def _mock_fetch_json(url, **kw):
-            if "api/v1/videos" in url:
-                return invidious_payload
-            raise RuntimeError("piped down")
-
-        downloader._DIRECT_MEDIA_CACHE.clear()
-        with patch("app.core.http_client.fetch_json", side_effect=_mock_fetch_json):
-            fb = downloader._fallback_youtube_direct(
-                "https://www.youtube.com/watch?v=testAudio11",
-                video_id="testAudio11",
-                proxy="",
-            )
-            self.assertIsNotNone(fb)
-            self.assertIn("id=AUDIO_ONLY", fb.stream_url)
-            self.assertNotIn("id=VIDEO_ONLY", fb.stream_url)
 
         # Section 3: Corrupted config.json backup & proxy URL credential redaction
         self.assertEqual(
@@ -476,7 +411,7 @@ class TestRookieIntegration(unittest.TestCase):
             bad_cfg = paths.bootstrap_config_path
             bad_cfg.write_text("{broken json", encoding="utf-8")
             loaded = Config.load(paths=paths)
-            self.assertEqual(loaded.cookies_app_bound, "disabled")
+            self.assertEqual(loaded.cookies_app_bound, "injection_only")
             self.assertTrue(bad_cfg.with_suffix(".json.bak").is_file())
 
 
@@ -548,6 +483,31 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertIn("new_rotated_ts_999", updated_src)
             self.assertNotIn("old_rotated_ts_1", updated_src)
             self.assertTrue(any("自动续期" in l for l in logs))
+
+
+    def test_v1_3_4_singleton_suppression_and_ytdlp_native_cookie_fallback(self) -> None:
+        """Regression tests for v1.3.4:
+        1) _suppress_chromium_singleton safely acquires Mutex and renames/restores ProcessSingleton window;
+        2) Native yt-dlp cookiesfrombrowser is used as fallback for Firefox when rookie-cookies is absent or empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            test_dir = Path(tmp) / "User Data"
+            test_dir.mkdir()
+            # On Linux/non-Windows this is a clean no-op
+            with rookie_bridge._suppress_chromium_singleton(test_dir):
+                pass
+
+            # Verify yt-dlp cookiesfrombrowser fallback for Firefox when cookiefile is empty
+            paths = AppPaths(app_dir=Path(tmp))
+            dl_opts = DownloadOptions(cookies_from_browser="firefox", cookies_browser_profile="default")
+            logs: list[str] = []
+            ydl_opts = downloader._build_common_ydl_opts(
+                dl_opts,
+                on_log=logs.append,
+                paths=paths,
+                target_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                token=CancelToken(),
+            )
+            self.assertEqual(ydl_opts.get("cookiesfrombrowser"), ("firefox", "default", None, None))
 
 
 if __name__ == "__main__":

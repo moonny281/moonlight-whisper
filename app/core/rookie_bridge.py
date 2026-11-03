@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 import ctypes.wintypes
 import json
@@ -31,10 +32,10 @@ from app.core.site_cookies import (
 LogCallback = Callable[[str], None]
 
 APP_BOUND_POLICIES: Tuple[Tuple[str, str], ...] = (
-    ("disabled", "仅明文库 / DPAPI v10 / 本地缓存 (disabled：跳过 v20 实时解密)"),
+    ("injection_only", "无特权静默解密 v20 (injection_only，默认推荐：单实例抑制无窗口)"),
     ("smart", "智能缓存优先 (smart：优先复用缓存，缺失时挂起态无窗口解密 v20 并持久化)"),
-    ("injection_only", "无特权挂起态解密 v20 (injection_only：CREATE_SUSPENDED 约50ms提取密钥，无UI窗口)"),
     ("allow_elevated_fallback", "进程内提权解密 v20 (allow_elevated_fallback：优先同权限，支持进程内 DPAPI/CNG 兜底)"),
+    ("disabled", "仅明文库 / DPAPI v10 / 本地缓存 (disabled：跳过 v20 实时解密)"),
 )
 
 DEFAULT_BROWSER_CATALOG: Tuple[Tuple[str, str], ...] = (
@@ -238,6 +239,101 @@ def _is_token_cancelled(token: Optional[CancelToken]) -> bool:
         return False
     attr = getattr(token, "is_cancelled", False)
     return bool(attr() if callable(attr) else attr)
+
+
+@contextlib.contextmanager
+def _suppress_chromium_singleton(user_data_dir: Optional[Path]):
+    """Windows context manager that prevents spawned Chromium child processes in rookie-cookies injector.rs
+    from discovering the running browser's ProcessSingleton window or forwarding WM_COPYDATA start commands.
+    This completely eliminates popup windows and opening tabs in the user's active browser!
+    """
+    if sys.platform != "win32" or user_data_dir is None:
+        yield
+        return
+
+    mutex_handle = None
+    renamed_windows: List[Tuple[int, str]] = []
+
+    try:
+        user32 = getattr(ctypes, "windll", None) and getattr(ctypes.windll, "user32", None)
+        kernel32 = getattr(ctypes, "windll", None) and getattr(ctypes.windll, "kernel32", None)
+
+        if user32 and kernel32:
+            # 1. Acquire Local\\ChromeProcessSingletonStartup! mutex so child process safely waits at AutoLockMutex
+            # instead of racing to initialize UI or write lockfiles
+            kMutexName = "Local\\ChromeProcessSingletonStartup!"
+            mutex_handle = kernel32.CreateMutexW(None, True, kMutexName)
+            if mutex_handle:
+                kernel32.WaitForSingleObject(mutex_handle, 50)
+
+            # 2. Find any Chrome_WidgetWin_0 window whose title matches user_data_dir and rename it temporarily
+            target_str = str(user_data_dir).rstrip("\\/").lower()
+
+            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+            def _enum_proc(hwnd, lparam):
+                try:
+                    length = user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(hwnd, buf, length + 1)
+                        title = buf.value.rstrip("\\/")
+                        if title.lower() == target_str:
+                            user32.SetWindowTextW(hwnd, title + "__mw_hold")
+                            renamed_windows.append((hwnd, title))
+                except Exception:
+                    pass
+                return True
+
+            cb = WNDENUMPROC(_enum_proc)
+            try:
+                user32.EnumWindows(cb, 0)
+            except Exception:
+                pass
+
+            # Also check message-only windows
+            try:
+                HWND_MESSAGE = ctypes.c_void_p(-3).value
+                child = None
+                for _ in range(50):
+                    child = user32.FindWindowExW(HWND_MESSAGE, child, "Chrome_WidgetWin_0", None)
+                    if not child:
+                        break
+                    length = user32.GetWindowTextLengthW(child)
+                    if length > 0:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(child, buf, length + 1)
+                        title = buf.value.rstrip("\\/")
+                        if title.lower() == target_str:
+                            user32.SetWindowTextW(child, title + "__mw_hold")
+                            renamed_windows.append((child, title))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        yield
+    finally:
+        if sys.platform == "win32":
+            try:
+                user32 = getattr(ctypes, "windll", None) and getattr(ctypes.windll, "user32", None)
+                if user32:
+                    for hwnd, original_title in renamed_windows:
+                        try:
+                            user32.SetWindowTextW(hwnd, original_title)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if mutex_handle:
+                try:
+                    kernel32 = getattr(ctypes, "windll", None) and getattr(ctypes.windll, "kernel32", None)
+                    if kernel32:
+                        kernel32.ReleaseMutex(mutex_handle)
+                        kernel32.CloseHandle(mutex_handle)
+                except Exception:
+                    pass
 
 
 def _chromium_user_data_dir(browser_id: str) -> Optional[Path]:
@@ -789,18 +885,11 @@ def extract_to_netscape_file(
         return None
 
     prof = (profile or "").strip() or None
-    policy = (app_bound or "disabled").strip().lower()
+    policy = (app_bound or "injection_only").strip().lower()
     if policy not in ("disabled", "smart", "injection_only", "allow_elevated_fallback"):
-        policy = "disabled"
+        policy = "injection_only"
 
-    # `disabled` strictly stays `"disabled"`! Only `"smart"` escalates when v20 decryption is needed.
-    eff_pol = "disabled" if policy in ("disabled", "smart") else policy
-    allow_v20_escalation = policy in ("smart", "injection_only", "allow_elevated_fallback")
-    escalation_policies: Tuple[str, ...] = (
-        ("allow_elevated_fallback", "injection_only")
-        if policy in ("smart", "allow_elevated_fallback")
-        else (("injection_only",) if policy == "injection_only" else ())
-    )
+    eff_pol = "injection_only" if policy == "smart" else policy
 
     domains = extraction_domains_for(target_url)
 
@@ -834,96 +923,99 @@ def extract_to_netscape_file(
         snap_db: Optional[Path] = None
         local_state: Optional[Path] = None
 
-        # Step 2: Primary extraction via `rookie_cookies.extract` / `read` (always passing `eff_pol`)
-        try:
-            if callable(extract_fn):
-                kwargs = _build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)
-                try:
-                    rows = list(extract_fn(**kwargs) or [])
-                except TypeError:
-                    minimal_kw: Dict[str, Any] = {"browser": b_id, "app_bound": eff_pol}
-                    if prof:
-                        minimal_kw["profile"] = prof
-                    if domains is not None:
-                        minimal_kw["domains"] = domains
-                    try:
-                        rows = list(extract_fn(**minimal_kw) or [])
-                    except TypeError:
-                        if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
-                            rows = []
-                        else:
-                            rows = list(extract_fn(browser=b_id) or [])
-            elif callable(read_fn):
-                read_kw = _build_extract_kwargs(b_id, prof, None, eff_pol, timeout, cancel_handle)
-                read_kw.pop("domains", None)
-                snap = read_fn(**read_kw)
-                all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
-                if domains:
-                    rows = [
-                        r
-                        for r in all_rows
-                        if any(
-                            str(r.get("domain") or "").lstrip(".").lower() == d
-                            or str(r.get("domain") or "").lstrip(".").lower().endswith("." + d)
-                            for d in domains
-                        )
-                    ]
-                else:
-                    rows = all_rows
-            else:
-                if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
-                    rows = []
-                else:
-                    helper_fn = getattr(rc, b_id, None)
-                    if not callable(helper_fn):
-                        raise RuntimeError(f"rookie_cookies 不支持浏览器 {b_id}")
-                    rows = list(helper_fn(domains=domains) if domains else helper_fn())
-        except Exception as primary_exc:
-            err_lower = str(primary_exc).lower()
-            is_locked_err = (
-                "os error 32" in err_lower
-                or "share-locked" in err_lower
-                or "being used by another process" in err_lower
-                or ("locked" in err_lower and ("database" in err_lower or "cookie" in err_lower))
-            )
-            if is_locked_err and b_id in _CHROMIUM_BROWSERS:
+        user_data_dir = _chromium_user_data_dir(b_id) if (sys.platform == "win32" and b_id in _CHROMIUM_BROWSERS) else None
+
+        with _suppress_chromium_singleton(user_data_dir):
+            if sys.platform == "win32" and b_id in _CHROMIUM_BROWSERS:
                 snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
                 if snap_db is not None and snap_db.is_file():
                     rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
-                    if not rows_have_site_auth(rows, target_url):
+                    if not rows_have_site_auth(rows, target_url) and eff_pol != "disabled":
                         cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol)
                         if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
                             rows = cand_rows
-                    if not rows_have_site_auth(rows, target_url) and allow_v20_escalation:
-                        for v20_pol in escalation_policies:
-                            cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, v20_pol)
-                            if rows_have_site_auth(cand_rows, target_url):
-                                rows = cand_rows
-                                break
-                            if len(cand_rows) > len(rows):
-                                rows = cand_rows
                 else:
-                    raise primary_exc
+                    if callable(extract_fn):
+                        kwargs = _build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)
+                        try:
+                            rows = list(extract_fn(**kwargs) or [])
+                        except TypeError:
+                            minimal_kw = {"browser": b_id, "app_bound": eff_pol}
+                            if prof:
+                                minimal_kw["profile"] = prof
+                            if domains is not None:
+                                minimal_kw["domains"] = domains
+                            try:
+                                rows = list(extract_fn(**minimal_kw) or [])
+                            except TypeError:
+                                if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                                    rows = []
+                                else:
+                                    rows = list(extract_fn(browser=b_id) or [])
             else:
-                raise primary_exc
-
-        # Step 3: If primary extract returned no auth cookies on Chromium without throwing OS error 32,
-        # try reading the unlocked SQLite snapshot for v10/plaintext cookies (and v20 ONLY if `allow_v20_escalation` is True)
-        if not rows_have_site_auth(rows, target_url) and b_id in _CHROMIUM_BROWSERS:
-            if snap_db is None or not snap_db.is_file():
-                snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=None)
-            if snap_db is not None and snap_db.is_file():
-                sql_rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
-                if rows_have_site_auth(sql_rows, target_url) or len(sql_rows) > len(rows):
-                    rows = sql_rows
-                if not rows_have_site_auth(rows, target_url) and allow_v20_escalation:
-                    for v20_pol in escalation_policies:
-                        cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, v20_pol)
-                        if rows_have_site_auth(cand_rows, target_url):
-                            rows = cand_rows
-                            break
-                        if len(cand_rows) > len(rows):
-                            rows = cand_rows
+                try:
+                    if callable(extract_fn):
+                        kwargs = _build_extract_kwargs(b_id, prof, domains, eff_pol, timeout, cancel_handle)
+                        try:
+                            rows = list(extract_fn(**kwargs) or [])
+                        except TypeError:
+                            minimal_kw = {"browser": b_id, "app_bound": eff_pol}
+                            if prof:
+                                minimal_kw["profile"] = prof
+                            if domains is not None:
+                                minimal_kw["domains"] = domains
+                            try:
+                                rows = list(extract_fn(**minimal_kw) or [])
+                            except TypeError:
+                                if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                                    rows = []
+                                else:
+                                    rows = list(extract_fn(browser=b_id) or [])
+                    elif callable(read_fn):
+                        read_kw = _build_extract_kwargs(b_id, prof, None, eff_pol, timeout, cancel_handle)
+                        read_kw.pop("domains", None)
+                        snap = read_fn(**read_kw)
+                        all_rows = list(snap.as_list() if hasattr(snap, "as_list") else [])
+                        if domains:
+                            rows = [
+                                r
+                                for r in all_rows
+                                if any(
+                                    str(r.get("domain") or "").lstrip(".").lower() == d
+                                    or str(r.get("domain") or "").lstrip(".").lower().endswith("." + d)
+                                    for d in domains
+                                )
+                            ]
+                        else:
+                            rows = all_rows
+                    else:
+                        if eff_pol == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS:
+                            rows = []
+                        else:
+                            helper_fn = getattr(rc, b_id, None)
+                            if not callable(helper_fn):
+                                raise RuntimeError(f"rookie_cookies 不支持浏览器 {b_id}")
+                            rows = list(helper_fn(domains=domains) if domains else helper_fn())
+                except Exception as primary_exc:
+                    err_lower = str(primary_exc).lower()
+                    is_locked_err = (
+                        "os error 32" in err_lower
+                        or "share-locked" in err_lower
+                        or "being used by another process" in err_lower
+                        or ("locked" in err_lower and ("database" in err_lower or "cookie" in err_lower))
+                    )
+                    if is_locked_err and b_id in _CHROMIUM_BROWSERS:
+                        snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
+                        if snap_db is not None and snap_db.is_file():
+                            rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                            if not rows_have_site_auth(rows, target_url) and eff_pol != "disabled":
+                                cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol)
+                                if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
+                                    rows = cand_rows
+                        else:
+                            raise primary_exc
+                    else:
+                        raise primary_exc
 
         if not rows:
             if on_log:

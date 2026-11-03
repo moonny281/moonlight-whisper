@@ -144,7 +144,7 @@ class DownloadOptions:
     cookies_file: str = ""
     cookies_from_browser: str = ""
     cookies_browser_profile: str = ""   # 例如 "Default" / "Profile 1" / Firefox 配置目录名
-    cookies_app_bound: str = "disabled"  # "disabled" (default: no browser spawn) | "injection_only" | "allow_elevated_fallback"
+    cookies_app_bound: str = "injection_only"  # "disabled" (default: no browser spawn) | "injection_only" | "allow_elevated_fallback"
     allow_playlist: bool = False
     ffmpeg_dir: Optional[Path] = None
     deno_path: Optional[Path] = None
@@ -802,6 +802,10 @@ def _build_common_ydl_opts(
                         ydl_opts.pop("_rookie_error_msg", None)
                         if on_log:
                             on_log(f"[Cookies 自动回退] 浏览器实时提取受限，已自动挂载本地缓存 Cookies：{cached_fb.name}")
+            if not loaded_cookiefile and browser_name in ("firefox", "librewolf", "zen", "cachy"):
+                ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
+                if on_log:
+                    on_log(f"[Cookies 回退] 正在尝试 yt-dlp 原生从 {browser_name} 读取 Cookies...")
         else:
             ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
 
@@ -840,143 +844,6 @@ def _extract_tiktok_video_id(url: str, error_text: str = "") -> Optional[str]:
         m = _TIKTOK_VIDEO_ID_RE.search(text)
         if m:
             return m.group(1)
-    return None
-
-
-def _fallback_youtube_direct(
-    url: str,
-    video_id: Optional[str],
-    proxy: str,
-    on_log: Optional[LogCallback] = None,
-) -> Optional[_DirectMediaFallback]:
-    """Resolve YouTube video metadata and direct audio stream via Piped / Invidious public API cluster
-    when the user's proxy IP triggers YouTube's 'Sign in to confirm you're not a bot' check without cookies.
-    """
-    if url in _DIRECT_MEDIA_CACHE:
-        return _DIRECT_MEDIA_CACHE[url]
-
-    vid = video_id or _extract_youtube_video_id(url)
-    if not vid:
-        return None
-
-    eff_proxy = resolve_effective_proxy(proxy, target_url=url)
-
-    # 1. Try Piped API instances
-    piped_bases = (
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.moomoo.me",
-        "https://piped-api.garudalinux.org",
-    )
-    if on_log:
-        on_log(f"[YouTube 备用通道 1/2] 正在通过免登录镜像接口解析音频流 (ID: {vid})...")
-
-    for base in piped_bases:
-        try:
-            resp = http_client.fetch_json(f"{base}/streams/{vid}", proxy=eff_proxy, timeout=15)
-            if not isinstance(resp, dict):
-                continue
-            audio_streams = resp.get("audioStreams")
-            if not isinstance(audio_streams, list) or not audio_streams:
-                continue
-            valid_streams = [
-                s for s in audio_streams if isinstance(s, dict) and str(s.get("url") or "").startswith("http")
-            ]
-            if not valid_streams:
-                continue
-            valid_streams.sort(key=lambda s: int(s.get("bitrate") or 0), reverse=True)
-            best = valid_streams[0]
-            stream_url = str(best["url"])
-            mime = str(best.get("mimeType") or "").lower()
-            ext = "m4a" if ("mp4" in mime or "m4a" in mime) else "webm"
-            title = str(resp.get("title") or f"YouTube_{vid}").strip() or f"YouTube_{vid}"
-            uploader = str(resp.get("uploader") or "YouTubeCreator").strip()
-            duration = float(resp.get("duration") or 0.0)
-            media_info = MediaInfo(
-                url=url,
-                id=vid,
-                title=title,
-                uploader=uploader,
-                duration=duration,
-                extractor="YouTubePiped",
-                webpage_url=url,
-            )
-            resolved = _DirectMediaFallback(
-                info=media_info,
-                stream_url=stream_url,
-                ext=ext,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            )
-            _DIRECT_MEDIA_CACHE[url] = resolved
-            if on_log:
-                on_log(f"[YouTube 备用通道] 成功解析音频直链：《{title}》 (ID: {vid})")
-            return resolved
-        except Exception:
-            continue
-
-    # 2. Try Invidious API instances with `?local=true` (proxied stream avoids Google IP bot block)
-    invidious_bases = (
-        "https://inv.tux.pizza",
-        "https://invidious.nerdvpn.de",
-        "https://inv.nadeko.net",
-        "https://yewtu.be",
-    )
-    if on_log:
-        on_log(f"[YouTube 备用通道 2/2] 正在尝试 Invidious 节点提取音频流 (ID: {vid})...")
-
-    for base in invidious_bases:
-        try:
-            resp = http_client.fetch_json(f"{base}/api/v1/videos/{vid}?local=true", proxy=eff_proxy, timeout=15)
-            if not isinstance(resp, dict):
-                continue
-            formats = resp.get("adaptiveFormats") or resp.get("formatStreams") or []
-            if not isinstance(formats, list) or not formats:
-                continue
-            audio_candidates = []
-            for f in formats:
-                if not isinstance(f, dict):
-                    continue
-                ftype = str(f.get("type") or "").lower()
-                if not ftype.startswith("audio/"):
-                    continue
-                u = str(f.get("url") or "").strip()
-                if not u:
-                    continue
-                if u.startswith("/"):
-                    u = base + u
-                if urllib.parse.urlparse(u).scheme not in ("http", "https"):
-                    continue
-                audio_candidates.append((int(f.get("bitrate") or 0), u, ftype))
-            if not audio_candidates:
-                continue
-            audio_candidates.sort(key=lambda x: x[0], reverse=True)
-            _, stream_url, ftype = audio_candidates[0]
-            ext = "m4a" if "mp4" in ftype else "webm"
-            title = str(resp.get("title") or f"YouTube_{vid}").strip() or f"YouTube_{vid}"
-            uploader = str(resp.get("author") or "YouTubeCreator").strip()
-            duration = float(resp.get("lengthSeconds") or 0.0)
-            media_info = MediaInfo(
-                url=url,
-                id=vid,
-                title=title,
-                uploader=uploader,
-                duration=duration,
-                extractor="YouTubeInvidious",
-                webpage_url=url,
-            )
-            resolved = _DirectMediaFallback(
-                info=media_info,
-                stream_url=stream_url,
-                ext=ext,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            )
-            _DIRECT_MEDIA_CACHE[url] = resolved
-            if on_log:
-                on_log(f"[YouTube 备用通道] 成功从 Invidious 节点获取音频流：《{title}》 (ID: {vid})")
-            return resolved
-        except Exception:
-            continue
-
     return None
 
 
@@ -1448,11 +1315,6 @@ def extract_playlist_or_info(
             direct_fb = _fallback_tiktok_direct(url, video_id=vid, proxy=opts.proxy, on_log=on_log)
             if direct_fb is not None:
                 return [direct_fb.info]
-        if _is_youtube_url(url) and not opts.allow_playlist:
-            yt_vid = _extract_youtube_video_id(url)
-            yt_fb = _fallback_youtube_direct(url, video_id=yt_vid, proxy=opts.proxy, on_log=on_log)
-            if yt_fb is not None:
-                return [yt_fb.info]
         raise _translate_ydl_exception(exc, has_cookies=has_cookies) from exc
 
     if token:
@@ -1595,19 +1457,6 @@ def download_audio(
                 _DIRECT_MEDIA_CACHE.pop(url, None)
                 return _download_direct_media_fallback(
                     fb=direct_fb,
-                    workdir=workdir,
-                    proxy=opts.proxy,
-                    on_progress=on_progress,
-                    on_log=on_log,
-                    token=token,
-                )
-        if _is_youtube_url(url):
-            yt_vid = _extract_youtube_video_id(url)
-            yt_fb = _fallback_youtube_direct(url, video_id=yt_vid, proxy=opts.proxy, on_log=on_log)
-            if yt_fb is not None:
-                _DIRECT_MEDIA_CACHE.pop(url, None)
-                return _download_direct_media_fallback(
-                    fb=yt_fb,
                     workdir=workdir,
                     proxy=opts.proxy,
                     on_progress=on_progress,

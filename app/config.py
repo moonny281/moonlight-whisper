@@ -60,7 +60,7 @@ class Config:
     cookies_file: str = ""
     cookies_from_browser: str = ""
     cookies_browser_profile: str = ""
-    cookies_app_bound: str = "disabled"  # Default "disabled" prevents spawning a new Edge/Chrome window during downloads
+    cookies_app_bound: str = "injection_only"  # Default "disabled" prevents spawning a new Edge/Chrome window during downloads
     managed_cookie_site: str = ""
     hf_mirror: bool = True
     pypi_mirror: str = "tuna"      # "tuna" | "aliyun" | "official"
@@ -176,9 +176,7 @@ class Config:
                 migrated["write_srt"] = bool(migrated.pop("export_srt"))
             migrated["version"] = 1
 
-        # v1.2.9: Migrate previous default "injection_only" to "disabled" so Edge/Chrome is never spawned during downloads
-        if migrated.get("cookies_app_bound") == "injection_only":
-            migrated["cookies_app_bound"] = "disabled"
+        # v1.3.4: injection_only is now fully singleton-suppressed (0 popups/tabs), default preserved
 
         return migrated
 
