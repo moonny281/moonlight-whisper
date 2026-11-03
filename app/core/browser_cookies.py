@@ -241,9 +241,22 @@ def _prepare_clean_profile_session(profile_dir: Path) -> None:
 class ManagedBrowser:
     """启动并控制使用独立托管配置目录的 Edge/Chrome 进程（支持可见登录窗口与后台无头静默刷新）。"""
 
-    def __init__(self, exe: Path, profile_dir: Path, headless: bool = False, proxy: str = "") -> None:
+    def __init__(
+        self,
+        exe: Path,
+        profile_dir: Path,
+        headless: bool = False,
+        proxy: str = "",
+        app_window: bool = False,
+        window_size: Tuple[int, int] = (480, 780),
+        window_pos: Optional[Tuple[int, int]] = None,
+    ) -> None:
         self.exe, self.profile_dir, self.headless = exe, profile_dir, headless
         self.proxy = (proxy or "").strip()
+        # app_window=True：以 `--app=URL` 单窗口小窗模式启动（无标签栏/地址栏，不会产生多余标签页）
+        self.app_window = bool(app_window)
+        self.window_size = window_size
+        self.window_pos = window_pos
         self.port = _free_port()
         self._proc: Optional[subprocess.Popen] = None
 
@@ -261,6 +274,10 @@ class ManagedBrowser:
             "--disable-session-crashed-bubble",
             "--hide-crash-restore-bubble",
             "--disable-blink-features=AutomationControlled",
+            # 独立托管目录不参与任何账号同步：关闭同步、跳过首次运行向导，避免 Edge 弹出登录/同步窗口与多余标签页
+            "--disable-sync",
+            "--disable-default-apps",
+            "--disable-features=msImplicitSignin,msEdgeOnRampFRE",
         ]
         if self.proxy:
             args.append(f"--proxy-server={self.proxy}")
@@ -278,7 +295,13 @@ class ManagedBrowser:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
                 startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-        args.append(start_url)
+        if self.app_window and not self.headless:
+            args.append(f"--app={start_url}")
+            args.append(f"--window-size={int(self.window_size[0])},{int(self.window_size[1])}")
+            if self.window_pos is not None:
+                args.append(f"--window-position={int(self.window_pos[0])},{int(self.window_pos[1])}")
+        else:
+            args.append(start_url)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if (self.headless and sys.platform == "win32") else 0
         self._proc = subprocess.Popen(
             args,
@@ -299,6 +322,18 @@ class ManagedBrowser:
             except requests.RequestException:
                 time.sleep(0.3)
         raise BrowserCookieError("等待托管浏览器调试端口超时")
+
+    def alive(self) -> bool:
+        """托管浏览器进程是否仍在运行（用户手动关掉登录小窗后为 False）。"""
+        return self._proc is not None and self._proc.poll() is None
+
+    def page_urls(self) -> List[str]:
+        """当前所有页面（标签/小窗）的 URL，用于判断用户是否已回到目标站点。"""
+        try:
+            targets = _local_session().get(f"http://127.0.0.1:{self.port}/json/list", timeout=3).json()
+        except Exception:
+            return []
+        return [str(t.get("url") or "") for t in targets if isinstance(t, dict) and t.get("type") == "page"]
 
     def get_cookies(self) -> List[Dict[str, Any]]:
         """同时从 Browser Target (`Storage.getCookies`) 与 Page Target (`Network.getAllCookies` / `Storage.getCookies`)

@@ -6,7 +6,7 @@
 ## 核心特性
 
 - **开箱即用**：CPU 模式下无需任何额外配置即可运行；首次勾选 NVIDIA GPU 加速时支持在线按需下载 CUDA 12（cuBLAS 12 + cuDNN 9）运行库（支持国内清华/阿里云 PyPI 镜像、断点续传、SHA256 校验与离线导入）。
-- **网站账号托管（Account Vault）与专用登录小窗**（v1.4.0）：点击「打开专用登录小窗」即在应用内弹出一个独立的小窗口（QtWebEngine）登录各大视频网站（YouTube、哔哩哔哩、抖音、TikTok、X/Twitter、Instagram、小红书，并支持 `plugins/sites.json` 扩展自定义站点）。小窗与日常浏览器的窗口/标签页互不干扰，也**不是浏览器配置目录**，不会触发 Edge/Chrome 账号同步；登录凭据由小窗直接回传（无需解密浏览器 Cookie 数据库），点击「我已登录」后写入 `cookies/<站点>.txt`。下载时按域名自动挂载对应站点凭据并原子回写轮换令牌。小窗不可用或站点拒绝内嵌登录时，可在浏览器登录后复制 Cookie，用「从剪贴板导入并托管」。
+- **网站账号托管（Account Vault）与安全登录小窗**：点击「打开安全登录小窗」，调用电脑上真实的 Edge / Chrome 以单窗口小窗（`--app` 模式，无标签页）打开登录页，Google 等站点认可这种真实浏览器环境，可正常登录 YouTube/Google（YouTube、哔哩哔哩、抖音、TikTok、X/Twitter、Instagram、小红书，并支持 `plugins/sites.json` 扩展自定义站点）。小窗使用应用自己的独立托管目录（`account_vault/browser_profile`），与日常浏览器的配置和账号隔离，并关闭账号同步、跳过首次运行向导；登录凭据通过本地调试端口明文读取，点击「我已登录，提取并托管凭据」后写入 `cookies/<站点>.txt`，同时顺带托管小窗里已登录的其他站点。下载时按域名自动挂载凭据并原子回写轮换令牌，凭据过期时可在后台无头静默刷新。另提供应用内置小窗（QtWebEngine，适合 B站/抖音等，Google 会拦截）与「从剪贴板导入」。
 - **智能容错与回退**：自动遵循 `GPU float16 → GPU int8_float16 → CPU int8` 降级回退链，显存不足或运行库异常时平滑切换。
 - **支持播放列表与批量队列**：支持批量粘贴链接、拖入本地音视频文件（`.mp3`, `.m4a`, `.mp4`, `.mkv`, `.wav` 等），可选开启播放列表/多 P 视频自动展开。
 - **结构化 Markdown 导出**：智能段落合并、防幻觉相邻句去重、繁体转简体（OpenCC）、文件名自动清洗与防重名。
@@ -23,7 +23,7 @@ moonlight-whisper/
 │  ├─ logger.py                # 7 天轮转日志 + UI 实时日志转发
 │  ├─ workers.py               # QThread 封装与串行任务队列 TaskQueue
 │  ├─ ui/                      # PySide6 界面层 (主窗口/GPU向导/模型管理/设置/网站账号托管中心/专用登录小窗 login_window.py)
-│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/site_cookies/webview_login/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
+│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/browser_login/site_cookies/webview_login/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
 ├─ cli.py                      # 命令行入口
 ├─ bin/                        # 放置 ffmpeg.exe 与可选 deno.exe
 ├─ assets/                     # 图标资源 (moon.svg / moon-512.png / app.ico)
@@ -88,3 +88,10 @@ powershell -ExecutionPolicy Bypass -File build\build.ps1 -Version 1.3.7
 ### v1.4.1
 - 修复登录小窗提示缺少 `PySide6-Addons` 的问题：`requirements.txt` 改用 `PySide6` 元包，保证 Essentials 与 Addons 版本严格一致；加载失败时提示与当前 PySide6 版本匹配的安装命令及具体错误。
 - 删除无法使用的「从现有浏览器提取并托管」功能及浏览器选择框；保留登录小窗与剪贴板导入。
+
+### v1.4.2
+- 修复内置小窗登录 Google 时提示「浏览器环境不安全」：新增**系统浏览器安全登录小窗**，调用本机真实的 Edge / Chrome，以单窗口 `--app` 小窗打开登录页，Google 可正常登录。
+- 小窗使用独立托管目录并带 `--disable-sync`、`--no-first-run`，不会读取或改动日常浏览器的配置，也避免 Edge 同步弹窗与多余标签页；登录凭据经本地调试端口直接读取，无需解密浏览器数据库。
+- 登录期间自动检测登录状态（已登录且页面回到目标站点时提示）；提取时仅在目标站点凭据有效才写入并关闭小窗，否则保留小窗继续登录；若小窗已被手动关闭，则改用后台无头模式从托管目录读取。
+- 登录一次后，下载时的后台无头静默刷新重新可用。
+- 内置 QtWebEngine 小窗保留为可选项（适合 B站/抖音等）。

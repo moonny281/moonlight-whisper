@@ -31,7 +31,7 @@ if %errorlevel% neq 0 (
 
 echo [3/4] 正在调用 build\build.ps1 执行测试与打包...
 set "PATH=%CD%\.venv\Scripts;%PATH%"
-powershell -ExecutionPolicy Bypass -File "build\build.ps1" -Version 1.4.1
+powershell -ExecutionPolicy Bypass -File "build\build.ps1" -Version 1.4.2
 if %errorlevel% neq 0 (
     echo [错误] 打包过程中出现错误。
     pause
