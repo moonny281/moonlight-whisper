@@ -4,7 +4,7 @@
 #>
 
 param(
-    [string]$Version = "1.2.0",
+    [string]$Version = "1.4.0",
     [switch]$SkipTests = $false,
     [switch]$SkipInstaller = $false
 )

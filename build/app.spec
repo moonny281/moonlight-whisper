@@ -9,7 +9,7 @@ block_cipher = None
 project_root = Path(SPECPATH).resolve().parent
 
 # Generate Windows file_version_info.txt in pure Python (UTF-8 without BOM)
-ver_str = os.environ.get("APP_VERSION", "1.3.0").strip() or "1.3.0"
+ver_str = os.environ.get("APP_VERSION", "1.4.0").strip() or "1.4.0"
 ver_parts = (ver_str.split(".") + ["0", "0", "0", "0"])[:4]
 ver_nums = tuple(int(x) if x.isdigit() else 0 for x in ver_parts)
 version_file = project_root / "build" / "file_version_info.txt"
@@ -74,6 +74,11 @@ hiddenimports = [
     "opencc",
     "requests",
     "socks",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebEngineWidgets",
+    "PySide6.QtWebChannel",
+    "PySide6.QtPositioning",
+    "PySide6.QtNetwork",
 ]
 
 for pkg in (
@@ -120,8 +125,6 @@ a = Analysis(
         "pandas",
         "tkinter",
         "pytest",
-        "PySide6.QtWebEngineCore",
-        "PySide6.QtWebEngineWidgets",
         "PySide6.QtWebEngineQuick",
         "PySide6.QtQuick",
         "PySide6.QtQuickWidgets",
@@ -141,11 +144,9 @@ a = Analysis(
         "PySide6.QtSql",
         "PySide6.QtTest",
         "PySide6.QtSensors",
-        "PySide6.QtPositioning",
         "PySide6.QtBluetooth",
         "PySide6.QtNfc",
         "PySide6.QtWebSockets",
-        "PySide6.QtWebChannel",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

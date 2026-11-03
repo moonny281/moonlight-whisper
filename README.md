@@ -6,7 +6,7 @@
 ## 核心特性
 
 - **开箱即用**：CPU 模式下无需任何额外配置即可运行；首次勾选 NVIDIA GPU 加速时支持在线按需下载 CUDA 12（cuBLAS 12 + cuDNN 9）运行库（支持国内清华/阿里云 PyPI 镜像、断点续传、SHA256 校验与离线导入）。
-- **网站账号托管与自动续期（Account Vault）**：在独立隔离的托管浏览器库（`account_vault/browser_profile`）中登录各大视频网站（YouTube、哔哩哔哩、抖音、TikTok、X/Twitter、Instagram、小红书，并支持 `plugins/sites.json` 扩展自定义站点），与日常浏览器完全隔离、零弹窗冲突；下载时按域名自动挂载对应站点凭据并原子回写轮换令牌，当 Cookie 过期或触发登录验证时自动在后台无头静默刷新提取新 Cookie。
+- **网站账号托管（Account Vault）与专用登录小窗**（v1.4.0）：点击「打开专用登录小窗」即在应用内弹出一个独立的小窗口（QtWebEngine）登录各大视频网站（YouTube、哔哩哔哩、抖音、TikTok、X/Twitter、Instagram、小红书，并支持 `plugins/sites.json` 扩展自定义站点）。小窗与日常浏览器的窗口/标签页互不干扰，也**不是浏览器配置目录**，不会触发 Edge/Chrome 账号同步；登录凭据由小窗直接回传（无需解密浏览器 Cookie 数据库），点击「我已登录」后写入 `cookies/<站点>.txt`。下载时按域名自动挂载对应站点凭据并原子回写轮换令牌。小窗不可用或站点拒绝内嵌登录时，可使用备用方式：在现有浏览器登录后提取，或从剪贴板导入 Cookie。
 - **智能容错与回退**：自动遵循 `GPU float16 → GPU int8_float16 → CPU int8` 降级回退链，显存不足或运行库异常时平滑切换。
 - **支持播放列表与批量队列**：支持批量粘贴链接、拖入本地音视频文件（`.mp3`, `.m4a`, `.mp4`, `.mkv`, `.wav` 等），可选开启播放列表/多 P 视频自动展开。
 - **结构化 Markdown 导出**：智能段落合并、防幻觉相邻句去重、繁体转简体（OpenCC）、文件名自动清洗与防重名。
@@ -22,8 +22,8 @@ moonlight-whisper/
 │  ├─ config.py                # config.json 读写、校验与迁移
 │  ├─ logger.py                # 7 天轮转日志 + UI 实时日志转发
 │  ├─ workers.py               # QThread 封装与串行任务队列 TaskQueue
-│  ├─ ui/                      # PySide6 界面层 (主窗口/GPU向导/模型管理/设置/网站账号托管中心)
-│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/site_cookies/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
+│  ├─ ui/                      # PySide6 界面层 (主窗口/GPU向导/模型管理/设置/网站账号托管中心/专用登录小窗 login_window.py)
+│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/site_cookies/webview_login/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
 ├─ cli.py                      # 命令行入口
 ├─ bin/                        # 放置 ffmpeg.exe 与可选 deno.exe
 ├─ assets/                     # 图标资源 (moon.svg / moon-512.png / app.ico)
@@ -76,3 +76,12 @@ powershell -ExecutionPolicy Bypass -File build\build.ps1 -Version 1.3.7
 ## 合规声明
 
 本软件仅供个人学习、课堂笔记整理与研究使用，请严格遵守各视频网站的服务条款与版权法律法规。
+
+## 更新记录
+
+### v1.4.0
+- 账号托管中心新增**专用登录小窗**：登录时弹出独立小窗，不再在现有浏览器里新增标签页（现有页面不受干扰、无需再从浏览器数据库里读取 Cookie）；小窗不使用浏览器配置目录，不会触发 Microsoft Edge 同步导致弹出大量窗口和标签页。
+- 小窗继承设置中的代理；支持 `window.open` 弹窗式登录（如「使用 Google 登录」）；登录状态持久保存在 `account_vault/login_window/`，「清除当前站点凭据」会同时清除小窗中该站点的登录状态。
+- 导出凭据先校验后替换：未完成的登录不会覆盖已有的有效托管凭据。
+- 原「在现有浏览器打开 / 从现有浏览器提取」降级为备用方式，剪贴板导入保留。
+- 依赖新增 `PySide6-Addons`（提供 QtWebEngine）；打包配置不再排除 QtWebEngine，安装包体积会明显增大。

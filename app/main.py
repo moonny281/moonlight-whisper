@@ -64,6 +64,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     from app.ui.main_window import MainWindow
     from app.ui.theme import apply_theme
 
+    # QtWebEngine（专用登录小窗）要求在创建 QApplication 之前设置，否则首次打开小窗会告警/渲染异常
+    try:
+        from PySide6.QtCore import QCoreApplication, Qt
+
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    except Exception:  # noqa: BLE001
+        pass
+
     app = QApplication(argv or sys.argv)
     app.setApplicationName(__app_name__)
     app.setApplicationVersion(__version__)
