@@ -323,9 +323,23 @@ class ManagedBrowser:
                 time.sleep(0.3)
         raise BrowserCookieError("等待托管浏览器调试端口超时")
 
+    def cdp_reachable(self, timeout: float = 1.5) -> bool:
+        """本地调试端口是否仍有响应。"""
+        try:
+            return bool(_local_session().get(f"http://127.0.0.1:{self.port}/json/version", timeout=timeout).ok)
+        except Exception:
+            return False
+
     def alive(self) -> bool:
-        """托管浏览器进程是否仍在运行（用户手动关掉登录小窗后为 False）。"""
-        return self._proc is not None and self._proc.poll() is None
+        """登录小窗是否仍在运行。
+
+        不能只看启动时的子进程是否还在：Edge/Chrome 可能由启动进程转交给另一个进程继续运行（启动进程随即退出），
+        此时窗口其实还开着、调试端口仍可用。因此进程存在或调试端口仍有响应都算存活；
+        只有两者都不成立（用户手动关闭了小窗）才视为已关闭。
+        """
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        return self._proc is not None and self.cdp_reachable()
 
     def page_urls(self) -> List[str]:
         """当前所有页面（标签/小窗）的 URL，用于判断用户是否已回到目标站点。"""
@@ -335,9 +349,11 @@ class ManagedBrowser:
             return []
         return [str(t.get("url") or "") for t in targets if isinstance(t, dict) and t.get("type") == "page"]
 
-    def get_cookies(self) -> List[Dict[str, Any]]:
+    def get_cookies(self, quick: bool = False) -> List[Dict[str, Any]]:
         """同时从 Browser Target (`Storage.getCookies`) 与 Page Target (`Network.getAllCookies` / `Storage.getCookies`)
         收集并合并全部 Cookie，确保 YouTube/Google 等跨站登录凭据 100% 完整导出。
+
+        quick=True（登录期间的状态轮询用）：只读 Browser Target，拿到结果就返回，不逐个连接页面目标，降低对登录页面的干扰。
         """
         sess = _local_session()
         merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -355,6 +371,9 @@ class ManagedBrowser:
                         merged[key] = c
         except Exception as exc:
             last_err = exc
+
+        if quick and merged:
+            return list(merged.values())
 
         # 2. Also query active Page targets (`/json/list` -> `Network.getAllCookies` & `Storage.getCookies`)
         try:
@@ -389,9 +408,10 @@ class ManagedBrowser:
         raise BrowserCookieError("未从托管浏览器调试端口获取到任何 Cookies")
 
     def close(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        if self._proc is not None and (self._proc.poll() is None or self.cdp_reachable()):
             try:
                 # 先尝试通过 CDP 优雅关闭，使新签发的 Cookie 完整落盘至托管 Profile
+                # （启动进程已转交给其他进程时，只要调试端口还在，同样走优雅关闭）
                 sess = _local_session()
                 ver = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=2).json()
                 ws = _ws_connect(ver["webSocketDebuggerUrl"])
@@ -399,7 +419,9 @@ class ManagedBrowser:
                     ws.send(json.dumps({"id": 2, "method": "Browser.close"}))
                 finally:
                     ws.close()
-                self._proc.wait(timeout=8)
+                end = time.time() + 8
+                while time.time() < end and (self._proc.poll() is None or self.cdp_reachable(timeout=0.5)):
+                    time.sleep(0.3)
             except Exception:
                 try:
                     self._proc.terminate()

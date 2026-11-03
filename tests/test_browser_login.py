@@ -23,7 +23,7 @@ class _FakeBrowser:
         self.rows, self.urls, self._alive, self.closed = rows, urls, alive, False
 
     def alive(self): return self._alive and not self.closed
-    def get_cookies(self): return list(self.rows)
+    def get_cookies(self, quick=False): return list(self.rows)
     def page_urls(self): return list(self.urls)
     def close(self): self.closed = True
 
@@ -35,6 +35,12 @@ def _session(site_key: str, paths: AppPaths, fake: _FakeBrowser) -> browser_logi
 
 
 class BrowserLoginTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # 不真实等待：缩短凭据等待时间，并让 sleep 立即返回
+        for p in (patch.object(browser_login, "_AUTH_WAIT_SEC", 0.0), patch.object(browser_login.time, "sleep")):
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_chromium_proxy_arg(self) -> None:
         self.assertEqual(browser_login.chromium_proxy_arg(""), "")
         self.assertEqual(browser_login.chromium_proxy_arg("127.0.0.1:7890"), "http://127.0.0.1:7890")
@@ -152,6 +158,61 @@ class BrowserLoginTests(unittest.TestCase):
                 res2 = _session("bilibili", paths, _FakeBrowser([], [], alive=False)).finish()
             self.assertIsNone(res2.path)
             self.assertTrue(res2.message)
+
+    def test_alive_uses_debug_port_when_launcher_process_exited(self) -> None:
+        mb = browser_cookies.ManagedBrowser(Path("msedge.exe"), Path("prof"), headless=False)
+        proc = MagicMock()
+        proc.poll.return_value = 0                      # 启动进程已退出（浏览器已转交给其他进程继续运行）
+        mb._proc = proc
+        with patch.object(mb, "cdp_reachable", return_value=True):
+            self.assertTrue(mb.alive())
+        with patch.object(mb, "cdp_reachable", return_value=False):
+            self.assertFalse(mb.alive())
+        proc.poll.return_value = None
+        with patch.object(mb, "cdp_reachable", return_value=False):
+            self.assertTrue(mb.alive())
+
+    def test_finish_failure_never_closes_window_and_reports_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            paths = AppPaths(app_dir=Path(td))
+            fake = _FakeBrowser([_row(".bilibili.com", "buvid3", "anon")], [])
+            with patch.object(browser_login, "_AUTH_WAIT_SEC", 0.0), patch.object(browser_login.time, "sleep"):
+                res = _session("bilibili", paths, fake).finish()
+            self.assertIsNone(res.path)
+            self.assertFalse(fake.closed)
+            self.assertIn("共读到 1 条 Cookie", res.message)
+            self.assertIn("bilibili.com", res.message)
+
+    def test_finish_waits_for_login_cookie_to_appear(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            paths = AppPaths(app_dir=Path(td))
+            fake = _FakeBrowser([_row(".bilibili.com", "buvid3", "anon")], [])
+            calls = {"n": 0}
+            orig = fake.get_cookies
+
+            def late(quick=False):
+                calls["n"] += 1
+                if calls["n"] == 3:
+                    fake.rows.append(_row(".bilibili.com", "SESSDATA", "late"))
+                return orig(quick)
+
+            fake.get_cookies = late  # type: ignore[assignment]
+            with patch.object(browser_login, "_AUTH_WAIT_SEC", 60.0):
+                res = _session("bilibili", paths, fake).finish()
+            self.assertEqual(res.path, get_site_cookie_path("bilibili", paths))
+            self.assertTrue(fake.closed)
+
+    def test_finish_rechecks_before_treating_window_as_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            paths = AppPaths(app_dir=Path(td))
+            fake = _FakeBrowser([_row(".bilibili.com", "SESSDATA", "t")], [])
+            states = iter([False, False, True, True, True, True, True])
+            fake.alive = lambda: next(states, True)       # type: ignore[assignment]
+            with patch.object(browser_login.time, "sleep"), \
+                 patch.object(browser_login, "refresh_hosted_site_cookies") as rf:
+                res = _session("bilibili", paths, fake).finish()
+            rf.assert_not_called()                          # 复核后发现窗口仍开着，不得走会清理进程的无头回退
+            self.assertEqual(res.path, get_site_cookie_path("bilibili", paths))
 
     def test_close_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as td:

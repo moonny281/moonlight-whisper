@@ -67,6 +67,7 @@ class CookieLoginDialog(QDialog):
         self._session_site_key = ""
         self._busy: Optional[_Call] = None
         self._poll_busy = False
+        self._gone_polls = 0
         self._closing = False
         self._poll_worker = None
         self._poll_timer = QTimer(self)
@@ -328,11 +329,17 @@ class CookieLoginDialog(QDialog):
                 return
             if err is not None or state is None:
                 return
-            if not state.alive:
+            if state.alive:
+                self._gone_polls = 0
+            else:
+                self._gone_polls += 1
+            if not state.alive and self._gone_polls >= 2:       # 连续两次都探测不到才认定小窗已关闭，避免一次偶发超时误判
                 self._poll_timer.stop()
                 self.lbl_status.setText(
                     "登录小窗已关闭。若已完成登录，仍可点击「步骤 2」从托管目录中读取凭据；否则请重新打开小窗。"
                 )
+            elif not state.alive:
+                return
             elif state.has_auth and state.on_site:
                 self.lbl_status.setText(f"✓ 已检测到 {site.display_label} 的登录凭据。确认小窗已处于登录状态后，点击「步骤 2」。")
             elif state.has_auth:
