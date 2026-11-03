@@ -243,15 +243,15 @@ def _is_token_cancelled(token: Optional[CancelToken]) -> bool:
 
 @contextlib.contextmanager
 def _suppress_chromium_singleton(user_data_dir: Optional[Path]):
-    """Windows context manager that prevents spawned Chromium child processes in rookie-cookies injector.rs
-    from discovering the running browser's ProcessSingleton window or forwarding WM_COPYDATA start commands.
+    """Hardened Windows context manager that prevents spawned Chromium child processes in rookie-cookies injector.rs
+    from discovering running Chrome/Edge ProcessSingleton windows or forwarding WM_COPYDATA start commands.
     This completely eliminates popup windows and opening tabs in the user's active browser!
     """
     if sys.platform != "win32" or user_data_dir is None:
         yield
         return
 
-    mutex_handle = None
+    mutex_handles: List[Any] = []
     renamed_windows: List[Tuple[int, str]] = []
 
     try:
@@ -259,30 +259,62 @@ def _suppress_chromium_singleton(user_data_dir: Optional[Path]):
         kernel32 = getattr(ctypes, "windll", None) and getattr(ctypes.windll, "kernel32", None)
 
         if user32 and kernel32:
-            # 1. Acquire Local\\ChromeProcessSingletonStartup! mutex so child process safely waits at AutoLockMutex
-            # instead of racing to initialize UI or write lockfiles
-            kMutexName = "Local\\ChromeProcessSingletonStartup!"
-            mutex_handle = kernel32.CreateMutexW(None, True, kMutexName)
-            if mutex_handle:
-                kernel32.WaitForSingleObject(mutex_handle, 50)
-
-            # 2. Find any Chrome_WidgetWin_0 window whose title matches user_data_dir and rename it temporarily
-            target_str = str(user_data_dir).rstrip("\\/").lower()
-
+            # Ensure 64-bit ctypes argtypes and restype are defined to avoid argument truncation crashes
             WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+            user32.EnumWindows.argtypes = [WNDENUMPROC, ctypes.wintypes.LPARAM]
+            user32.EnumWindows.restype = ctypes.wintypes.BOOL
+            user32.GetWindowTextLengthW.argtypes = [ctypes.wintypes.HWND]
+            user32.GetWindowTextLengthW.restype = ctypes.c_int
+            user32.GetWindowTextW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int]
+            user32.GetWindowTextW.restype = ctypes.c_int
+            user32.SetWindowTextW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPCWSTR]
+            user32.SetWindowTextW.restype = ctypes.wintypes.BOOL
+            user32.FindWindowExW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HWND, ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR]
+            user32.FindWindowExW.restype = ctypes.wintypes.HWND
 
-            def _enum_proc(hwnd, lparam):
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+            kernel32.ReleaseMutex.argtypes = [ctypes.wintypes.HANDLE]
+            kernel32.ReleaseMutex.restype = ctypes.wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+            kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+
+            # 1. Acquire both Chrome and Edge ProcessSingletonStartup! mutexes
+            for m_name in (
+                "Local\\ChromeProcessSingletonStartup!",
+                "Local\\EdgeProcessSingletonStartup!",
+                "Local\\MicrosoftEdgeProcessSingletonStartup!",
+            ):
+                try:
+                    h = kernel32.CreateMutexW(None, True, m_name)
+                    if h:
+                        kernel32.WaitForSingleObject(h, 50)
+                        mutex_handles.append(h)
+                except Exception:
+                    pass
+
+            # 2. Find any ProcessSingleton message window whose title matches user_data_dir
+            u_str = str(user_data_dir).rstrip("\\/").lower()
+            target_candidates = {u_str, u_str + "\\"}
+
+            def _check_and_hold_window(hwnd: int) -> None:
                 try:
                     length = user32.GetWindowTextLengthW(hwnd)
                     if length > 0:
                         buf = ctypes.create_unicode_buffer(length + 1)
                         user32.GetWindowTextW(hwnd, buf, length + 1)
-                        title = buf.value.rstrip("\\/")
-                        if title.lower() == target_str:
+                        title = buf.value
+                        clean_t = title.rstrip("\\/").lower()
+                        if clean_t in target_candidates or (clean_t + "\\") in target_candidates:
                             user32.SetWindowTextW(hwnd, title + "__mw_hold")
                             renamed_windows.append((hwnd, title))
                 except Exception:
                     pass
+
+            def _enum_proc(hwnd, lparam):
+                _check_and_hold_window(hwnd)
                 return True
 
             cb = WNDENUMPROC(_enum_proc)
@@ -291,22 +323,23 @@ def _suppress_chromium_singleton(user_data_dir: Optional[Path]):
             except Exception:
                 pass
 
-            # Also check message-only windows
+            # Also check message-only windows under HWND_MESSAGE
             try:
                 HWND_MESSAGE = ctypes.c_void_p(-3).value
-                child = None
-                for _ in range(50):
-                    child = user32.FindWindowExW(HWND_MESSAGE, child, "Chrome_WidgetWin_0", None)
-                    if not child:
-                        break
-                    length = user32.GetWindowTextLengthW(child)
-                    if length > 0:
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        user32.GetWindowTextW(child, buf, length + 1)
-                        title = buf.value.rstrip("\\/")
-                        if title.lower() == target_str:
-                            user32.SetWindowTextW(child, title + "__mw_hold")
-                            renamed_windows.append((child, title))
+                for cls_name in (
+                    "Chrome_WidgetWin_0",
+                    "Chrome_WidgetWin_1",
+                    "Edge_WidgetWin_0",
+                    "Edge_WidgetWin_1",
+                    "Chrome_ProcessMessageWindow",
+                    "Edge_ProcessMessageWindow",
+                ):
+                    child = None
+                    for _ in range(30):
+                        child = user32.FindWindowExW(HWND_MESSAGE, child, cls_name, None)
+                        if not child:
+                            break
+                        _check_and_hold_window(child)
             except Exception:
                 pass
     except Exception:
@@ -326,12 +359,12 @@ def _suppress_chromium_singleton(user_data_dir: Optional[Path]):
                             pass
             except Exception:
                 pass
-            if mutex_handle:
+            for h in mutex_handles:
                 try:
                     kernel32 = getattr(ctypes, "windll", None) and getattr(ctypes.windll, "kernel32", None)
                     if kernel32:
-                        kernel32.ReleaseMutex(mutex_handle)
-                        kernel32.CloseHandle(mutex_handle)
+                        kernel32.ReleaseMutex(h)
+                        kernel32.CloseHandle(h)
                 except Exception:
                     pass
 
@@ -593,11 +626,52 @@ def _decrypt_aes_gcm_cookie_value(enc_bytes: bytes, key: bytes) -> Optional[str]
         return None
 
 
+_V20_KEY_CACHE: Dict[str, bytes] = {}
+
+
+def _decrypt_chromium_v20_master_key(local_state_path: Optional[Path], browser_id: str = "edge") -> Optional[bytes]:
+    """In-process decryption of Chromium v20 master key from Local State without spawning any browser process.
+    On Windows:
+    1. Read `Local State` JSON -> `os_crypt.app_bound_encrypted_key` (base64 string).
+    2. Strip 4-byte `APPB` prefix -> `encrypted_key_bytes`.
+    3. Call Windows `CryptUnprotectData` (User DPAPI).
+       In Microsoft Edge, the decrypted payload's trailing 32 bytes is directly the AES-256 master key!
+    """
+    if sys.platform != "win32" or not local_state_path or not local_state_path.is_file():
+        return None
+
+    cache_key = f"{browser_id.lower()}:{local_state_path.resolve()}"
+    if cache_key in _V20_KEY_CACHE:
+        return _V20_KEY_CACHE[cache_key]
+
+    try:
+        ls_text = local_state_path.read_text(encoding="utf-8", errors="replace")
+        ls_json = json.loads(ls_text)
+        app_bound_b64 = (ls_json.get("os_crypt") or {}).get("app_bound_encrypted_key") or ""
+        if not app_bound_b64:
+            return None
+        raw_appb = base64.b64decode(app_bound_b64)
+        if not raw_appb.startswith(b"APPB") or len(raw_appb) <= 4:
+            return None
+        enc_payload = raw_appb[4:]
+
+        unprotected = _dpapi_unprotect(enc_payload)
+        if unprotected and len(unprotected) >= 32:
+            candidate_key = unprotected[-32:]
+            _V20_KEY_CACHE[cache_key] = candidate_key
+            return candidate_key
+    except Exception:
+        pass
+
+    return None
+
+
 def _decrypt_chromium_sqlite_cookies(
     db_path: Path,
     local_state_path: Optional[Path],
     domains: Optional[List[str]],
     v20_key: Optional[bytes] = None,
+    browser_id: str = "edge",
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Read an unlocked Chromium `Cookies` SQLite file and decrypt plaintext + `v10` DPAPI (+ `v20` if `v20_key` provided) cookies.
     Returns `(decrypted_rows, v20_skipped_count)`.
@@ -613,6 +687,8 @@ def _decrypt_chromium_sqlite_cookies(
                     v10_key = _dpapi_unprotect(raw_key[5:])
         except Exception:
             v10_key = None
+        if v20_key is None:
+            v20_key = _decrypt_chromium_v20_master_key(local_state_path, browser_id=browser_id)
 
     rows_out: List[Dict[str, Any]] = []
     v20_count = 0
@@ -795,6 +871,7 @@ def _call_extract_from_path(
     local_state: Optional[Path],
     domains: Optional[List[str]],
     app_bound_policy: str,
+    on_log: Optional[LogCallback] = None,
 ) -> List[Dict[str, Any]]:
     """Call `rookie_cookies.extract_from_path` properly:
     IMPORTANT: `browser_id` and `local_state_path` are mutually exclusive in `rookie-cookies`.
@@ -818,10 +895,12 @@ def _call_extract_from_path(
             res = list(extract_path_fn(str(snap_db), domains=domains, browser_id=b_id) or [])
             if res:
                 return res
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as exc2:
+            if on_log:
+                on_log(f"[rookie-cookies 调试] extract_from_path(browser_id={b_id}) 回退重试异常: {exc2}")
+    except Exception as exc1:
+        if on_log:
+            on_log(f"[rookie-cookies 调试] extract_from_path(browser_id={b_id}, app_bound={app_bound_policy}) 异常: {exc1}")
 
     if local_state is not None and local_state.is_file():
         try:
@@ -929,9 +1008,9 @@ def extract_to_netscape_file(
             if sys.platform == "win32" and b_id in _CHROMIUM_BROWSERS:
                 snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
                 if snap_db is not None and snap_db.is_file():
-                    rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                    rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains, browser_id=b_id)
                     if not rows_have_site_auth(rows, target_url) and eff_pol != "disabled":
-                        cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol)
+                        cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol, on_log=on_log)
                         if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
                             rows = cand_rows
                 else:
@@ -1007,9 +1086,9 @@ def extract_to_netscape_file(
                     if is_locked_err and b_id in _CHROMIUM_BROWSERS:
                         snap_db, local_state = _copy_locked_chromium_cookies_db(b_id, prof, base_temp, on_log=on_log)
                         if snap_db is not None and snap_db.is_file():
-                            rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains)
+                            rows, v20_skipped = _decrypt_chromium_sqlite_cookies(snap_db, local_state, domains, browser_id=b_id)
                             if not rows_have_site_auth(rows, target_url) and eff_pol != "disabled":
-                                cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol)
+                                cand_rows = _call_extract_from_path(rc, snap_db, b_id, local_state, domains, eff_pol, on_log=on_log)
                                 if rows_have_site_auth(cand_rows, target_url) or len(cand_rows) > len(rows):
                                     rows = cand_rows
                         else:
@@ -1020,10 +1099,10 @@ def extract_to_netscape_file(
         if not rows:
             if on_log:
                 dom_desc = f"（目标域: {', '.join(domains)}）" if domains else ""
-                if (policy == "disabled" and b_id in _APP_BOUND_CHROMIUM_BROWSERS) or v20_skipped > 0:
+                if v20_skipped > 0:
                     on_log(
-                        f"[Cookies 提示] {b_id} 中的 Cookie 采用 App-Bound (v20) 加密；当前策略为 {policy}，"
-                        "未启用进程注入/提权解密。建议使用设置中的「登录并获取 Cookies…」导出一次（永久免弹窗复用）或改用 Firefox。"
+                        f"[Cookies 提示] {b_id} 中检测到 {v20_skipped} 条 App-Bound (v20) 加密登录凭据未能解密（策略: {policy}）。"
+                        "建议打开「偏好设置 -> 网络与认证」点击「登录并获取 Cookies…」一键导出（永久免弹窗复用）或改用 Firefox。"
                     )
                 else:
                     on_log(

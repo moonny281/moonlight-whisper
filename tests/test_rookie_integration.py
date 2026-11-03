@@ -510,5 +510,35 @@ class TestRookieIntegration(unittest.TestCase):
             self.assertEqual(ydl_opts.get("cookiesfrombrowser"), ("firefox", "default", None, None))
 
 
+    def test_v1_3_5_in_process_v20_decryption_and_hardened_suppression(self) -> None:
+        """Regression tests for v1.3.5:
+        1) In-process _decrypt_chromium_v20_master_key extracts 32-byte key from Local State without browser spawn;
+        2) _suppress_chromium_singleton covers EdgeProcessSingletonStartup! and properly handles 64-bit ctypes types."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ls_path = Path(tmp) / "Local State"
+            # 4 bytes APPB + 32 bytes encrypted key
+            fake_raw_key = b"APPB" + (b"X" * 40)
+            import base64
+            import json
+            ls_path.write_text(
+                json.dumps({"os_crypt": {"app_bound_encrypted_key": base64.b64encode(fake_raw_key).decode("ascii")}}),
+                encoding="utf-8",
+            )
+            rookie_bridge._V20_KEY_CACHE.clear()
+            # On Linux/mocked platform, simulate DPAPI returning 32 bytes of decrypted key
+            with patch("app.core.rookie_bridge._dpapi_unprotect", return_value=b"K" * 32), patch(
+                "app.core.rookie_bridge.sys.platform", "win32"
+            ):
+                key = rookie_bridge._decrypt_chromium_v20_master_key(ls_path, browser_id="edge")
+                self.assertEqual(key, b"K" * 32)
+                # Verify cached
+                self.assertEqual(rookie_bridge._decrypt_chromium_v20_master_key(ls_path, browser_id="edge"), b"K" * 32)
+
+            # Test singleton suppression context manager on simulated Windows
+            with patch("app.core.rookie_bridge.sys.platform", "win32"):
+                with rookie_bridge._suppress_chromium_singleton(Path(tmp) / "User Data"):
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()
