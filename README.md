@@ -1,11 +1,12 @@
 # Moonlight Whisper
 
-> 基于 `yt-dlp` + `faster-whisper (CTranslate2)` 的 Windows 桌面端视频/音频转录工具。
-> 粘贴视频链接或拖入本地音视频文件 → 自动下载最佳音轨 → 转码 16kHz WAV → Whisper 语音转录 → 输出带时间戳的 Markdown 文档与可选 SRT 字幕。
+> 基于 `yt-dlp` + `网站账号托管与自动续期引擎` + `faster-whisper (CTranslate2)` 的 Windows 桌面端视频/音频转录工具。
+> 粘贴视频链接或拖入本地音视频文件 → 自动挂载托管站点 Cookie 并下载最佳音轨 → 转码 16kHz WAV → Whisper 语音转录 → 输出带时间戳的 Markdown 文档与可选 SRT 字幕。
 
 ## 核心特性
 
 - **开箱即用**：CPU 模式下无需任何额外配置即可运行；首次勾选 NVIDIA GPU 加速时支持在线按需下载 CUDA 12（cuBLAS 12 + cuDNN 9）运行库（支持国内清华/阿里云 PyPI 镜像、断点续传、SHA256 校验与离线导入）。
+- **网站账号托管与自动续期（Account Vault）**：在独立隔离的托管浏览器库（`account_vault/browser_profile`）中登录各大视频网站（YouTube、哔哩哔哩、抖音、TikTok、X/Twitter、Instagram、小红书，并支持 `plugins/sites.json` 扩展自定义站点），与日常浏览器完全隔离、零弹窗冲突；下载时按域名自动挂载对应站点凭据并原子回写轮换令牌，当 Cookie 过期或触发登录验证时自动在后台无头静默刷新提取新 Cookie。
 - **智能容错与回退**：自动遵循 `GPU float16 → GPU int8_float16 → CPU int8` 降级回退链，显存不足或运行库异常时平滑切换。
 - **支持播放列表与批量队列**：支持批量粘贴链接、拖入本地音视频文件（`.mp3`, `.m4a`, `.mp4`, `.mkv`, `.wav` 等），可选开启播放列表/多 P 视频自动展开。
 - **结构化 Markdown 导出**：智能段落合并、防幻觉相邻句去重、繁体转简体（OpenCC）、文件名自动清洗与防重名。
@@ -21,8 +22,8 @@ moonlight-whisper/
 │  ├─ config.py                # config.json 读写、校验与迁移
 │  ├─ logger.py                # 7 天轮转日志 + UI 实时日志转发
 │  ├─ workers.py               # QThread 封装与串行任务队列 TaskQueue
-│  ├─ ui/                      # PySide6 界面层 (主窗口/GPU向导/模型管理/设置)
-│  └─ core/                    # 零 Qt 依赖核心层 (downloader/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
+│  ├─ ui/                      # PySide6 界面层 (主窗口/GPU向导/模型管理/设置/网站账号托管中心)
+│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/site_cookies/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
 ├─ cli.py                      # 命令行入口
 ├─ bin/                        # 放置 ffmpeg.exe 与可选 deno.exe
 ├─ assets/                     # 图标资源 (moon.svg / moon-512.png / app.ico)
@@ -44,6 +45,12 @@ moonlight-whisper/
    # 转录单个视频链接或本地文件（CPU 模式）
    python cli.py "https://www.bilibili.com/video/BV1xx411c7mD" --cpu --srt
 
+   # 查看已托管网站账号与凭据状态
+   python cli.py --hosted-sites
+
+   # 后台无头静默刷新指定托管站点的 Cookie
+   python cli.py --refresh-cookies youtube
+
    # 检测当前 GPU 与 CUDA 运行库状态
    python cli.py --detect-gpu
    ```
@@ -63,7 +70,7 @@ pytest -v
 ## 打包与制作安装包 (Windows)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build\build.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File build\build.ps1 -Version 1.3.7
 ```
 
 ## 合规声明

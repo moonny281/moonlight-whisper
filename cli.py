@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command-line interface for Moonlight Whisper (Milestone M1 & batch scripting)."""
+"""Command-line interface for Moonlight Whisper (with YouTube Account Vault & Bilibili/TikTok rookie-cookies browser reading)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from typing import List
 
 from app.config import Config
-from app.core import downloader, gpu_runtime, pipeline, rookie_bridge
+from app.core import browser_cookies, downloader, gpu_runtime, pipeline, rookie_bridge
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions
 from app.core.errors import CancelledError, ErrorInfo
@@ -21,7 +21,7 @@ from app.paths import PATHS
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="moonlight-whisper-cli",
-        description="Moonlight Whisper 命令行视频/音频转录工具 (yt-dlp + rookie-cookies + faster-whisper)",
+        description="Moonlight Whisper 命令行视频/音频转录工具 (yt-dlp + YouTube账号托管 + B站/TikTok浏览器直读 + faster-whisper)",
     )
     parser.add_argument(
         "inputs",
@@ -38,19 +38,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playlist", action="store_true", help="允许展开播放列表 / 多 P 视频")
     parser.add_argument("--no-vad", action="store_true", help="关闭 VAD 静音过滤")
     parser.add_argument("--proxy", help="HTTP/SOCKS5 代理地址")
-    parser.add_argument("--cookies", help="Cookies 文件（Netscape / JSON / 原始 Cookie 头）")
+    parser.add_argument("--cookies", help="可选：显式指定 Cookies 文件（Netscape / JSON / 原始 Cookie 头）")
     parser.add_argument(
         "--cookies-from-browser",
-        help="通过内置 rookie-cookies 从浏览器提取 Cookies（支持 chrome/edge/firefox/brave/arc/vivaldi/opera/qq/360 等）",
+        help="B站/TikTok 等站点优先通过内置 rookie-cookies 从浏览器提取 Cookies（支持 chrome/edge/firefox/brave 等）",
     )
     parser.add_argument("--cookies-browser-profile", help="浏览器配置文件名（如 Default / Profile 1 / default-release）")
     parser.add_argument(
         "--app-bound",
         choices=["disabled", "smart", "injection_only", "allow_elevated_fallback"],
-        help="Windows Chromium v20 App-Bound 解密策略（默认 disabled）",
+        help="Windows Chromium v20 App-Bound 解密策略",
     )
     parser.add_argument("--list-profiles", metavar="BROWSER", help="列出指定浏览器在本机已发现的 Profile 列表后退出")
-    parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs / rookie-cookies 诊断信息后退出")
+    parser.add_argument("--no-auto-refresh-cookies", action="store_true", help="禁用托管站点 Cookie 过期后台无头静默刷新")
+    parser.add_argument("--hosted-sites", action="store_true", help="列出本机所有已托管站点的登录凭据状态后退出")
+    parser.add_argument("--refresh-cookies", metavar="SITE_OR_URL", help="后台无头静默刷新指定托管站点（如 youtube）的 Cookie 后退出")
+    parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs / rookie-cookies / 账号托管环境诊断信息后退出")
     parser.add_argument("--detect-gpu", action="store_true", help="仅检测当前机器的 NVIDIA GPU 与 CUDA 运行库状态")
     parser.add_argument("--install-gpu-runtime", action="store_true", help="在线下载并安装 CUDA 12 运行库")
     return parser
@@ -92,6 +95,8 @@ def main(argv: List[str] | None = None) -> int:
         cfg.cookies_browser_profile = args.cookies_browser_profile
     if args.app_bound:
         cfg.cookies_app_bound = args.app_bound
+    if args.no_auto_refresh_cookies:
+        cfg.auto_refresh_cookies = False
 
     cfg.apply_to_paths(PATHS)
     PATHS.ensure_runtime_dirs()
@@ -105,6 +110,22 @@ def main(argv: List[str] | None = None) -> int:
             default_tag = " [默认]" if p.is_default else ""
             print(f"{p.profile_id}\t({p.display_name}){default_tag}")
         return 0
+
+    if args.hosted_sites:
+        for site, c_path, rep in browser_cookies.list_hosted_sites_status(PATHS):
+            status = "✓ 已托管有效" if rep.ok else ("⚠ 已过期" if c_path.is_file() else "未托管")
+            print(f"{site.key:12s} | {site.display_label:32s} | {status} | {rep.summary()}")
+        return 0
+
+    if args.refresh_cookies:
+        eff_proxy = downloader.resolve_effective_proxy(cfg.proxy, target_url=args.refresh_cookies)
+        out = browser_cookies.refresh_hosted_site_cookies(
+            args.refresh_cookies,
+            paths=PATHS,
+            proxy=eff_proxy,
+            on_log=print,
+        )
+        return 0 if out is not None else 1
 
     if args.diagnose:
         diag = downloader.diagnose_youtube_runtime(PATHS)
@@ -155,6 +176,7 @@ def main(argv: List[str] | None = None) -> int:
         cookies_from_browser=cfg.cookies_from_browser,
         cookies_browser_profile=cfg.cookies_browser_profile,
         cookies_app_bound=cfg.cookies_app_bound,
+        auto_refresh_cookies=cfg.auto_refresh_cookies,
         allow_playlist=cfg.allow_playlist,
         ffmpeg_dir=PATHS.bin_dir,
     )

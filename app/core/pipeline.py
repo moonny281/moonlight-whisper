@@ -129,13 +129,10 @@ def run(
                 cookies_from_browser=cfg.cookies_from_browser,
                 cookies_browser_profile=cfg.cookies_browser_profile,
                 cookies_app_bound=cfg.cookies_app_bound,
+                auto_refresh_cookies=cfg.auto_refresh_cookies,
                 allow_playlist=False,
                 ffmpeg_dir=paths.bin_dir,
             )
-            if cfg.managed_cookie_site and not dl_opts.cookies_file:
-                saved_managed = paths.data_root / "cookies" / f"{cfg.managed_cookie_site}.txt"
-                if saved_managed.exists():
-                    dl_opts.cookies_file = str(saved_managed)
 
             _emit_stage("获取视频信息")
             _emit_log(f"正在解析链接元数据：{job.source}")

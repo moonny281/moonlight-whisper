@@ -60,8 +60,9 @@ class Config:
     cookies_file: str = ""
     cookies_from_browser: str = ""
     cookies_browser_profile: str = ""
-    cookies_app_bound: str = "injection_only"  # Default "disabled" prevents spawning a new Edge/Chrome window during downloads
+    cookies_app_bound: str = "injection_only"
     managed_cookie_site: str = ""
+    auto_refresh_cookies: bool = True
     hf_mirror: bool = True
     pypi_mirror: str = "tuna"      # "tuna" | "aliyun" | "official"
     filename_template: str = "{title}"
@@ -151,6 +152,7 @@ class Config:
             cookies_browser_profile=_str("cookies_browser_profile", defaults.cookies_browser_profile).strip(),
             cookies_app_bound=cookies_app_bound,
             managed_cookie_site=_str("managed_cookie_site", defaults.managed_cookie_site).strip(),
+            auto_refresh_cookies=bool(data.get("auto_refresh_cookies", defaults.auto_refresh_cookies)),
             hf_mirror=bool(data.get("hf_mirror", defaults.hf_mirror)),
             pypi_mirror=pypi_mirror,
             filename_template=filename_template,
@@ -175,8 +177,6 @@ class Config:
             if "export_srt" in migrated and "write_srt" not in migrated:
                 migrated["write_srt"] = bool(migrated.pop("export_srt"))
             migrated["version"] = 1
-
-        # v1.3.4: injection_only is now fully singleton-suppressed (0 popups/tabs), default preserved
 
         return migrated
 

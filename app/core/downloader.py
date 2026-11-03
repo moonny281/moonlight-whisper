@@ -1,4 +1,8 @@
-"""yt-dlp wrapper with built-in rookie-cookies extraction, on-demand Deno/Node JS runtime, YouTube & TikTok direct fallbacks, Cookie domain binding & static inspection, domestic proxy bypass, and isolated Cookie cleanup."""
+"""yt-dlp wrapper with hybrid Cookie strategy:
+- YouTube: Dedicated Account Vault (`data_root/cookies/youtube.txt` + headless CDP auto-refresh via `account_vault/browser_profile`);
+- Bilibili / TikTok & other sites: Priority daily-browser Cookie reading (`rookie-cookies`) with automatic fallback to Account Vault;
+- On-demand Deno/Node JS runtime, YouTube & TikTok fallbacks, Cookie domain binding & static inspection, domestic proxy bypass, and isolated Cookie cleanup.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from app.core import http_client, rookie_bridge
+from app.core import browser_cookies, http_client, rookie_bridge
 from app.core.cancel import CancelToken
 from app.core.errors import CancelledError, DownloadError
 from app.core.site_cookies import cookie_domains_for, inspect_netscape, resolve_site
@@ -32,10 +36,6 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 
 _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-_YOUTUBE_URL_ID_RE = re.compile(
-    r"(?:v=|/(?:embed|shorts|live|v)/|youtu\.be/)([A-Za-z0-9_-]{11})",
-    re.IGNORECASE,
-)
 _TIKTOK_VIDEO_ID_RE = re.compile(r"(?:\[TikTok\]\s*|/(?:video|photo|v|embed/v2)/)(\d{15,22})", re.IGNORECASE)
 _SPACE_NETSCAPE_RE = re.compile(
     r"^(\S+)\s+(TRUE|FALSE)\s+(/\S*)\s+(TRUE|FALSE)\s+(\d+)\s+(\S+)(?:\s+(.*))?$",
@@ -143,8 +143,9 @@ class DownloadOptions:
     proxy: str = ""
     cookies_file: str = ""
     cookies_from_browser: str = ""
-    cookies_browser_profile: str = ""   # 例如 "Default" / "Profile 1" / Firefox 配置目录名
-    cookies_app_bound: str = "injection_only"  # "disabled" (default: no browser spawn) | "injection_only" | "allow_elevated_fallback"
+    cookies_browser_profile: str = ""
+    cookies_app_bound: str = "injection_only"
+    auto_refresh_cookies: bool = True
     allow_playlist: bool = False
     ffmpeg_dir: Optional[Path] = None
     deno_path: Optional[Path] = None
@@ -256,13 +257,8 @@ def _read_text_multi_encoding(path: Path) -> str:
     return raw_bytes.decode("utf-8", errors="replace")
 
 
-def _infer_cookie_domains(target_url: str) -> List[str]:
-    """Return strictly bound cookie domains for `target_url` via `site_cookies.cookie_domains_for`."""
-    return cookie_domains_for(target_url)
-
-
 def purge_stale_cookie_files(temp_dir: Path, max_age_sec: int = 3600) -> int:
-    """删除超过 max_age_sec 的临时 Cookie 副本及残留的一次性 login_profile_* 目录。"""
+    """删除超过 max_age_sec 的临时 Cookie 副本及旧版遗留的 login_profile_* 目录。"""
     removed = 0
     now = time.time()
     if temp_dir.is_dir():
@@ -366,7 +362,7 @@ def normalize_cookie_text(
     rows: List[str] = []
     domains_seen: List[str] = []
 
-    # Case 1: JSON Cookie export from Cookie-Editor / EditThisCookie
+    # Case 1: JSON Cookie export
     if text.startswith("[") or text.startswith("{"):
         try:
             parsed = json.loads(text)
@@ -445,7 +441,7 @@ def normalize_cookie_text(
                 rows.append(_format_netscape_row(prefix, dom, path_s, sec_s, exp_val, name_s, val_s))
                 domains_seen.append(dom.lower())
 
-    # Case 4: Raw HTTP `Cookie:` header string copied from browser F12 DevTools (`k1=v1; k2=v2`)
+    # Case 4: Raw HTTP `Cookie:` header string (`k1=v1; k2=v2`)
     if not rows:
         header_body = text
         if header_body.lower().startswith("cookie:"):
@@ -480,8 +476,10 @@ def normalize_cookie_text(
         ("YouTube/Google", ("youtube.com", "google.com")),
         ("TikTok", ("tiktok.com",)),
         ("Bilibili", ("bilibili.com",)),
+        ("Douyin", ("douyin.com",)),
         ("Instagram", ("instagram.com",)),
         ("X/Twitter", ("x.com", "twitter.com")),
+        ("Xiaohongshu", ("xiaohongshu.com",)),
     ]
     matched_sites: List[str] = []
     for label, dom_keys in site_map:
@@ -502,7 +500,7 @@ def import_cookies_from_text(
     if count <= 0 or not netscape_text:
         raise DownloadError(
             "未能从剪贴板识别到有效的 Cookie 内容（若粘贴的是原始 Cookie 请求头，需同时指定目标站点链接）。\n"
-            "推荐直接启用「从浏览器读取 (rookie-cookies)」或使用「登录并获取 Cookies…」。"
+            "推荐直接启用「从浏览器读取」或打开「网站账号托管中心」登录。"
         )
     paths.ensure_runtime_dirs()
     dest = paths.data_root / "cookies.txt"
@@ -552,7 +550,7 @@ def prepare_cookie_file(
     if count <= 0 or not netscape_text:
         if on_log:
             on_log(
-                f"[Cookies 警告] 文件 {cookie_path.name} 未包含可识别的 Cookie，建议使用「偏好设置 -> 从浏览器读取 (rookie-cookies)」或重新导出。"
+                f"[Cookies 警告] 文件 {cookie_path.name} 未包含可识别的 Cookie，请检查或重新获取。"
             )
         return None
 
@@ -640,7 +638,6 @@ def _apply_js_runtime_opts(
     resolved_node = _usable(raw_node, "node", on_log=log_cb)
     resolved_bun = _usable(raw_bun, "bun", on_log=log_cb)
 
-    # If downloading YouTube and neither deno>=2.3 nor node>=22 nor bun>=1.2.11 is available, try auto-installing deno.exe on Windows
     if (
         resolved_deno is None
         and resolved_node is None
@@ -673,27 +670,65 @@ def _apply_js_runtime_opts(
             on_log("[YouTube] 未找到 yt-dlp-ejs，已允许从 GitHub 获取挑战解析脚本（兜底）")
 
 
-def _find_cached_cookie_fallback(paths: AppPaths, target_url: str, browser_id: str = "") -> Optional[Path]:
-    """Check if the user has a previously exported/imported/cached cookie file in `data_root/cookies/` or `data_root/cookies.txt`."""
-    candidates: List[Path] = []
-    cookies_dir = paths.data_root / "cookies"
-    site = resolve_site(target_url)
+def _resolve_hosted_cookie_for_site(
+    target_url: str,
+    opts: DownloadOptions,
+    paths: AppPaths = PATHS,
+    on_log: Optional[LogCallback] = None,
+    browser_id: str = "",
+) -> Optional[Path]:
+    """查找目标站点的本地托管 Cookie 文件 (`data_root/cookies/<site>.txt`)；若已过期且开启自动续期，则后台无头静默刷新。"""
+    custom_sites_file = browser_cookies.get_custom_sites_file(paths)
+    site = resolve_site(target_url, custom_sites_file=custom_sites_file)
+    eff_proxy = resolve_effective_proxy(opts.proxy, target_url=target_url)
+
     if site is not None:
-        if browser_id:
-            candidates.append(cookies_dir / f"rookie_cache_{browser_id.lower()}_{site.key}.txt")
-        candidates.append(cookies_dir / f"{site.key}.txt")
-        if cookies_dir.is_dir():
-            for p in sorted(cookies_dir.glob(f"rookie_cache_*_{site.key}.txt")):
-                if p not in candidates:
-                    candidates.append(p)
-    candidates.append(paths.data_root / "cookies.txt")
-    for c in candidates:
-        if c.is_file() and c.stat().st_size > 0:
-            if not target_url or inspect_netscape(c, target_url).ok:
-                return c
-    for c in candidates:
-        if c.is_file() and c.stat().st_size > 0:
-            return c
+        hosted_path = browser_cookies.get_site_cookie_path(site.key, paths)
+        if hosted_path.is_file() and hosted_path.stat().st_size > 0:
+            rep = inspect_netscape(hosted_path, target_url, custom_sites_file=custom_sites_file)
+            if rep.ok:
+                return hosted_path
+            if opts.auto_refresh_cookies and browser_cookies.has_vault_profile(paths):
+                if on_log:
+                    on_log(f"[账号托管] 检测到 {site.display_label} 的本地托管 Cookie 已过期，正在后台静默刷新...")
+                refreshed = browser_cookies.refresh_hosted_site_cookies(
+                    site,
+                    paths=paths,
+                    proxy=eff_proxy,
+                    on_log=on_log,
+                )
+                if refreshed and refreshed.is_file():
+                    return refreshed
+            return hosted_path
+
+        if opts.auto_refresh_cookies and browser_cookies.has_vault_profile(paths):
+            refreshed = browser_cookies.refresh_hosted_site_cookies(
+                site,
+                paths=paths,
+                proxy=eff_proxy,
+                on_log=on_log,
+            )
+            if refreshed and refreshed.is_file():
+                return refreshed
+
+        # Check rookie cache fallback for non-YouTube sites if present
+        if site.key != "youtube":
+            cookies_dir = paths.data_root / "cookies"
+            candidates: List[Path] = []
+            if browser_id:
+                candidates.append(cookies_dir / f"rookie_cache_{browser_id.lower()}_{site.key}.txt")
+            if cookies_dir.is_dir():
+                for p in sorted(cookies_dir.glob(f"rookie_cache_*_{site.key}.txt")):
+                    if p not in candidates:
+                        candidates.append(p)
+            for c in candidates:
+                if c.is_file() and c.stat().st_size > 0 and inspect_netscape(c, target_url, custom_sites_file=custom_sites_file).ok:
+                    return c
+
+    fallback_cookie = paths.data_root / "cookies.txt"
+    if fallback_cookie.is_file() and fallback_cookie.stat().st_size > 0:
+        if not target_url or inspect_netscape(fallback_cookie, target_url, custom_sites_file=custom_sites_file).ok:
+            return fallback_cookie
     return None
 
 
@@ -704,6 +739,10 @@ def _build_common_ydl_opts(
     target_url: str = "",
     token: Optional[CancelToken] = None,
 ) -> Dict[str, Any]:
+    """智能分流 Cookie 策略：
+    - YouTube (`_is_youtube_url(target_url)`): 专属使用「网站账号托管中心」(`data_root/cookies/youtube.txt` + 过期无头静默刷新)，不读取日常浏览器；
+    - TikTok / Bilibili 等其他站点: 优先从日常浏览器读取最新 Cookie (`rookie-cookies`)，未配置或读取受限时自动回退使用托管账号凭据。
+    """
     ydl_opts: Dict[str, Any] = {
         "noplaylist": not opts.allow_playlist,
         "quiet": True,
@@ -735,109 +774,170 @@ def _build_common_ydl_opts(
         on_log=on_log,
     )
 
+    custom_sites_file = browser_cookies.get_custom_sites_file(paths)
     loaded_cookiefile = False
+    is_yt = _is_youtube_url(target_url)
+
+    # 1. Explicit user-specified cookies_file (only if it matches target_url domain or is a raw header file)
     if opts.cookies_file.strip():
         cookie_path = Path(opts.cookies_file.strip()).expanduser()
-        prepared = prepare_cookie_file(cookie_path, paths.temp_dir, on_log=on_log, target_url=target_url)
+        prepared = prepare_cookie_file(cookie_path, paths.temp_dir, on_log=None, target_url=target_url)
         if prepared is not None and prepared.exists():
-            ydl_opts["cookiefile"] = str(prepared)
-            ydl_opts["_cookie_source_path"] = str(cookie_path)
-            loaded_cookiefile = True
-            if target_url and on_log:
-                report = inspect_netscape(prepared, target_url)
-                on_log(f"[Cookies 体检] {report.summary()}")
-        elif on_log:
-            on_log("[Cookies 警告] Cookies 文件未能加载，本次将以未登录状态请求。")
+            rep = inspect_netscape(prepared, target_url, custom_sites_file=custom_sites_file) if target_url else None
+            if rep is None or rep.matched > 0:
+                # If explicit file is the hosted youtube.txt and expired, auto-refresh it first
+                if rep is not None and not rep.ok and opts.auto_refresh_cookies and browser_cookies.has_vault_profile(paths):
+                    refreshed = browser_cookies.refresh_hosted_site_cookies(
+                        target_url,
+                        paths=paths,
+                        proxy=eff_proxy,
+                        on_log=on_log,
+                    )
+                    if refreshed and refreshed.is_file():
+                        cookie_path = refreshed
+                        prepared = prepare_cookie_file(cookie_path, paths.temp_dir, on_log=None, target_url=target_url) or prepared
+                        rep = inspect_netscape(prepared, target_url, custom_sites_file=custom_sites_file)
+                ydl_opts["cookiefile"] = str(prepared)
+                ydl_opts["_cookie_source_path"] = str(cookie_path)
+                loaded_cookiefile = True
+                if on_log:
+                    on_log(f"[Cookies] 已加载 Cookies 文件：{cookie_path.name}")
+                    if rep is not None:
+                        on_log(f"[Cookies 体检] {rep.summary()}")
+            else:
+                try:
+                    prepared.unlink()
+                except OSError:
+                    pass
 
-    if opts.cookies_from_browser.strip() and not loaded_cookiefile:
+    # 2. Branch A: YouTube -> Use Account Vault (`data_root/cookies/youtube.txt` + silent headless auto-refresh);
+    #    never read from daily Chromium browsers (Edge/Chrome) to avoid v20 issues
+    if is_yt and not loaded_cookiefile:
+        yt_hosted = _resolve_hosted_cookie_for_site(target_url, opts, paths=paths, on_log=on_log)
+        if yt_hosted is not None and yt_hosted.is_file():
+            prepared_yt = prepare_cookie_file(yt_hosted, paths.temp_dir, on_log=on_log, target_url=target_url)
+            if prepared_yt is not None and prepared_yt.exists():
+                ydl_opts["cookiefile"] = str(prepared_yt)
+                ydl_opts["_cookie_source_path"] = str(yt_hosted)
+                opts.cookies_file = str(yt_hosted)
+                loaded_cookiefile = True
+                if on_log:
+                    rep_yt = inspect_netscape(prepared_yt, target_url, custom_sites_file=custom_sites_file)
+                    on_log(f"[账号托管] YouTube 已挂载托管账号凭据 | {rep_yt.summary()}")
+        elif opts.cookies_from_browser.strip().lower() in ("firefox", "librewolf", "zen", "cachy"):
+            b_gecko = opts.cookies_from_browser.strip().lower()
+            prof_gecko = opts.cookies_browser_profile.strip() or None
+            ydl_opts["cookiesfrombrowser"] = (b_gecko, prof_gecko, None, None)
+
+    # 3. Branch B: Bilibili / TikTok & other non-YouTube sites -> Prioritize reading from daily browser (`cookies_from_browser`),
+    #    then fall back to Account Vault (`data_root/cookies/<site>.txt`)
+    if not is_yt and not loaded_cookiefile:
         browser_name = opts.cookies_from_browser.strip().lower()
         profile = opts.cookies_browser_profile.strip() or None
-        if rookie_bridge.is_available():
-            try:
-                purge_stale_cookie_files(paths.temp_dir)
-                _register_cookie_dir_cleanup(paths.temp_dir / "cookies")
-                rookie_cookie_file = rookie_bridge.extract_to_netscape_file(
-                    browser=browser_name,
-                    profile=opts.cookies_browser_profile.strip(),
-                    target_url=target_url,
-                    temp_dir=paths.temp_dir,
-                    app_bound=opts.cookies_app_bound,
-                    token=token,
-                    on_log=on_log,
-                )
-                if rookie_cookie_file is not None and rookie_cookie_file.exists():
-                    ydl_opts["cookiefile"] = str(rookie_cookie_file)
-                    opts.cookies_file = str(rookie_cookie_file)
-                    site_obj = resolve_site(target_url)
-                    if site_obj is not None:
-                        pers_c = paths.data_root / "cookies" / f"{site_obj.key}.txt"
-                        if pers_c.is_file():
-                            ydl_opts["_cookie_source_path"] = str(pers_c)
-                    loaded_cookiefile = True
-                else:
+        if browser_name:
+            if rookie_bridge.is_available():
+                try:
+                    purge_stale_cookie_files(paths.temp_dir)
+                    _register_cookie_dir_cleanup(paths.temp_dir / "cookies")
+                    rookie_cookie_file = rookie_bridge.extract_to_netscape_file(
+                        browser=browser_name,
+                        profile=opts.cookies_browser_profile.strip(),
+                        target_url=target_url,
+                        temp_dir=paths.temp_dir,
+                        app_bound=opts.cookies_app_bound,
+                        token=token,
+                        on_log=on_log,
+                    )
+                    if rookie_cookie_file is not None and rookie_cookie_file.exists():
+                        ydl_opts["cookiefile"] = str(rookie_cookie_file)
+                        opts.cookies_file = str(rookie_cookie_file)
+                        site_obj = resolve_site(target_url, custom_sites_file=custom_sites_file)
+                        if site_obj is not None:
+                            pers_c = browser_cookies.get_site_cookie_path(site_obj.key, paths)
+                            if pers_c.is_file():
+                                ydl_opts["_cookie_source_path"] = str(pers_c)
+                        loaded_cookiefile = True
+                    else:
+                        ydl_opts["_rookie_cookie_dropped"] = True
+                except CancelledError:
+                    raise
+                except DownloadError as r_exc:
                     ydl_opts["_rookie_cookie_dropped"] = True
-            except CancelledError:
-                raise
-            except DownloadError as r_exc:
-                ydl_opts["_rookie_cookie_dropped"] = True
-                ydl_opts["_rookie_error_msg"] = r_exc.user_message
-            except Exception as unexpected_exc:
-                msg = rookie_bridge.translate_rookie_error(unexpected_exc, browser_id=browser_name)
-                if on_log:
-                    on_log(f"[Cookies 警告] {msg}")
-                ydl_opts["_rookie_cookie_dropped"] = True
-                ydl_opts["_rookie_error_msg"] = msg
+                    ydl_opts["_rookie_error_msg"] = r_exc.user_message
+                except Exception as unexpected_exc:
+                    msg = rookie_bridge.translate_rookie_error(unexpected_exc, browser_id=browser_name)
+                    if on_log:
+                        on_log(f"[Cookies 警告] {msg}")
+                    ydl_opts["_rookie_cookie_dropped"] = True
+                    ydl_opts["_rookie_error_msg"] = msg
 
-            # If browser live extraction failed (e.g. browser running & locking DB or v20), check if a cached cookies.txt exists
-            if not loaded_cookiefile:
-                cached_fb = _find_cached_cookie_fallback(paths, target_url, browser_id=browser_name)
-                if cached_fb is not None:
-                    prepared_fb = prepare_cookie_file(cached_fb, paths.temp_dir, on_log=None, target_url=target_url)
-                    if prepared_fb is not None and prepared_fb.exists():
-                        ydl_opts["cookiefile"] = str(prepared_fb)
-                        ydl_opts["_cookie_source_path"] = str(cached_fb)
-                        opts.cookies_file = str(prepared_fb)
-                        loaded_cookiefile = True
-                        ydl_opts.pop("_rookie_cookie_dropped", None)
-                        ydl_opts.pop("_rookie_error_msg", None)
-                        if on_log:
-                            on_log(f"[Cookies 自动回退] 浏览器实时提取受限，已自动挂载本地缓存 Cookies：{cached_fb.name}")
-            # Chromium 系 (Edge/Chrome) 的 v20 App-Bound 凭据常常无法后台解密：
-            # 若本机装有 Firefox 且已登录，自动改读 Firefox（明文库，无需解密）。
-            if (
-                not loaded_cookiefile
-                and target_url
-                and browser_name not in ("firefox", "librewolf", "zen", "cachy")
-            ):
-                for alt_browser in ("firefox",):
-                    try:
-                        alt_file = rookie_bridge.extract_to_netscape_file(
-                            browser=alt_browser,
-                            target_url=target_url,
-                            temp_dir=paths.temp_dir,
-                            app_bound="disabled",
-                            token=token,
-                            on_log=None,
-                        )
-                    except CancelledError:
-                        raise
-                    except Exception:
-                        alt_file = None
-                    if alt_file is not None and alt_file.exists():
-                        ydl_opts["cookiefile"] = str(alt_file)
-                        opts.cookies_file = str(alt_file)
-                        loaded_cookiefile = True
-                        ydl_opts.pop("_rookie_cookie_dropped", None)
-                        ydl_opts.pop("_rookie_error_msg", None)
-                        if on_log:
-                            on_log(f"[Cookies 自动回退] {browser_name} 受 v20 加密限制，已改用 {alt_browser} 的登录 Cookies。")
-                        break
-            if not loaded_cookiefile and browser_name in ("firefox", "librewolf", "zen", "cachy"):
+                # If daily browser didn't have valid login cookies, fall back to Account Vault / cached cookies
+                if not loaded_cookiefile:
+                    hosted_fb = _resolve_hosted_cookie_for_site(
+                        target_url,
+                        opts,
+                        paths=paths,
+                        on_log=on_log,
+                        browser_id=browser_name,
+                    )
+                    if hosted_fb is not None and hosted_fb.is_file():
+                        prepared_fb = prepare_cookie_file(hosted_fb, paths.temp_dir, on_log=None, target_url=target_url)
+                        if prepared_fb is not None and prepared_fb.exists():
+                            ydl_opts["cookiefile"] = str(prepared_fb)
+                            ydl_opts["_cookie_source_path"] = str(hosted_fb)
+                            opts.cookies_file = str(prepared_fb)
+                            loaded_cookiefile = True
+                            ydl_opts.pop("_rookie_cookie_dropped", None)
+                            ydl_opts.pop("_rookie_error_msg", None)
+                            if on_log:
+                                on_log(f"[Cookies 自动回退] 已自动挂载本地托管/缓存凭据：{hosted_fb.name}")
+
+                # Fallback to Firefox if installed and logged in
+                if (
+                    not loaded_cookiefile
+                    and target_url
+                    and browser_name not in ("firefox", "librewolf", "zen", "cachy")
+                ):
+                    for alt_browser in ("firefox",):
+                        try:
+                            alt_file = rookie_bridge.extract_to_netscape_file(
+                                browser=alt_browser,
+                                target_url=target_url,
+                                temp_dir=paths.temp_dir,
+                                app_bound="disabled",
+                                token=token,
+                                on_log=None,
+                            )
+                        except CancelledError:
+                            raise
+                        except Exception:
+                            alt_file = None
+                        if alt_file is not None and alt_file.exists():
+                            ydl_opts["cookiefile"] = str(alt_file)
+                            opts.cookies_file = str(alt_file)
+                            loaded_cookiefile = True
+                            ydl_opts.pop("_rookie_cookie_dropped", None)
+                            ydl_opts.pop("_rookie_error_msg", None)
+                            if on_log:
+                                on_log(f"[Cookies 自动回退] 已改用 {alt_browser} 的登录 Cookies。")
+                            break
+
+                if not loaded_cookiefile and browser_name in ("firefox", "librewolf", "zen", "cachy"):
+                    ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
+                    if on_log:
+                        on_log(f"[Cookies 回退] 正在尝试 yt-dlp 原生从 {browser_name} 读取 Cookies...")
+            else:
                 ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
-                if on_log:
-                    on_log(f"[Cookies 回退] 正在尝试 yt-dlp 原生从 {browser_name} 读取 Cookies...")
         else:
-            ydl_opts["cookiesfrombrowser"] = (browser_name, profile, None, None)
+            # No daily browser selected -> check if non-YouTube site is hosted in Account Vault
+            hosted_non_yt = _resolve_hosted_cookie_for_site(target_url, opts, paths=paths, on_log=on_log)
+            if hosted_non_yt is not None and hosted_non_yt.is_file():
+                prepared_h = prepare_cookie_file(hosted_non_yt, paths.temp_dir, on_log=on_log, target_url=target_url)
+                if prepared_h is not None and prepared_h.exists():
+                    ydl_opts["cookiefile"] = str(prepared_h)
+                    ydl_opts["_cookie_source_path"] = str(hosted_non_yt)
+                    opts.cookies_file = str(hosted_non_yt)
+                    loaded_cookiefile = True
 
     if _is_tiktok_url(target_url) and "tiktok" in _WORKING_UA_CACHE:
         ydl_opts["http_headers"] = {"User-Agent": _WORKING_UA_CACHE["tiktok"]}
@@ -852,19 +952,6 @@ def _is_tiktok_url(url: str) -> bool:
 def _is_youtube_url(url: str) -> bool:
     u = (url or "").lower()
     return "youtube.com" in u or "youtu.be" in u or "youtube-nocookie.com" in u
-
-
-def _extract_youtube_video_id(url: str) -> Optional[str]:
-    if not url:
-        return None
-    m = _YOUTUBE_URL_ID_RE.search(url)
-    if m:
-        return m.group(1)
-    parsed = urllib.parse.urlparse(url)
-    qs_v = urllib.parse.parse_qs(parsed.query).get("v")
-    if qs_v and _YOUTUBE_ID_RE.match(qs_v[0]):
-        return qs_v[0]
-    return None
 
 
 def _extract_tiktok_video_id(url: str, error_text: str = "") -> Optional[str]:
@@ -993,12 +1080,12 @@ def _run_ydl_extract_with_fallbacks(
     paths: AppPaths,
     on_log: Optional[LogCallback] = None,
 ) -> Tuple[Any, Optional[Any]]:
-    """Run `ydl.extract_info(url, download=download)` with automatic fallbacks."""
+    """Run `ydl.extract_info(url, download=download)` with Account Vault silent refresh and multi-client fallbacks."""
     current_opts = copy.copy(ydl_opts)
     cookies_dropped = bool(current_opts.pop("_rookie_cookie_dropped", False))
     rookie_err_msg = str(current_opts.pop("_rookie_error_msg", "") or "")
     cookie_source_str = str(current_opts.pop("_cookie_source_path", "") or "")
-    cookie_source_path = Path(cookie_source_str) if cookie_source_str else None
+    cookie_source_path: Optional[Path] = Path(cookie_source_str) if cookie_source_str else None
 
     def _run_ydl_once(run_opts: Dict[str, Any]) -> Tuple[Any, Any]:
         cf_str = str(run_opts.get("cookiefile") or "")
@@ -1027,7 +1114,7 @@ def _run_ydl_extract_with_fallbacks(
         err_str = str(first_exc)
         err_lower = err_str.lower()
 
-        # Fallback 1: Running Edge/Chrome on Windows locks the Cookie database (#7271)
+        # Fallback 1: Running browser on Windows locks the Cookie database when using native cookiesfrombrowser (#7271)
         if "could not copy" in err_lower and "cookie database" in err_lower and "cookiesfrombrowser" in current_opts:
             if on_log:
                 on_log(
@@ -1047,13 +1134,52 @@ def _run_ydl_extract_with_fallbacks(
                 err_str = str(retry_exc)
                 err_lower = err_str.lower()
 
-        # Fallback 2: YouTube fallback appending `web_embedded` to yt-dlp's maintained `default` client list
+        # Fallback 2: If site challenged with login/bot check or expired cookie token, silently refresh from Account Vault
+        needs_auth_refresh = (
+            any(pat in err_lower for pat in _AGE_OR_AUTH_PATTERNS)
+            or "http error 403" in err_lower
+            or (_is_youtube_url(url) and "requested format is not available" in err_lower)
+        )
+        if needs_auth_refresh and opts.auto_refresh_cookies and browser_cookies.has_vault_profile(paths):
+            eff_proxy = resolve_effective_proxy(opts.proxy, target_url=url)
+            refreshed_cookie = browser_cookies.refresh_hosted_site_cookies(
+                url,
+                paths=paths,
+                proxy=eff_proxy,
+                on_log=on_log,
+            )
+            if refreshed_cookie is not None and refreshed_cookie.is_file():
+                fresh_session_cookie = prepare_cookie_file(
+                    refreshed_cookie,
+                    paths.temp_dir,
+                    on_log=None,
+                    target_url=url,
+                )
+                if fresh_session_cookie and fresh_session_cookie.exists():
+                    current_opts["cookiefile"] = str(fresh_session_cookie)
+                    cookie_source_path = refreshed_cookie
+                    opts.cookies_file = str(refreshed_cookie)
+                    cookies_dropped = False
+                    rookie_err_msg = ""
+                    if on_log:
+                        on_log("[账号托管] 已挂载后台静默提取的新凭据，正在重新请求...")
+                    try:
+                        return _run_ydl_once(current_opts)
+                    except CancelledError:
+                        raise
+                    except Exception as refresh_retry_exc:
+                        _tag_exc(refresh_retry_exc)
+                        attempts.append(refresh_retry_exc)
+                        err_str = str(refresh_retry_exc)
+                        err_lower = err_str.lower()
+
+        # Fallback 3: YouTube fallback appending `web_embedded` to yt-dlp's maintained `default` client list
         if _is_youtube_url(url) and "failed to decrypt with dpapi" not in err_lower and not (
             "could not find" in err_lower and "cookies database" in err_lower
         ):
             had_cookies = "cookiefile" in current_opts or "cookiesfrombrowser" in current_opts
 
-            # 2A: If cookies were used, keep yt-dlp's default clients and append `web_embedded`
+            # 3A: If cookies were used, keep yt-dlp's default clients and append `web_embedded`
             if had_cookies:
                 if on_log:
                     on_log("[YouTube 兼容重试 1/2] 正在切换 YouTube 默认+嵌入式客户端 (default, web_embedded) 与复合流模式重试...")
@@ -1082,7 +1208,7 @@ def _run_ydl_extract_with_fallbacks(
                     if on_log:
                         on_log(f"[尝试 {len(attempts)}] {yt_c_exc}")
 
-            # 2B: Try cookie-free `default, web_embedded, tv`
+            # 3B: Try cookie-free `default, web_embedded, tv`
             if on_log:
                 on_log("[YouTube 兼容重试 2/2] 正在尝试 YouTube 免 Cookie 嵌入式/TV 通道 (default, web_embedded, tv)...")
             yt_nocookie_opts = copy.copy(current_opts)
@@ -1104,7 +1230,7 @@ def _run_ydl_extract_with_fallbacks(
                 if on_log:
                     on_log(f"[尝试 {len(attempts)}] {yt_nc_exc}")
 
-        # Fallback 3: TikTok webpage anti-bot challenge (`Unexpected response from webpage request`)
+        # Fallback 4: TikTok webpage anti-bot challenge (`Unexpected response from webpage request`)
         if _is_tiktok_url(url) and (
             "unexpected response from webpage request" in err_lower
             or "unable to extract" in err_lower
@@ -1158,8 +1284,8 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
 
     if "failed to decrypt with dpapi" in lower:
         return DownloadError(
-            "无法解密 Chrome/Edge 的 Cookies：新版 Chromium（127+）启用了 App-Bound 加密，yt-dlp 无法从外部读取。"
-            "请确认已安装内置 rookie-cookies 组件，或改用 Firefox、「登录并获取 Cookies」、导入 cookies.txt。",
+            "无法解密 Chrome/Edge 的 Cookies：新版 Chromium（127+）启用了 App-Bound 加密。"
+            "请使用「网站账号托管中心」登录托管，或确认已安装内置 rookie-cookies 组件。",
             detail=text,
         )
 
@@ -1171,7 +1297,7 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
 
     if "could not copy" in lower and "cookie database" in lower:
         return DownloadError(
-            "浏览器正在运行并独占锁定了 Cookies 数据库（#7271）。请先关闭浏览器，或使用内置 rookie-cookies / Firefox /「登录并获取 Cookies」。",
+            "浏览器正在运行并独占锁定了 Cookies 数据库（#7271）。请使用内置 rookie-cookies 或「网站账号托管中心」。",
             detail=text,
         )
 
@@ -1188,7 +1314,7 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
 
     if "does not look like a netscape format cookies file" in lower:
         return DownloadError(
-            "导入的 Cookies 文件格式无效。请打开「偏好设置 -> 网络与认证」使用「登录并获取 Cookies」或「📋 从剪贴板导入」。",
+            "Cookies 文件格式无效。请打开「偏好设置 -> 网络与认证」使用「打开账号托管中心…」或「📋 从剪贴板导入」。",
             detail=text,
         )
 
@@ -1205,14 +1331,20 @@ def _translate_ydl_exception(exc: BaseException, has_cookies: bool = False) -> D
             msg = f"{rookie_err}（匿名重试后该视频仍要求登录）"
         elif getattr(exc, "cookies_dropped", False):
             msg = (
-                "当前代理节点 IP 被 YouTube 判定为机器人，要求登录验证；而所选浏览器 (Edge/Chrome) 的 v20 (App-Bound) 加密"
-                "无法在后台解密，未能拿到登录 Cookies。请任选其一：①「偏好设置 -> 网络与认证 -> 登录并获取 Cookies…」登录导出一次；"
-                "②改用 Firefox（登录 YouTube 后在设置里选 Firefox）；③换一个更干净的代理节点（住宅 IP 优先）后重试。"
+                "该视频要求登录验证，但未能从所选日常浏览器提取到对应站点的有效登录 Cookies。"
+                "请确认已在所选浏览器中登录该站点，或打开「偏好设置 -> 网络与认证 -> 打开账号托管中心…」登录托管。"
             )
         elif has_cookies:
-            msg = "已使用你导入的 Cookies，但站点仍要求登录：Cookies 可能已过期/被轮换，或不属于该站点账号。请重新导出（YouTube 请用无痕窗口导出并立刻关闭）。"
+            msg = (
+                "已挂载 Cookies，但站点仍要求验证登录：登录态可能已失效。"
+                "请打开「偏好设置 -> 网络与认证 -> 打开账号托管中心…」重新登录一次即可恢复自动续期。"
+            )
         else:
-            msg = "该视频需要登录或年龄验证，请在「偏好设置 -> 网络与认证」中配置 Cookies。"
+            msg = (
+                "该视频或当前代理节点被站点要求验证登录（或年龄验证）。"
+                "YouTube 请打开「偏好设置 -> 网络与认证 -> 打开账号托管中心…」登录托管一次；"
+                "B站 / TikTok 可直接开启「从浏览器读取」或使用账号托管中心。"
+            )
         return DownloadError(msg, detail=text)
 
     if "timed out" in lower or "proxy" in lower or "connection" in lower or "ssl" in lower:
@@ -1300,6 +1432,7 @@ def fetch_info(
         cookies_from_browser=opts.cookies_from_browser,
         cookies_browser_profile=opts.cookies_browser_profile,
         cookies_app_bound=opts.cookies_app_bound,
+        auto_refresh_cookies=opts.auto_refresh_cookies,
         allow_playlist=False,
         ffmpeg_dir=opts.ffmpeg_dir,
         deno_path=opts.deno_path,
@@ -1346,7 +1479,7 @@ def extract_playlist_or_info(
             direct_fb = _fallback_tiktok_direct(url, video_id=vid, proxy=opts.proxy, on_log=on_log)
             if direct_fb is not None:
                 return [direct_fb.info]
-        raise _translate_ydl_exception(exc, has_cookies=has_cookies) from exc
+        raise _translate_ydl_exception(exc, has_cookies=has_cookies or bool(opts.cookies_file)) from exc
 
     if token:
         token.check()
@@ -1494,7 +1627,7 @@ def download_audio(
                     on_log=on_log,
                     token=token,
                 )
-        raise _translate_ydl_exception(exc, has_cookies=has_cookies) from exc
+        raise _translate_ydl_exception(exc, has_cookies=has_cookies or bool(opts.cookies_file)) from exc
 
     if token:
         token.check()
@@ -1523,9 +1656,8 @@ def get_yt_dlp_version(paths: AppPaths = PATHS) -> str:
 
 
 def diagnose_youtube_runtime(paths: AppPaths = PATHS) -> Dict[str, str]:
-    """供「关于/诊断」按钮和 `cli.py --diagnose` 使用（包含 deno/node/bun 最低版本合规检查）。"""
-    yt = _import_yt_dlp(paths)
-    report: Dict[str, str] = {"yt-dlp": str(getattr(yt.version, "__version__", "?"))}
+    """供「关于/诊断」按钮和 `cli.py --diagnose` 使用（包含 deno/node/bun、rookie-cookies 与账号托管状态）。"""
+    report: Dict[str, str] = {"yt-dlp": get_yt_dlp_version(paths)}
     for name in ("deno", "node", "bun"):
         exe = paths.find_binary(name)
         ver = _probe_version(exe, name) if exe else None
@@ -1536,7 +1668,7 @@ def diagnose_youtube_runtime(paths: AppPaths = PATHS) -> Dict[str, str]:
             min_s = ".".join(map(str, min_v))
             report[name] = f"{exe} (v{ver_s}) {'✓' if ok else f'✗ 低于要求 v{min_s}，yt-dlp 不会使用'}"
         else:
-            report[name] = "未找到" 
+            report[name] = "未找到"
     try:
         import yt_dlp_ejs
         report["yt-dlp-ejs"] = str(getattr(yt_dlp_ejs, "version", "?"))
@@ -1547,7 +1679,16 @@ def diagnose_youtube_runtime(paths: AppPaths = PATHS) -> Dict[str, str]:
         report["yt-dlp 期望的 EJS 版本"] = str(_info.VERSION)
     except Exception:
         report["yt-dlp 期望的 EJS 版本"] = "未知"
-    report["rookie-cookies (浏览器 Cookie 引擎)"] = rookie_bridge.get_version()
+
+    report["rookie-cookies (B站/TikTok 浏览器读取引擎)"] = rookie_bridge.get_version()
+    browser_exe = browser_cookies.find_browser("edge") or browser_cookies.find_browser("chrome")
+    report["账号托管浏览器内核 (YouTube 专用)"] = str(browser_exe) if browser_exe else "未检测到 Edge / Chrome"
+    active_sites = [
+        site.display_label
+        for site, _p, rep in browser_cookies.list_hosted_sites_status(paths)
+        if rep.ok
+    ]
+    report["已托管有效站点"] = "、".join(active_sites) if active_sites else "暂无（可在偏好设置中登录托管）"
     return report
 
 

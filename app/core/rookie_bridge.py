@@ -837,7 +837,6 @@ def _persistent_cookie_cache_candidates(base_temp: Path, b_id: str, target_url: 
     site_key = site.key if site is not None else "general"
     return [
         data_cookies_dir / f"rookie_cache_{b_id}_{site_key}.txt",
-        data_cookies_dir / f"{site_key}.txt",
     ]
 
 
@@ -1248,42 +1247,3 @@ def extract_to_netscape_file(
         raise DownloadError(msg, detail=str(exc)) from exc
     finally:
         stop_watcher.set()
-
-
-def diagnose_browser_cookies(
-    browser: str,
-    profile: str = "",
-    target_url: str = "",
-    app_bound: str = "disabled",
-) -> Tuple[bool, str]:
-    """Run an on-demand browser Cookie extraction & static inspection check for the Settings UI."""
-    rc = _import_rookie()
-    if rc is None:
-        return False, "当前环境未安装 rookie-cookies 组件，请运行 pip install rookie-cookies>=0.6.0。"
-
-    logs: List[str] = []
-    try:
-        out_file = extract_to_netscape_file(
-            browser=browser,
-            profile=profile,
-            target_url=target_url,
-            app_bound=app_bound,
-            on_log=logs.append,
-            force_refresh=True,
-        )
-    except Exception as exc:
-        return False, "\n".join(logs) if logs else str(exc)
-
-    if out_file is None or not out_file.exists():
-        return False, "\n".join(logs) or f"未能从 {browser} 提取到任何有效 Cookie。"
-
-    try:
-        if target_url:
-            rep = inspect_netscape(out_file, target_url)
-            return rep.ok, "\n".join(logs + [rep.summary()])
-        return True, "\n".join(logs) or "Cookie 提取成功。"
-    finally:
-        try:
-            out_file.unlink()
-        except OSError:
-            pass

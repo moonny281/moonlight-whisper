@@ -1,4 +1,4 @@
-"""Windows 11 Mica-styled Settings Dialog (with built-in rookie-cookies browser extraction, Profile discovery, managed browser CDP login, and Cookie health check)."""
+"""Windows 11 Mica-styled Settings Dialog (with hybrid Cookie strategy: YouTube Account Vault + Bilibili/TikTok rookie-cookies browser reading)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import Config, LlmConfig
-from app.core import downloader, rookie_bridge, summarizer
+from app.core import browser_cookies, downloader, rookie_bridge, summarizer
 from app.core.errors import ErrorInfo
 from app.core.site_cookies import inspect_netscape, netscape_to_header, probe_bilibili_login, resolve_site
 from app.paths import PATHS, AppPaths
@@ -38,7 +38,7 @@ from app.workers import YtDlpUpdateWorker
 
 
 class SettingsDialog(QDialog):
-    """Comprehensive Mica-styled settings dialog with built-in rookie-cookies support, Profile discovery, and zero row overlap."""
+    """Comprehensive Mica-styled settings dialog with YouTube Account Vault & Bilibili/TikTok browser Cookie reading."""
 
     def __init__(
         self,
@@ -53,7 +53,7 @@ class SettingsDialog(QDialog):
         self._ytdlp_worker: Optional[YtDlpUpdateWorker] = None
 
         self.setWindowTitle("偏好设置 - Moonlight Whisper")
-        self.setMinimumSize(740, 650)
+        self.setMinimumSize(740, 680)
         self._build_ui()
         self._load_from_config()
         if 0 <= initial_tab < self.tabs.count():
@@ -122,15 +122,15 @@ class SettingsDialog(QDialog):
 
         rookie_ver = rookie_bridge.get_version()
         cookie_card, cookie_box = make_mica_section(
-            f"站点登录与 Cookies（内置 rookie-cookies: {rookie_ver}）",
-            "• 方式一（推荐）：在下方选择「从浏览器读取」，内置 rookie-cookies 原生支持 Edge / Chrome / Brave (含 Windows App-Bound v20 解密) 与 Firefox；\n"
-            "• 方式二：点击「登录并获取 Cookies…」打开专用隔离浏览器登录导出，或直接导入 cookies.txt。",
+            f"站点登录与 Cookies（智能分流：YouTube 账号托管 + B站/TikTok 浏览器读取 [{rookie_ver}]）",
+            "• YouTube 策略：专属使用「网站账号托管中心」隔离登录态，Cookie 过期时后台无头静默自动续期（不读取日常浏览器）；\n"
+            "• B站 / TikTok 等策略：优先从下方所选的日常浏览器直接读取最新 Cookie，若未读取到则自动回退使用托管账号凭据。",
         )
         cookie_form = QFormLayout()
         self._configure_form(cookie_form)
 
         self.combo_browser_cookies = QComboBox()
-        self.combo_browser_cookies.addItem("不从浏览器读取（使用下方 Cookies 文件或匿名请求）", "")
+        self.combo_browser_cookies.addItem("不从浏览器读取（仅使用托管账号或 Cookies 文件）", "")
         for b_info in rookie_bridge.list_supported_browsers():
             self.combo_browser_cookies.addItem(b_info["display_name"], b_info["id"])
         self.combo_browser_cookies.currentIndexChanged.connect(self._on_browser_changed)
@@ -153,10 +153,17 @@ class SettingsDialog(QDialog):
             self.combo_app_bound.addItem(policy_label, policy_key)
         cookie_form.addRow("v20 解密策略：", self.combo_app_bound)
 
+        self.lbl_vault_status = QLabel("")
+        self.lbl_vault_status.setWordWrap(True)
+        cookie_form.addRow("账号托管状态：", self.lbl_vault_status)
+
+        self.chk_auto_refresh_cookies = QCheckBox("当托管账号 Cookie 过期或触发验证时，后台自动无头静默提取新凭据")
+        cookie_form.addRow("托管自动续期：", self.chk_auto_refresh_cookies)
+
         cookie_file_row = QHBoxLayout()
         cookie_file_row.setSpacing(6)
         self.edit_cookies_file = QLineEdit()
-        self.edit_cookies_file.setPlaceholderText("可选：指定本地 cookies.txt / JSON（若填写则优先于上方浏览器读取）")
+        self.edit_cookies_file.setPlaceholderText("可选：手动指定特定 cookies.txt / JSON（日常留空即可按站点自动分流）")
         btn_paste_cookie = QPushButton("📋 从剪贴板导入")
         btn_paste_cookie.setToolTip("将剪贴板中的 Netscape / JSON Cookie 内容转换并保存为标准 cookies.txt")
         btn_paste_cookie.clicked.connect(self._import_cookies_from_clipboard)
@@ -174,10 +181,10 @@ class SettingsDialog(QDialog):
 
         cookie_action_row = QHBoxLayout()
         cookie_action_row.setSpacing(8)
-        self.btn_login_cookie = QPushButton("登录并获取 Cookies…")
+        self.btn_login_cookie = QPushButton("🌐 打开网站账号托管中心（登录 YouTube 等）…")
         self.btn_login_cookie.setObjectName("PrimaryButton")
         self.btn_login_cookie.clicked.connect(self._open_cookie_login)
-        self.btn_check_cookie = QPushButton("检测 Cookies 有效性")
+        self.btn_check_cookie = QPushButton("🩺 检测 Cookies 有效性")
         self.btn_check_cookie.clicked.connect(self._check_cookies)
         cookie_action_row.addWidget(self.btn_login_cookie)
         cookie_action_row.addWidget(self.btn_check_cookie)
@@ -395,6 +402,19 @@ class SettingsDialog(QDialog):
                 f"未检测到 {browser_id} 的额外配置目录（留空即可自动使用默认配置）。",
             )
 
+    def _refresh_vault_status_label(self) -> None:
+        statuses = browser_cookies.list_hosted_sites_status(self.paths)
+        ok_sites = [site.display_label for site, _p, rep in statuses if rep.ok]
+        expired_sites = [site.display_label for site, c_path, rep in statuses if c_path.is_file() and not rep.ok]
+        parts: list[str] = []
+        if ok_sites:
+            parts.append(f"✓ 已托管就绪（{len(ok_sites)} 个）：{'、'.join(ok_sites)}")
+        if expired_sites:
+            parts.append(f"⚠ 待自动刷新：{'、'.join(expired_sites)}")
+        if not parts:
+            parts.append("尚未托管 YouTube 等站点账号，点击下方「打开网站账号托管中心…」登录一次即可持久托管并自动续期。")
+        self.lbl_vault_status.setText("\n".join(parts))
+
     def _clear_cookies_file(self) -> None:
         self.edit_cookies_file.clear()
         self.cfg.managed_cookie_site = ""
@@ -406,65 +426,62 @@ class SettingsDialog(QDialog):
             proxy=self.edit_proxy.text().strip(),
             preferred_browser=str(self.combo_browser_cookies.currentData() or "edge"),
         )
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.exported_path:
-            self.edit_cookies_file.setText(dlg.exported_path)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.exported_site_key:
             self.cfg.managed_cookie_site = dlg.exported_site_key
+        self._refresh_vault_status_label()
 
     def _check_cookies(self) -> None:
-        raw_path = self.edit_cookies_file.text().strip()
-        browser_id = str(self.combo_browser_cookies.currentData() or "").strip()
-        if not raw_path and not browser_id:
-            QMessageBox.warning(
-                self,
-                "检测 Cookies",
-                "请先选择「从浏览器读取」的浏览器，或指定「Cookies 文件」。",
-            )
-            return
-        url, ok = QInputDialog.getText(self, "检测 Cookies", "输入一个需要登录才能看的视频链接：")
+        url, ok = QInputDialog.getText(
+            self,
+            "检测 Cookies 有效性",
+            "输入一个需要检测的视频链接（YouTube 将检测托管账号，B站/TikTok 将优先检测浏览器读取）：",
+        )
         if not ok or not url.strip():
             return
         target_url = url.strip()
-
-        if raw_path:
-            logs: list[str] = []
-            prepared = downloader.prepare_cookie_file(
-                Path(raw_path).expanduser(),
-                self.paths.temp_dir,
+        opts = downloader.DownloadOptions(
+            proxy=self.edit_proxy.text().strip(),
+            cookies_file=self.edit_cookies_file.text().strip(),
+            cookies_from_browser=str(self.combo_browser_cookies.currentData() or "").strip(),
+            cookies_browser_profile=self._current_profile_text(),
+            cookies_app_bound=str(self.combo_app_bound.currentData() or "injection_only"),
+            auto_refresh_cookies=self.chk_auto_refresh_cookies.isChecked(),
+        )
+        logs: list[str] = []
+        try:
+            ydl_opts = downloader._build_common_ydl_opts(
+                opts,
                 on_log=logs.append,
+                paths=self.paths,
                 target_url=target_url,
             )
-            if prepared is None:
-                QMessageBox.warning(self, "检测结果", "\n".join(logs) or "Cookies 文件无法解析")
-                return
-        else:
-            logs = []
-            try:
-                prepared = rookie_bridge.extract_to_netscape_file(
-                    browser=browser_id,
-                    profile=self._current_profile_text(),
-                    target_url=target_url,
-                    temp_dir=self.paths.temp_dir,
-                    app_bound=str(self.combo_app_bound.currentData() or "disabled"),
-                    on_log=logs.append,
-                )
-            except Exception as exc:
-                err = ErrorInfo.from_exception(exc)
-                QMessageBox.warning(self, "浏览器提取失败", err.user_message)
-                return
-            if prepared is None:
-                QMessageBox.warning(self, "检测结果", "\n".join(logs) or f"未能从 {browser_id} 提取到匹配的 Cookies")
-                return
+        except Exception as exc:
+            err = ErrorInfo.from_exception(exc)
+            QMessageBox.warning(self, "检测失败", err.user_message)
+            return
 
-        report = inspect_netscape(prepared, target_url)
-        msg = report.summary()
-        site = resolve_site(target_url)
+        cf_str = str(ydl_opts.get("cookiefile") or "")
+        if not cf_str or not Path(cf_str).is_file():
+            QMessageBox.warning(
+                self,
+                "检测结果",
+                "\n".join(logs) or "未获取到匹配的 Cookies（YouTube 请先在账号托管中心登录，B站/TikTok 请确认已选择浏览器读取）。",
+            )
+            return
+
+        prepared = Path(cf_str)
+        custom_file = browser_cookies.get_custom_sites_file(self.paths)
+        report = inspect_netscape(prepared, target_url, custom_sites_file=custom_file)
+        msg = "\n".join(logs + [report.summary()])
+        site = resolve_site(target_url, custom_sites_file=custom_file)
         if site and site.key == "bilibili" and report.ok:
-            hdr = netscape_to_header(prepared, target_url)
+            hdr = netscape_to_header(prepared, target_url, custom_sites_file=custom_file)
             bili_ok = probe_bilibili_login(hdr, proxy=downloader.resolve_effective_proxy(self.edit_proxy.text(), target_url))
             if bili_ok is True:
                 msg += "\n\n[B 站联网探测] 登录态有效（isLogin=True）！"
             elif bili_ok is False:
                 msg += "\n\n[B 站联网探测] 服务端返回未登录（isLogin=False），SESSDATA 可能已失效，请重新登录。"
+        self._refresh_vault_status_label()
         QMessageBox.information(self, "检测结果", msg)
 
     def _show_youtube_diagnosis(self) -> None:
@@ -480,7 +497,7 @@ class SettingsDialog(QDialog):
                 self,
                 "剪贴板为空",
                 "当前剪贴板中没有文本内容。\n"
-                "请先在浏览器中使用 Get cookies.txt LOCALLY 或 Cookie-Editor 插件复制 Cookies。",
+                "请先在浏览器中复制 Cookies，或直接使用「从浏览器读取」/「网站账号托管中心」。",
             )
             return
         target_url = ""
@@ -500,7 +517,6 @@ class SettingsDialog(QDialog):
                 target_url=target_url,
             )
             self.edit_cookies_file.setText(str(saved_path))
-            self.combo_browser_cookies.setCurrentIndex(0)
             sites_desc = f"\n识别到的目标站点：{', '.join(sites)}" if sites else ""
             QMessageBox.information(
                 self,
@@ -521,7 +537,6 @@ class SettingsDialog(QDialog):
         )
         if file_path:
             self.edit_cookies_file.setText(file_path)
-            self.combo_browser_cookies.setCurrentIndex(0)
 
     def _load_from_config(self) -> None:
         self.edit_proxy.setText(self.cfg.proxy)
@@ -544,6 +559,9 @@ class SettingsDialog(QDialog):
         idx_ab = self.combo_app_bound.findData(self.cfg.cookies_app_bound)
         if idx_ab >= 0:
             self.combo_app_bound.setCurrentIndex(idx_ab)
+
+        self.chk_auto_refresh_cookies.setChecked(self.cfg.auto_refresh_cookies)
+        self._refresh_vault_status_label()
 
         self.chk_allow_playlist.setChecked(self.cfg.allow_playlist)
         self.chk_vad.setChecked(self.cfg.vad)
@@ -627,6 +645,7 @@ class SettingsDialog(QDialog):
         self.cfg.cookies_from_browser = str(self.combo_browser_cookies.currentData() or "")
         self.cfg.cookies_browser_profile = self._current_profile_text()
         self.cfg.cookies_app_bound = str(self.combo_app_bound.currentData() or "disabled")
+        self.cfg.auto_refresh_cookies = self.chk_auto_refresh_cookies.isChecked()
 
         self.cfg.allow_playlist = self.chk_allow_playlist.isChecked()
         self.cfg.vad = self.chk_vad.isChecked()

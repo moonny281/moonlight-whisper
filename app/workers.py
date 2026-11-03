@@ -129,6 +129,7 @@ class PlaylistExpandWorker(QThread):
             cookies_from_browser=self.cfg.cookies_from_browser,
             cookies_browser_profile=self.cfg.cookies_browser_profile,
             cookies_app_bound=self.cfg.cookies_app_bound,
+            auto_refresh_cookies=self.cfg.auto_refresh_cookies,
             allow_playlist=self.cfg.allow_playlist,
             ffmpeg_dir=self.paths.bin_dir,
         )

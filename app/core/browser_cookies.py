@@ -1,37 +1,80 @@
-"""通过 Chrome DevTools Protocol 从一次性独立浏览器配置目录读取 Cookies。
+"""网站账号托管与自动续期引擎（Account Vault & CDP Silent Auto-Refresh）。
 
-要点：
-- 每次启动使用全新的一次性临时 --user-data-dir（彻底消除固定目录残留进程引起的 Chromium 单实例转发与标签页堆积）；
-- 启动前与关闭后自动清理占用该配置目录的残留进程；
-- 注入 --disable-blink-features=AutomationControlled，防止 Google / YouTube 登录拦截“此浏览器或应用可能不安全”；
-- Cookies 由浏览器自己解密后经 CDP (Storage.getCookies + Network.getAllCookies) 返回，100% 绕开 App-Bound Encryption (v20)；
-- 只导出目标站点关联域名的 Cookies（如 YouTube 同时包含 .youtube.com 与 .google.com）；调试端口仅绑定 127.0.0.1 随机端口与本地 Origin。
+架构设计：
+1. 独立持久化的账号托管库 (`data_root/account_vault/browser_profile`)：
+   - 与用户日常使用的 Edge/Chrome 完全物理隔离，绝不读取或干扰日常浏览器；
+   - 用户只需在「网站账号托管中心」登录一次各大视频站点（YouTube / B站 / 抖音 / TikTok / X / Instagram / 小红书等），登录态长久保存在托管库中。
+2. 零标签页堆积与零单实例冲突保障：
+   - 每次启动托管浏览器前，主动清理占用该托管目录的残留进程（`_kill_stale_profile_owner`）；
+   - 自动清空 Chromium 会话历史标签页缓存（`Default/Sessions/*`）并将 `Preferences` 的 `exit_type` 设为 `Normal`，保留 100% 登录态与 Cookie 的同时，彻底杜绝历史标签页恢复与堆积。
+3. 失效自动静默提取（`refresh_hosted_site_cookies`）：
+   - 当 `data_root/cookies/<site>.txt` 过期、缺失或下载中途被站点要求重新验证时，后台以 `--headless=new` 无头模式静默拉起托管库，访问目标站点完成令牌轮换（如 YouTube `__Secure-1PSIDTS`），经本地 CDP (`Storage.getCookies` + `Network.getAllCookies`) 提取明文 Cookie 落盘后立即关闭，全程 0 弹窗、100% 绕开 Windows App-Bound (v20) 限制。
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+from app.core.site_cookies import (
+    CookieReport,
+    SiteProfile,
+    export_domains_for,
+    get_site_by_key,
+    inspect_netscape,
+    load_all_sites,
+    resolve_site,
+    rows_have_site_auth,
+)
+from app.paths import PATHS, AppPaths
 
 try:  # websockets>=11 提供同步客户端
     from websockets.sync.client import connect as _ws_connect_raw
 except Exception:  # pragma: no cover
     _ws_connect_raw = None
 
+_VAULT_LOCK = threading.RLock()
+
 
 class BrowserCookieError(RuntimeError):
     pass
 
 
+def get_vault_profile_dir(paths: AppPaths = PATHS) -> Path:
+    """返回独立持久化的账号托管浏览器 Profile 目录。"""
+    return paths.data_root / "account_vault" / "browser_profile"
+
+
+def get_site_cookie_path(site_key: str, paths: AppPaths = PATHS) -> Path:
+    """返回指定托管站点的标准 Netscape Cookies 文件路径 (`data_root/cookies/<site_key>.txt`)。"""
+    clean_key = (site_key or "").strip().lower()
+    return paths.data_root / "cookies" / f"{clean_key}.txt"
+
+
+def get_custom_sites_file(paths: AppPaths = PATHS) -> Path:
+    """返回可选的用户自定义扩展站点配置文件路径 (`data_root/plugins/sites.json`)。"""
+    return paths.plugins_dir / "sites.json"
+
+
+def has_vault_profile(paths: AppPaths = PATHS) -> bool:
+    """判断本机是否已初始化过账号托管浏览器配置目录。"""
+    vault_dir = get_vault_profile_dir(paths)
+    if not vault_dir.is_dir():
+        return False
+    return (vault_dir / "Local State").exists() or (vault_dir / "Default").exists()
+
+
 def find_browser(kind: str = "edge") -> Optional[Path]:
-    """定位 Edge / Chrome 可执行文件（Windows）。"""
+    """定位 Edge / Chrome 可执行文件。"""
     env = os.environ
     pf, pf86, local = env.get("ProgramFiles", ""), env.get("ProgramFiles(x86)", ""), env.get("LOCALAPPDATA", "")
     table = {
@@ -64,6 +107,12 @@ def find_browser(kind: str = "edge") -> Optional[Path]:
                     continue
         except ImportError:
             pass
+    else:
+        names = ("microsoft-edge", "msedge") if kind == "edge" else ("google-chrome", "chromium", "chromium-browser")
+        for name in names:
+            found = shutil.which(name)
+            if found:
+                return Path(found).resolve()
     return None
 
 
@@ -105,7 +154,7 @@ def _cdp_call(ws_url: str, method: str, call_id: int = 1, timeout: float = 10.0)
 
 
 def _kill_stale_profile_owner(profile_dir: Path) -> None:
-    """Windows 下按命令行里是否包含该 profile 路径来清理残留浏览器进程，防止僵尸进程占资源或单实例转发。"""
+    """按命令行是否包含该独立托管 profile 路径来清理残留浏览器进程（绝不影响用户日常浏览器）。"""
     if sys.platform != "win32":
         return
     needle = str(profile_dir).strip().lower()
@@ -147,8 +196,50 @@ def _kill_stale_profile_owner(profile_dir: Path) -> None:
         pass
 
 
+def _prepare_clean_profile_session(profile_dir: Path) -> None:
+    """在保留托管账号 Cookies 与 LocalStorage 的前提下，清除单实例锁与历史打开标签页，彻底杜绝标签页恢复堆积。"""
+    if not profile_dir.exists():
+        return
+    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+        lock_p = profile_dir / lock_name
+        try:
+            if lock_p.exists() or lock_p.is_symlink():
+                lock_p.unlink()
+        except OSError:
+            pass
+
+    default_dir = profile_dir / "Default"
+    if not default_dir.is_dir():
+        return
+
+    sessions_dir = default_dir / "Sessions"
+    if sessions_dir.is_dir():
+        shutil.rmtree(sessions_dir, ignore_errors=True)
+
+    for legacy_tab_file in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"):
+        p = default_dir / legacy_tab_file
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+
+    prefs_file = default_dir / "Preferences"
+    if prefs_file.is_file():
+        try:
+            prefs = json.loads(prefs_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(prefs, dict):
+                prof_sec = prefs.setdefault("profile", {})
+                if isinstance(prof_sec, dict):
+                    prof_sec["exit_type"] = "Normal"
+                    prof_sec["exited_cleanly"] = True
+                prefs_file.write_text(json.dumps(prefs, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+
 class ManagedBrowser:
-    """启动并控制一个使用一次性独立配置目录的 Edge/Chrome 进程。"""
+    """启动并控制使用独立托管配置目录的 Edge/Chrome 进程（支持可见登录窗口与后台无头静默刷新）。"""
 
     def __init__(self, exe: Path, profile_dir: Path, headless: bool = False, proxy: str = "") -> None:
         self.exe, self.profile_dir, self.headless = exe, profile_dir, headless
@@ -159,6 +250,7 @@ class ManagedBrowser:
     def start(self, start_url: str = "about:blank", timeout: float = 18.0) -> None:
         _kill_stale_profile_owner(self.profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_clean_profile_session(self.profile_dir)
         args = [
             str(self.exe),
             f"--remote-debugging-port={self.port}",
@@ -166,6 +258,8 @@ class ManagedBrowser:
             f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
             "--disable-blink-features=AutomationControlled",
         ]
         if self.proxy:
@@ -197,18 +291,18 @@ class ManagedBrowser:
         sess = _local_session()
         while time.time() < deadline:
             if self._proc.poll() is not None:
-                raise BrowserCookieError("浏览器进程已退出，请重试打开登录窗口")
+                raise BrowserCookieError("托管浏览器进程已退出，请重试打开登录窗口")
             try:
                 r = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=1.5)
                 if r.ok:
                     return
             except requests.RequestException:
                 time.sleep(0.3)
-        raise BrowserCookieError("等待浏览器调试端口超时")
+        raise BrowserCookieError("等待托管浏览器调试端口超时")
 
     def get_cookies(self) -> List[Dict[str, Any]]:
         """同时从 Browser Target (`Storage.getCookies`) 与 Page Target (`Network.getAllCookies` / `Storage.getCookies`)
-        收集并合并全部 Cookie，确保 YouTube/Google 跨站登录凭据 100% 完整导出。
+        收集并合并全部 Cookie，确保 YouTube/Google 等跨站登录凭据 100% 完整导出。
         """
         sess = _local_session()
         merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -257,12 +351,12 @@ class ManagedBrowser:
             return list(merged.values())
         if last_err is not None:
             raise BrowserCookieError(f"读取 Cookies 失败：{last_err}") from last_err
-        raise BrowserCookieError("未从浏览器调试端口获取到任何 Cookies")
+        raise BrowserCookieError("未从托管浏览器调试端口获取到任何 Cookies")
 
     def close(self) -> None:
         if self._proc and self._proc.poll() is None:
             try:
-                # 先尝试通过 CDP 优雅关闭，使 Cookie 落盘
+                # 先尝试通过 CDP 优雅关闭，使新签发的 Cookie 完整落盘至托管 Profile
                 sess = _local_session()
                 ver = sess.get(f"http://127.0.0.1:{self.port}/json/version", timeout=2).json()
                 ws = _ws_connect(ver["webSocketDebuggerUrl"])
@@ -279,6 +373,7 @@ class ManagedBrowser:
                     pass
         self._proc = None
         _kill_stale_profile_owner(self.profile_dir)
+        _prepare_clean_profile_session(self.profile_dir)
 
 
 def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: Iterable[str]) -> Tuple[str, int]:
@@ -312,12 +407,147 @@ def cdp_cookies_to_netscape(cookies: Iterable[Dict[str, Any]], allowed_domains: 
     return "\n".join(lines) + "\n", count
 
 
-def export_site_cookies(browser: ManagedBrowser, out_file: Path, allowed_domains: Iterable[str]) -> int:
-    text, count = cdp_cookies_to_netscape(browser.get_cookies(), allowed_domains)
+def _write_netscape_atomic(out_file: Path, text: str) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(text, encoding="utf-8")
+    tmp_file = out_file.with_suffix(out_file.suffix + ".tmp")
+    tmp_file.write_text(text, encoding="utf-8")
     try:
-        os.chmod(out_file, 0o600)
+        os.chmod(tmp_file, 0o600)
     except OSError:
         pass
+    tmp_file.replace(out_file)
+
+
+def export_site_cookies(browser: ManagedBrowser, out_file: Path, allowed_domains: Iterable[str]) -> int:
+    text, count = cdp_cookies_to_netscape(browser.get_cookies(), allowed_domains)
+    _write_netscape_atomic(out_file, text)
     return count
+
+
+def export_logged_in_sites_from_browser(
+    browser: ManagedBrowser,
+    paths: AppPaths = PATHS,
+    primary_site_key: str = "",
+) -> Dict[str, CookieReport]:
+    """从当前打开的托管浏览器一次性读取全部 Cookies，自动为当前选中站点及所有已登录站点导出 `<site>.txt`。"""
+    all_cookies = browser.get_cookies()
+    custom_file = get_custom_sites_file(paths)
+    reports: Dict[str, CookieReport] = {}
+    for site in load_all_sites(custom_file):
+        check_url = site.effective_refresh_url
+        is_primary = site.key == (primary_site_key or "").strip().lower()
+        has_auth = rows_have_site_auth(all_cookies, check_url, custom_sites_file=custom_file)
+        if not is_primary and not has_auth:
+            continue
+        out_path = get_site_cookie_path(site.key, paths)
+        text, count = cdp_cookies_to_netscape(all_cookies, export_domains_for(site))
+        if count > 0 or is_primary:
+            _write_netscape_atomic(out_path, text)
+            reports[site.key] = inspect_netscape(out_path, check_url, custom_sites_file=custom_file)
+    return reports
+
+
+def list_hosted_sites_status(paths: AppPaths = PATHS) -> List[Tuple[SiteProfile, Path, CookieReport]]:
+    """列出所有已注册站点的本地托管 Cookie 状态。"""
+    custom_file = get_custom_sites_file(paths)
+    results: List[Tuple[SiteProfile, Path, CookieReport]] = []
+    for site in load_all_sites(custom_file):
+        c_path = get_site_cookie_path(site.key, paths)
+        rep = inspect_netscape(c_path, site.effective_refresh_url, custom_sites_file=custom_file)
+        results.append((site, c_path, rep))
+    return results
+
+
+def clear_hosted_site_cookies(site_key: str, paths: AppPaths = PATHS) -> bool:
+    """删除指定站点的已导出 Cookie 文件。"""
+    p = get_site_cookie_path(site_key, paths)
+    if p.is_file():
+        try:
+            p.unlink()
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def refresh_hosted_site_cookies(
+    site_or_url: str | SiteProfile,
+    paths: AppPaths = PATHS,
+    proxy: str = "",
+    timeout: float = 18.0,
+    settle_sec: float = 2.5,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Optional[Path]:
+    """当托管站点的 Cookie 过期或触发验证时，在后台以无头模式 (`headless=True`) 静默启动托管浏览器配置目录，
+    访问目标站点完成令牌刷新并重新导出 `data_root/cookies/<site>.txt`。
+    """
+    custom_file = get_custom_sites_file(paths)
+    if isinstance(site_or_url, SiteProfile):
+        site: Optional[SiteProfile] = site_or_url
+    else:
+        raw = str(site_or_url or "").strip()
+        site = get_site_by_key(raw, custom_file) or resolve_site(raw, custom_file)
+    if site is None:
+        return None
+
+    if not has_vault_profile(paths):
+        return None
+
+    exe = find_browser("edge") or find_browser("chrome")
+    if exe is None:
+        if on_log:
+            on_log("[账号托管] 未检测到 Edge 或 Chrome，无法执行后台静默刷新。")
+        return None
+
+    vault_profile = get_vault_profile_dir(paths)
+    refresh_url = site.effective_refresh_url
+    out_file = get_site_cookie_path(site.key, paths)
+
+    with _VAULT_LOCK:
+        if on_log:
+            on_log(f"[账号托管] 正在后台静默启动托管浏览器刷新 {site.display_label} 的登录凭据...")
+        browser = ManagedBrowser(exe, vault_profile, headless=True, proxy=proxy)
+        try:
+            browser.start(refresh_url, timeout=timeout)
+            deadline = time.time() + max(0.5, settle_sec)
+            latest_cookies: List[Dict[str, Any]] = []
+            while time.time() < deadline:
+                time.sleep(0.5)
+                try:
+                    latest_cookies = browser.get_cookies()
+                except Exception:
+                    continue
+                if rows_have_site_auth(latest_cookies, refresh_url, custom_sites_file=custom_file):
+                    # 额外等待一小段时间让页面脚本完成令牌轮换（如 __Secure-1PSIDTS）
+                    time.sleep(min(0.8, max(0.0, deadline - time.time())))
+                    try:
+                        latest_cookies = browser.get_cookies()
+                    except Exception:
+                        pass
+                    break
+
+            if not latest_cookies:
+                latest_cookies = browser.get_cookies()
+
+            text, count = cdp_cookies_to_netscape(latest_cookies, export_domains_for(site))
+            if count <= 0:
+                if on_log:
+                    on_log(f"[账号托管] 托管浏览器中未找到 {site.display_label} 的 Cookie，请先在「网站账号托管中心」登录一次。")
+                return None
+
+            _write_netscape_atomic(out_file, text)
+            rep = inspect_netscape(out_file, refresh_url, custom_sites_file=custom_file)
+            if rep.ok:
+                if on_log:
+                    on_log(f"[账号托管] 已成功静默提取并刷新 {site.display_label} 的最新凭据（{rep.summary()}）")
+                return out_file
+
+            if on_log:
+                on_log(f"[账号托管] 托管库中的 {site.display_label} 登录态已失效（{rep.summary()}），请打开「网站账号托管中心」重新登录。")
+            return None
+        except Exception as exc:
+            if on_log:
+                on_log(f"[账号托管] 后台静默刷新 {site.display_label} 凭据未成功：{exc}")
+            return None
+        finally:
+            browser.close()

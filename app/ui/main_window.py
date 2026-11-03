@@ -516,10 +516,10 @@ class MainWindow(QMainWindow):
             apply_theme(QApplication.instance(), self.cfg.ui.theme, window=self)
             from app.logger import get_logger
             get_logger().info(
-                "已保存偏好设置 (代理=%s, Cookies文件=%s, 浏览器Cookies=%s)",
+                "已保存偏好设置 (代理=%s, 浏览器读取[B站/TikTok优先]=%s, YouTube托管自动续期=%s)",
                 self.cfg.proxy or "自动检测系统代理/直连",
-                self.cfg.cookies_file or "未设置",
                 self.cfg.cookies_from_browser or "未启用",
+                "开启" if self.cfg.auto_refresh_cookies else "关闭",
             )
 
     def _on_options_changed(self) -> None:
