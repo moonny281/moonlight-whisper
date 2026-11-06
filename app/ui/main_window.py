@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from app import __app_name__, __version__
 from app.config import Config
-from app.core import downloader, gpu_runtime, model_manager
+from app.core import downloader, gpu_runtime, languages, model_manager
 from app.core.errors import ErrorInfo
 from app.core.gpu_runtime import GpuStatus
 from app.core.pipeline import Job
@@ -47,17 +48,8 @@ from app.ui.widgets import (
 )
 from app.workers import PlaylistExpandWorker, TaskQueue, YtDlpUpdateWorker
 
-LANGUAGE_OPTIONS = [
-    ("自动检测 (Auto)", None),
-    ("中文 (zh)", "zh"),
-    ("英语 (en)", "en"),
-    ("日语 (ja)", "ja"),
-    ("韩语 (ko)", "ko"),
-    ("法语 (fr)", "fr"),
-    ("德语 (de)", "de"),
-    ("西班牙语 (es)", "es"),
-    ("俄语 (ru)", "ru"),
-]
+# Every language Whisper supports (plus Cantonese); per-model availability is applied by `_refresh_language_options`.
+LANGUAGE_OPTIONS = languages.language_options()
 
 
 class MainWindow(QMainWindow):
@@ -202,9 +194,22 @@ class MainWindow(QMainWindow):
         lbl_l = QLabel("识别语言")
         lbl_l.setObjectName("FieldLabel")
         self.combo_lang = QComboBox()
-        self.combo_lang.setMinimumWidth(135)
+        self.combo_lang.setMinimumWidth(190)
         for label, code in LANGUAGE_OPTIONS:
             self.combo_lang.addItem(label, code)
+        # Searchable: type part of a language name or code to filter the list.
+        self.combo_lang.setEditable(True)
+        self.combo_lang.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.combo_lang.setMaxVisibleItems(16)
+        lang_completer = self.combo_lang.completer()
+        if lang_completer is not None:
+            lang_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            lang_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            lang_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        lang_edit = self.combo_lang.lineEdit()
+        if lang_edit is not None:
+            lang_edit.setPlaceholderText("输入语言名或代码筛选")
+            lang_edit.editingFinished.connect(self._restore_lang_text)
 
         lbl_out = QLabel("输出目录")
         lbl_out.setObjectName("FieldLabel")
@@ -239,6 +244,12 @@ class MainWindow(QMainWindow):
         self.chk_llm_summary = QCheckBox("启用 AI 自动生成摘要 (OpenAI 兼容)")
         self.chk_include_timestamps = QCheckBox("文档包含时间轴 ([00:00:00])")
         self.chk_include_video_info = QCheckBox("文档包含视频信息表")
+        self.chk_route = QCheckBox("按语言自动选择模型 (语言路由)")
+        self.chk_route.setToolTip(
+            "开启后：先识别（或使用你指定的）语言，再按「偏好设置 → 语言路由」中的规则选择模型。\n"
+            "例如 中文/粤语 → SenseVoiceSmall，其余语言 → Whisper。\n"
+            "此时「转录模型」仅在语言检测失败或不可靠时作为默认模型。"
+        )
 
         toggles_grid.addWidget(self.chk_gpu, 0, 0)
         toggles_grid.addWidget(self.chk_to_simplified, 0, 1)
@@ -248,6 +259,7 @@ class MainWindow(QMainWindow):
         toggles_grid.addWidget(self.chk_llm_summary, 1, 2)
         toggles_grid.addWidget(self.chk_include_timestamps, 2, 0)
         toggles_grid.addWidget(self.chk_include_video_info, 2, 1)
+        toggles_grid.addWidget(self.chk_route, 2, 2)
         toggles_grid.setColumnStretch(0, 1)
         toggles_grid.setColumnStretch(1, 1)
         toggles_grid.setColumnStretch(2, 1)
@@ -338,8 +350,10 @@ class MainWindow(QMainWindow):
         self.btn_settings_top.clicked.connect(lambda: self._open_settings_dialog(initial_tab=0))
         self.btn_about_top.clicked.connect(self._show_about_dialog)
 
+        self.combo_model.currentIndexChanged.connect(self._refresh_language_options)
         self.combo_model.currentIndexChanged.connect(self._on_options_changed)
-        self.combo_lang.currentIndexChanged.connect(self._on_options_changed)
+        self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
+        self.chk_route.toggled.connect(self._on_route_toggled)
         self.chk_gpu.toggled.connect(self._on_gpu_toggled)
         self.gpu_indicator.install_clicked.connect(self._open_gpu_dialog)
 
@@ -387,9 +401,12 @@ class MainWindow(QMainWindow):
             if idx_m >= 0:
                 self.combo_model.setCurrentIndex(idx_m)
 
+            self.chk_route.setChecked(self.cfg.route_enabled)
+
             idx_l = self.combo_lang.findData(self.cfg.language)
             if idx_l >= 0:
                 self.combo_lang.setCurrentIndex(idx_l)
+            self._refresh_language_options()
 
             self.chk_gpu.setChecked(self.cfg.use_gpu)
             self.edit_output_dir.setText(str(self.paths.output_dir))
@@ -530,11 +547,64 @@ class MainWindow(QMainWindow):
                 "开启" if self.cfg.auto_refresh_cookies else "关闭",
             )
 
+    def _restore_lang_text(self) -> None:
+        """Snap the editable language box back to the selected entry (ignore half-typed text)."""
+        edit = self.combo_lang.lineEdit()
+        if edit is not None:
+            edit.setText(self.combo_lang.itemText(self.combo_lang.currentIndex()))
+
+    def _language_allowed(self, code: Optional[str]) -> bool:
+        """With routing on every language is allowed (each routes to a model that supports it)."""
+        if self.chk_route.isChecked() or code is None:
+            return True
+        model = str(self.combo_model.currentData() or self.cfg.model)
+        return languages.is_language_supported(model, code)
+
+    def _refresh_language_options(self) -> None:
+        """Grey out languages the selected model cannot transcribe; fall back to auto-detect if needed."""
+        model = str(self.combo_model.currentData() or self.cfg.model)
+        routing = self.chk_route.isChecked()
+        supported = None if routing else languages.supported_languages(model)
+        item_model = self.combo_lang.model()
+        for i in range(self.combo_lang.count()):
+            code = self.combo_lang.itemData(i)
+            allowed = code is None or supported is None or code in supported
+            item = item_model.item(i) if hasattr(item_model, "item") else None
+            if item is not None:
+                item.setEnabled(allowed)
+                item.setToolTip("" if allowed else f"{model} 不支持该语言（可开启「语言路由」自动换用其他模型）")
+        current = self.combo_lang.currentData()
+        if not self._language_allowed(current):
+            blocker = self.combo_lang.blockSignals(True)
+            try:
+                self.combo_lang.setCurrentIndex(0)
+            finally:
+                self.combo_lang.blockSignals(blocker)
+            self._restore_lang_text()
+            self.cfg.language = None
+
+    def _on_lang_changed(self) -> None:
+        if self._suppress_option_sync:
+            return
+        if not self._language_allowed(self.combo_lang.currentData()):
+            self.combo_lang.setCurrentIndex(0)  # re-enters with auto-detect
+            return
+        self._restore_lang_text()
+        self._on_options_changed()
+
+    def _on_route_toggled(self, checked: bool) -> None:
+        if self._suppress_option_sync:
+            return
+        self.cfg.route_enabled = bool(checked)
+        self._refresh_language_options()
+        self._on_options_changed()
+
     def _on_options_changed(self) -> None:
         if self._suppress_option_sync:
             return
         self.cfg.model = str(self.combo_model.currentData() or "large-v3-turbo")
         self.cfg.language = self.combo_lang.currentData()
+        self.cfg.route_enabled = self.chk_route.isChecked()
         self.cfg.keep_audio = self.chk_keep_audio.isChecked()
         self.cfg.write_srt = self.chk_write_srt.isChecked()
         self.cfg.to_simplified = self.chk_to_simplified.isChecked()

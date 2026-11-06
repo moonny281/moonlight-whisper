@@ -10,7 +10,17 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.config import Config
-from app.core import audio, downloader, gpu_runtime, md_writer, model_manager, summarizer, transcriber
+from app.core import (
+    audio,
+    downloader,
+    gpu_runtime,
+    md_writer,
+    model_manager,
+    router,
+    sensevoice_engine,
+    summarizer,
+    transcriber,
+)
 from app.core.cancel import CancelToken
 from app.core.downloader import DownloadOptions, MediaInfo
 from app.core.errors import CancelledError, MoonlightError, TranscribeError
@@ -189,9 +199,27 @@ def run(
 
         token.check()
 
+        # Step 4.5: Language routing — pick the model (and language) for this file
+        decision = router.resolve_route(
+            cfg,
+            wav_path,
+            hf_mirror=cfg.hf_mirror,
+            proxy=cfg.proxy,
+            on_log=_emit_log,
+            on_stage=_emit_stage,
+            token=token,
+            paths=paths,
+        )
+        model_name = decision.model
+        language = decision.language
+        if decision.routed or model_name != cfg.model:
+            _emit_log(f"本次转录使用模型：{model_name}")
+        token.check()
+
         # Step 5: Ensure GPU or fallback to CPU
         target_device = "cpu"
         vram_gb = 8.0
+        uses_sensevoice = model_manager.get_model_engine(model_name) == model_manager.ENGINE_SENSEVOICE
         if cfg.use_gpu:
             gpu_info = gpu_runtime.detect(paths)
             if gpu_info.status == GpuStatus.READY:
@@ -202,14 +230,14 @@ def run(
                 _emit_log(f"[GPU 回退] {gpu_info.message}，本次任务自动使用 CPU 模式。")
 
         # Step 6: Ensure model is downloaded locally
-        if not model_manager.is_model_installed(cfg.model, paths=paths):
-            _emit_stage(f"下载模型 ({cfg.model})")
-            _emit_log(f"本地未找到完整模型 {cfg.model}，开始自动下载...")
+        if not model_manager.is_model_installed(model_name, paths=paths):
+            _emit_stage(f"下载模型 ({model_name})")
+            _emit_log(f"本地未找到完整模型 {model_name}，开始自动下载...")
             model_manager.download_model(
-                model_name=cfg.model,
+                model_name=model_name,
                 hf_mirror=cfg.hf_mirror,
                 proxy=cfg.proxy,
-                on_progress=lambda ratio, msg: _emit_stage(f"下载模型 ({cfg.model}) {int(ratio * 100)}%"),
+                on_progress=lambda ratio, msg: _emit_stage(f"下载模型 ({model_name}) {int(ratio * 100)}%"),
                 on_log=_emit_log,
                 token=token,
                 paths=paths,
@@ -217,11 +245,26 @@ def run(
 
         token.check()
 
-        # Step 7: Transcribe with faster-whisper (35% - 95%), with auto-repair if cached local model is corrupted
+        if uses_sensevoice and target_device == "cuda":
+            if not sensevoice_engine.ensure_gpu_assets(
+                model_name=model_name,
+                hf_mirror=cfg.hf_mirror,
+                pypi_mirror=cfg.pypi_mirror,
+                proxy=cfg.proxy,
+                on_progress=lambda ratio, msg: _emit_stage(f"准备 GPU 文件 {int(ratio * 100)}%"),
+                on_log=_emit_log,
+                on_stage=_emit_stage,
+                token=token,
+                paths=paths,
+            ):
+                target_device = "cpu"
+            token.check()
+
+        # Step 7: Transcribe with faster-whisper / SenseVoiceSmall (35% - 95%), with auto-repair if cached local model is corrupted
         _emit_stage("加载模型与转录中")
         tr_opts = TranscribeOptions(
-            model=cfg.model,
-            language=cfg.language,
+            model=model_name,
+            language=language,
             device=target_device,
             compute_type=cfg.compute_type,
             cpu_threads=cfg.cpu_threads,
@@ -249,6 +292,8 @@ def run(
                     "config.json",
                     "tokenizer",
                     "vocabulary",
+                    "tokens.txt",
+                    "model.int8.onnx",
                     "invalid model",
                     "failed to open",
                     "failed to read",
@@ -259,15 +304,15 @@ def run(
             if not is_corrupt_model_err:
                 raise
             token.check()
-            _emit_log(f"[模型自愈] 检测到本地模型 {cfg.model} 文件可能损坏或不完整 ({first_tr_err.user_message})，正在清理并重新下载...")
-            _emit_stage(f"修复下载模型 ({cfg.model})")
-            transcriber.MODEL_CACHE.clear()
-            model_manager.purge_corrupted_model(cfg.model, paths=paths)
+            _emit_log(f"[模型自愈] 检测到本地模型 {model_name} 文件可能损坏或不完整 ({first_tr_err.user_message})，正在清理并重新下载...")
+            _emit_stage(f"修复下载模型 ({model_name})")
+            transcriber.clear_all_model_caches()
+            model_manager.purge_corrupted_model(model_name, paths=paths)
             model_manager.download_model(
-                model_name=cfg.model,
+                model_name=model_name,
                 hf_mirror=cfg.hf_mirror,
                 proxy=cfg.proxy,
-                on_progress=lambda ratio, msg: _emit_stage(f"修复模型 ({cfg.model}) {int(ratio * 100)}%"),
+                on_progress=lambda ratio, msg: _emit_stage(f"修复模型 ({model_name}) {int(ratio * 100)}%"),
                 on_log=_emit_log,
                 token=token,
                 paths=paths,

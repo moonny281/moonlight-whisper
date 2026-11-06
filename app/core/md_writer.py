@@ -156,7 +156,8 @@ def render_markdown(
     device = meta.get("device", "cpu")
     compute_type = meta.get("compute_type", "int8")
     language = meta.get("language", "unknown")
-    prob = float(meta.get("language_probability", 1.0))
+    prob_raw = meta.get("language_probability", 1.0)
+    language_cell = language if prob_raw is None else f"{language}（置信度 {float(prob_raw):.2f}）"
 
     paragraphs = merge_segments_to_paragraphs(segments)
     if paragraphs:
@@ -181,7 +182,7 @@ def render_markdown(
             f"| 作者 | {info.uploader} |\n"
             f"| 时长 | {duration_str} |\n"
             f"| 模型 | {model_name}（{device}/{compute_type}） |\n"
-            f"| 语言 | {language}（置信度 {prob:.2f}） |\n"
+            f"| 语言 | {language_cell} |\n"
             f"| 转录时间 | {now_str} |"
         )
         sections.append(info_table)

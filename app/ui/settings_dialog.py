@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,7 +14,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QAbstractItemView,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -22,12 +25,14 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from app.config import Config, LlmConfig
-from app.core import browser_cookies, downloader, rookie_bridge, summarizer
+from app.config import DEFAULT_ROUTE_RULES, Config, LlmConfig
+from app.core import browser_cookies, downloader, languages, model_manager, rookie_bridge, summarizer
 from app.core.errors import ErrorInfo
 from app.core.site_cookies import inspect_netscape, netscape_to_header, probe_bilibili_login, resolve_site
 from app.paths import PATHS, AppPaths
@@ -52,6 +57,7 @@ class SettingsDialog(QDialog):
         self.paths = paths
         self._ytdlp_worker: Optional[YtDlpUpdateWorker] = None
 
+        self._route_rules: dict = {}
         self.setWindowTitle("偏好设置 - Moonlight Whisper")
         self.setMinimumSize(740, 680)
         self._build_ui()
@@ -74,6 +80,8 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._build_transcribe_tab(), "转录与外观")
         self.tabs.addTab(self._build_llm_tab(), "AI 自动摘要")
         self.tabs.addTab(self._build_storage_tab(), "存储目录")
+        # Appended last so the existing tab indices (e.g. `initial_tab=2` for the AI summary tab) stay valid.
+        self.tabs.addTab(self._build_route_tab(), "语言路由")
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -263,6 +271,132 @@ class SettingsDialog(QDialog):
         layout.addWidget(tr_card)
         layout.addStretch(1)
         return page
+
+    def _build_route_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        card, box = make_mica_section("语言路由：按语言自动选择识别模型")
+        info = QLabel(
+            "开启后，每个任务会先确定语言（主界面指定了语言就直接用；选“自动检测”则先用下方的小型 Whisper 模型识别语言），"
+            "再按规则选择模型：命中规则用规则里的模型，没有规则的语言使用“默认模型”。\n"
+            "SenseVoiceSmall 仅支持 中/英/日/韩/粤语，且速度很快；其余语言请使用 Whisper。语言检测不可靠时，改用主界面所选模型。"
+        )
+        info.setWordWrap(True)
+        info.setObjectName("HintLabel")
+        box.addWidget(info)
+
+        self.chk_route_enabled = QCheckBox("启用语言路由")
+        box.addWidget(self.chk_route_enabled)
+
+        self.tbl_route_rules = QTableWidget(0, 2)
+        self.tbl_route_rules.setHorizontalHeaderLabels(["语言", "使用模型"])
+        self.tbl_route_rules.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl_route_rules.verticalHeader().setVisible(False)
+        self.tbl_route_rules.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_route_rules.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_route_rules.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl_route_rules.setMinimumHeight(190)
+        box.addWidget(self.tbl_route_rules)
+
+        add_row = QHBoxLayout()
+        self.combo_rule_lang = QComboBox()
+        for lang in languages.ALL_LANGUAGES:
+            self.combo_rule_lang.addItem(lang.label, lang.code)
+        self.combo_rule_lang.setEditable(True)
+        self.combo_rule_lang.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.combo_rule_model = QComboBox()
+        for spec in model_manager.SUPPORTED_MODELS:
+            self.combo_rule_model.addItem(spec.name, spec.name)
+        self.btn_rule_add = QPushButton("添加 / 更新规则")
+        self.btn_rule_del = QPushButton("删除选中")
+        self.btn_rule_reset = QPushButton("恢复默认")
+        add_row.addWidget(QLabel("语言："))
+        add_row.addWidget(self.combo_rule_lang, 1)
+        add_row.addWidget(QLabel("模型："))
+        add_row.addWidget(self.combo_rule_model, 1)
+        add_row.addWidget(self.btn_rule_add)
+        add_row.addWidget(self.btn_rule_del)
+        add_row.addWidget(self.btn_rule_reset)
+        box.addLayout(add_row)
+
+        form = QFormLayout()
+        self._configure_form(form)
+        self.combo_route_fallback = QComboBox()
+        for spec in model_manager.SUPPORTED_MODELS:
+            self.combo_route_fallback.addItem(spec.name, spec.name)
+        form.addRow("默认模型（无规则的语言）：", self.combo_route_fallback)
+
+        self.combo_route_detect = QComboBox()
+        for name in ("tiny", "base", "small"):
+            self.combo_route_detect.addItem(name, name)
+        form.addRow("语言检测模型：", self.combo_route_detect)
+        box.addLayout(form)
+
+        layout.addWidget(card)
+        layout.addStretch(1)
+
+        self.btn_rule_add.clicked.connect(self._on_route_rule_add)
+        self.btn_rule_del.clicked.connect(self._on_route_rule_delete)
+        self.btn_rule_reset.clicked.connect(self._on_route_rules_reset)
+        self.tbl_route_rules.itemSelectionChanged.connect(self._on_route_rule_selected)
+        return page
+
+    def _refresh_route_table(self) -> None:
+        self.tbl_route_rules.setRowCount(0)
+        for code in sorted(self._route_rules, key=lambda c: [l.code for l in languages.ALL_LANGUAGES].index(c)):
+            row = self.tbl_route_rules.rowCount()
+            self.tbl_route_rules.insertRow(row)
+            lang_item = QTableWidgetItem(languages.language_label(code))
+            lang_item.setData(Qt.ItemDataRole.UserRole, code)
+            self.tbl_route_rules.setItem(row, 0, lang_item)
+            self.tbl_route_rules.setItem(row, 1, QTableWidgetItem(self._route_rules[code]))
+
+    def _selected_rule_code(self) -> Optional[str]:
+        rows = self.tbl_route_rules.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.tbl_route_rules.item(rows[0].row(), 0)
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
+
+    def _on_route_rule_selected(self) -> None:
+        code = self._selected_rule_code()
+        if not code:
+            return
+        idx = self.combo_rule_lang.findData(code)
+        if idx >= 0:
+            self.combo_rule_lang.setCurrentIndex(idx)
+        midx = self.combo_rule_model.findData(self._route_rules.get(code))
+        if midx >= 0:
+            self.combo_rule_model.setCurrentIndex(midx)
+
+    def _on_route_rule_add(self) -> None:
+        code = self.combo_rule_lang.currentData()
+        model = str(self.combo_rule_model.currentData() or "")
+        if not code or not model:
+            return
+        if not languages.is_language_supported(model, str(code)):
+            QMessageBox.warning(
+                self,
+                "规则无效",
+                f"模型 {model} 不支持语言 {languages.language_label(str(code))}。\n"
+                "SenseVoiceSmall 仅支持 中/英/日/韩/粤语；粤语需 Whisper large-v3 / large-v3-turbo。",
+            )
+            return
+        self._route_rules[str(code)] = model
+        self._refresh_route_table()
+
+    def _on_route_rule_delete(self) -> None:
+        code = self._selected_rule_code()
+        if code and code in self._route_rules:
+            del self._route_rules[code]
+            self._refresh_route_table()
+
+    def _on_route_rules_reset(self) -> None:
+        self._route_rules = dict(DEFAULT_ROUTE_RULES)
+        self._refresh_route_table()
 
     def _build_llm_tab(self) -> QWidget:
         page = QWidget()
@@ -585,6 +719,19 @@ class SettingsDialog(QDialog):
         if idx_log >= 0:
             self.combo_log_level.setCurrentIndex(idx_log)
 
+        self.chk_route_enabled.setChecked(self.cfg.route_enabled)
+        self._route_rules = dict(self.cfg.route_rules)
+        self._refresh_route_table()
+        for combo, value in (
+            (self.combo_route_fallback, self.cfg.route_fallback_model),
+            (self.combo_route_detect, self.cfg.route_detect_model),
+        ):
+            idx = combo.findData(value)
+            if idx < 0 and value:
+                combo.addItem(value, value)
+                idx = combo.count() - 1
+            combo.setCurrentIndex(max(0, idx))
+
         self.chk_llm_enabled.setChecked(self.cfg.llm.enabled)
         self.edit_llm_base_url.setText(self.cfg.llm.base_url)
         self.edit_llm_api_key.setText(self.cfg.llm.api_key)
@@ -664,6 +811,11 @@ class SettingsDialog(QDialog):
         self.cfg.filename_template = self.edit_filename_tpl.text().strip() or "{title}"
         self.cfg.ui.theme = str(self.combo_theme.currentData() or "system")
         self.cfg.log_level = str(self.combo_log_level.currentData() or "INFO")
+
+        self.cfg.route_enabled = self.chk_route_enabled.isChecked()
+        self.cfg.route_rules = dict(self._route_rules)
+        self.cfg.route_fallback_model = str(self.combo_route_fallback.currentData() or self.cfg.route_fallback_model)
+        self.cfg.route_detect_model = str(self.combo_route_detect.currentData() or self.cfg.route_detect_model)
 
         self.cfg.llm.enabled = self.chk_llm_enabled.isChecked()
         self.cfg.llm.base_url = self.edit_llm_base_url.text().strip() or "https://api.openai.com/v1"

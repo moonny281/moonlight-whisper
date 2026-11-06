@@ -7,6 +7,10 @@
 
 - **开箱即用**：CPU 模式下无需任何额外配置即可运行；首次勾选 NVIDIA GPU 加速时支持在线按需下载 CUDA 12（cuBLAS 12 + cuDNN 9）运行库（支持国内清华/阿里云 PyPI 镜像、断点续传、SHA256 校验与离线导入）。
 - **网站账号托管（Account Vault）与安全登录小窗**：点击「打开安全登录小窗」，调用电脑上真实的 Edge / Chrome 以单窗口小窗（`--app` 模式，无标签页）打开登录页，Google 等站点认可这种真实浏览器环境，可正常登录 YouTube/Google（YouTube、哔哩哔哩、抖音、TikTok、X/Twitter、Instagram、小红书，并支持 `plugins/sites.json` 扩展自定义站点）。小窗使用应用自己的独立托管目录（`account_vault/browser_profile`），与日常浏览器的配置和账号隔离，并关闭账号同步、跳过首次运行向导；登录凭据通过本地调试端口明文读取，点击「我已登录，提取并托管凭据」后写入 `cookies/<站点>.txt`，同时顺带托管小窗里已登录的其他站点。下载时按域名自动挂载凭据并原子回写轮换令牌，凭据过期时可在后台无头静默刷新。另提供应用内置小窗（QtWebEngine，适合 B站/抖音等，Google 会拦截）与「从剪贴板导入」。
+- **SenseVoiceSmall 模型支持**：模型下拉框与「模型管理」中提供 `SenseVoiceSmall`（阿里 FunASR，中/英/日/韩/粤语，自带标点与数字规整）。CPU 使用 sherpa-onnx 导出的 int8 ONNX 模型（约 240 MB，按需下载，也可手动导入含 `model.int8.onnx` + `tokens.txt` 的文件夹）；推理复用 `onnxruntime`，特征提取使用 `kaldi-native-fbank`，不依赖 PyTorch / FunASR；语音分段复用 faster-whisper 内置的 Silero VAD（单段最长 15 秒，遵循「VAD 静音过滤」设置）。「繁体转简体」只作用于中文/粤语输出，不会改动日文汉字。
+- **SenseVoiceSmall GPU 加速**：勾选「启用 NVIDIA GPU 加速」后，SenseVoiceSmall 通过 ONNX Runtime CUDA 推理。首次使用会按需补充下载 `cudart` / `cuFFT`（装入现有 `gpu_runtime/`）与 fp32 权重 `model.onnx`（约 940 MB；int8 版本大量使用 MatMulInteger / DynamicQuantizeLinear 整数算子，CUDA 上缺乏对应支持，GPU 上改用 fp32）。任何一步失败、或 CUDA 推理中途出错，都会自动回退到 CPU int8 并写入日志，不会中断任务。
+- **全语言选择与过滤**：主界面「识别语言」覆盖 Whisper 支持的全部语言（含粤语），可输入语言名或代码搜索；当前模型不支持的语言会置灰（如 SenseVoiceSmall 仅 zh/en/ja/ko/yue，Whisper tiny~medium 不含粤语），始终保留「自动检测」。
+- **语言路由**：勾选「按语言自动选择模型」后，按「偏好设置 → 语言路由」中的规则为每个任务选模型。指定了语言则直接查规则；选「自动检测」则先用小型 Whisper 模型（默认 `base`，约 145 MB，CPU）识别语言，再查规则。默认规则：中文/粤语 → SenseVoiceSmall，其余语言 → 默认模型（`large-v3-turbo`）。语言检测失败或置信度低于 0.4 时，使用主界面所选模型。命令行：`--route` / `--no-route`。
 - **智能容错与回退**：自动遵循 `GPU float16 → GPU int8_float16 → CPU int8` 降级回退链，显存不足或运行库异常时平滑切换。
 - **支持播放列表与批量队列**：支持批量粘贴链接、拖入本地音视频文件（`.mp3`, `.m4a`, `.mp4`, `.mkv`, `.wav` 等），可选开启播放列表/多 P 视频自动展开。
 - **结构化 Markdown 导出**：智能段落合并、防幻觉相邻句去重、繁体转简体（OpenCC）、文件名自动清洗与防重名。
@@ -23,7 +27,7 @@ moonlight-whisper/
 │  ├─ logger.py                # 7 天轮转日志 + UI 实时日志转发
 │  ├─ workers.py               # QThread 封装与串行任务队列 TaskQueue
 │  ├─ ui/                      # PySide6 界面层 (主窗口/GPU向导/模型管理/设置/网站账号托管中心/专用登录小窗 login_window.py)
-│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/browser_login/site_cookies/webview_login/audio/transcriber/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
+│  └─ core/                    # 零 Qt 依赖核心层 (downloader/browser_cookies/browser_login/site_cookies/webview_login/audio/transcriber/sensevoice_engine/router/languages/summarizer/md_writer/gpu_runtime/model_manager/pipeline)
 ├─ cli.py                      # 命令行入口
 ├─ bin/                        # 放置 ffmpeg.exe 与可选 deno.exe
 ├─ assets/                     # 图标资源 (moon.svg / moon-512.png / app.ico)
@@ -101,3 +105,10 @@ powershell -ExecutionPolicy Bypass -File build\build.ps1 -Version 1.3.7
 - 提取时若目标站点登录凭据尚未就绪，最多等待数秒重试；仍读不到时**不再关闭小窗**，并提示读到的 Cookie 条数与主要域名，便于排查。
 - 登录期间的状态轮询改为只读浏览器级 Cookie，减少对登录页面的干扰；「小窗已关闭」需连续两次探测不到才提示。
 - 优雅关闭小窗时，即使启动进程已退出，只要调试端口仍在也通过 CDP 关闭，保证新 Cookie 落盘。
+
+### v1.4.4
+- 新增 **SenseVoiceSmall** 语音识别模型（中/英/日/韩/粤语），CPU int8 与 CUDA fp32 均可用，GPU 不可用时自动回退 CPU。
+- 新增 **语言路由**：按语言自动选择识别模型，规则可在「偏好设置 → 语言路由」编辑；自动检测语言时用小型 Whisper 模型预先识别。
+- 「识别语言」扩展为全部 100 种语言，支持搜索，并按所选模型置灰不支持的语言；Whisper tiny~medium 选择粤语时不再报错，而是提示并改用自动检测。
+- 依赖变更：`onnxruntime` 改为 `onnxruntime-gpu>=1.22,<1.25`（CUDA 12 构建，两者互斥，升级前请先 `pip uninstall onnxruntime`），新增 `kaldi-native-fbank`。安装包体积会增大约 200 MB（CUDA 执行提供程序）。
+- 配置新增 `route_enabled`、`route_rules`、`route_fallback_model`、`route_detect_model`，旧版 `config.json` 自动补默认值。

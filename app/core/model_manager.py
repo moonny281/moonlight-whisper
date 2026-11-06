@@ -1,4 +1,4 @@
-"""Whisper CTranslate2 model management: strict JSON/binary verification, streaming HF mirror download, and auto-repair."""
+"""ASR model management (Whisper CTranslate2 + SenseVoiceSmall ONNX): strict verification, streaming HF mirror download, and auto-repair."""
 
 from __future__ import annotations
 
@@ -20,6 +20,10 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 
 
+ENGINE_WHISPER = "whisper"
+ENGINE_SENSEVOICE = "sensevoice"
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
@@ -28,6 +32,7 @@ class ModelSpec:
     recommendation: str
     mel_bins: int = 80
     fallback_repo_id: str = ""
+    engine: str = ENGINE_WHISPER
 
 
 SUPPORTED_MODELS: Tuple[ModelSpec, ...] = (
@@ -44,6 +49,13 @@ SUPPORTED_MODELS: Tuple[ModelSpec, ...] = (
         mel_bins=128,
         fallback_repo_id="deepdml/faster-whisper-large-v3-turbo-ct2",
     ),
+    ModelSpec(
+        "SenseVoiceSmall",
+        "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        240,
+        "中/英/日/韩/粤语，CPU 极速推理 (int8)，自带标点",
+        engine=ENGINE_SENSEVOICE,
+    ),
 )
 
 MODEL_SPEC_MAP: Dict[str, ModelSpec] = {m.name: m for m in SUPPORTED_MODELS}
@@ -53,6 +65,20 @@ REQUIRED_MODEL_FILES: Tuple[str, ...] = (
     "config.json",
     "tokenizer.json",
 )
+
+# SenseVoiceSmall (sherpa-onnx export): quantized weights preferred, fp32 export accepted for manual import.
+SENSEVOICE_WEIGHT_FILES: Tuple[str, ...] = ("model.int8.onnx", "model.onnx")
+SENSEVOICE_DOWNLOAD_FILES: Tuple[str, ...] = ("model.int8.onnx", "tokens.txt")
+# The int8 export is built on MatMulInteger / DynamicQuantizeLinear (CPU-oriented ops), so GPU inference uses the
+# fp32 export (~940 MB), fetched on demand the first time GPU acceleration is used with SenseVoiceSmall.
+SENSEVOICE_FP32_FILE = "model.onnx"
+SENSEVOICE_FP32_APPROX_MB = 940
+
+
+def get_model_engine(model_name: str) -> str:
+    """Return the engine (`whisper` | `sensevoice`) that runs `model_name`; unknown names are Whisper repos."""
+    spec = MODEL_SPEC_MAP.get(model_name)
+    return spec.engine if spec else ENGINE_WHISPER
 
 
 @dataclass
@@ -108,8 +134,72 @@ def _is_valid_json_file(path: Path, expect_dict: bool = True) -> bool:
         return False
 
 
-def verify_model_dir(directory: Path, min_bin_bytes: int = 4) -> Tuple[bool, List[str]]:
-    """Verify whether `directory` contains a complete, uncorrupted CTranslate2 Whisper model.
+def _looks_like_bad_download(head: bytes) -> bool:
+    return head.startswith(b"version https://git-lfs") or head.startswith(b"<!DOCTYPE") or head.startswith(b"<html")
+
+
+def find_sensevoice_fp32(directory: Path, min_bytes: int = 4) -> Optional[Path]:
+    """Return the intact fp32 weights (`model.onnx`) used for GPU inference, or `None`."""
+    fp = directory / SENSEVOICE_FP32_FILE
+    try:
+        if not fp.is_file() or fp.stat().st_size < min_bytes:
+            return None
+        with fp.open("rb") as f:
+            if _looks_like_bad_download(f.read(64)):
+                return None
+        return fp
+    except OSError:
+        return None
+
+
+def find_sensevoice_weights(directory: Path, min_bytes: int = 4) -> Optional[Path]:
+    """Return the first intact SenseVoice weights file (`model.int8.onnx` preferred) in `directory`."""
+    for name in SENSEVOICE_WEIGHT_FILES:
+        fp = directory / name
+        try:
+            if not fp.is_file() or fp.stat().st_size < min_bytes:
+                continue
+            with fp.open("rb") as f:
+                if _looks_like_bad_download(f.read(64)):
+                    continue
+            return fp
+        except OSError:
+            continue
+    return None
+
+
+def _verify_sensevoice_dir(directory: Path, min_bin_bytes: int = 4) -> Tuple[bool, List[str]]:
+    """SenseVoiceSmall needs `model.int8.onnx` (or `model.onnx`) plus a valid text `tokens.txt`."""
+    if not directory.exists() or not directory.is_dir():
+        return False, list(SENSEVOICE_DOWNLOAD_FILES)
+
+    missing: List[str] = []
+    if find_sensevoice_weights(directory, min_bytes=min_bin_bytes) is None:
+        missing.append("model.int8.onnx")
+
+    tok = directory / "tokens.txt"
+    tokens_ok = False
+    try:
+        if tok.is_file() and tok.stat().st_size > 0:
+            head = tok.read_bytes()[:64]
+            tokens_ok = not _looks_like_bad_download(head)
+    except OSError:
+        tokens_ok = False
+    if not tokens_ok:
+        missing.append("tokens.txt")
+
+    return len(missing) == 0, missing
+
+
+def verify_model_dir(
+    directory: Path,
+    min_bin_bytes: int = 4,
+    engine: str = ENGINE_WHISPER,
+) -> Tuple[bool, List[str]]:
+    """Verify whether `directory` contains a complete, uncorrupted model for `engine`.
+
+    For `engine="sensevoice"` see `_verify_sensevoice_dir`. For the default Whisper engine this checks a
+    CTranslate2 model.
 
     Requires ALL of:
     1. `model.bin` (non-empty and >= `min_bin_bytes`, not a Git LFS pointer or HTML error page)
@@ -117,6 +207,9 @@ def verify_model_dir(directory: Path, min_bin_bytes: int = 4) -> Tuple[bool, Lis
     3. `tokenizer.json` (valid JSON object required by faster-whisper Python Tokenizer)
     4. `vocabulary.json` (valid JSON) OR `vocabulary.txt` (non-empty text, required by CTranslate2 C++)
     """
+    if engine == ENGINE_SENSEVOICE:
+        return _verify_sensevoice_dir(directory, min_bin_bytes=min_bin_bytes)
+
     if not directory.exists() or not directory.is_dir():
         return False, ["model.bin", "config.json", "tokenizer.json", "vocabulary.json/vocabulary.txt"]
 
@@ -181,8 +274,9 @@ def _dir_size_mb(directory: Path) -> float:
 
 def is_model_installed(model_name: str, paths: AppPaths = PATHS) -> bool:
     model_dir = paths.models_dir / model_name
-    ok, _ = verify_model_dir(model_dir)
-    if ok:
+    engine = get_model_engine(model_name)
+    ok, _ = verify_model_dir(model_dir, engine=engine)
+    if ok and engine == ENGINE_WHISPER:
         spec = MODEL_SPEC_MAP.get(model_name)
         if spec:
             _ensure_preprocessor_config(model_dir, spec.mel_bins)
@@ -194,8 +288,8 @@ def list_models(paths: AppPaths = PATHS) -> List[ModelStatus]:
     results: List[ModelStatus] = []
     for spec in SUPPORTED_MODELS:
         local_dir = paths.models_dir / spec.name
-        installed, _ = verify_model_dir(local_dir)
-        if installed:
+        installed, _ = verify_model_dir(local_dir, engine=spec.engine)
+        if installed and spec.engine == ENGINE_WHISPER:
             _ensure_preprocessor_config(local_dir, spec.mel_bins)
         size_mb = _dir_size_mb(local_dir) if installed else 0.0
         results.append(
@@ -209,17 +303,44 @@ def list_models(paths: AppPaths = PATHS) -> List[ModelStatus]:
     return results
 
 
-def _fetch_repo_file_list(repo_id: str, endpoint: str, proxy: str) -> List[Tuple[str, int]]:
-    """Fetch `(rfilename, exact_size_bytes)` list from HuggingFace API (0 in fallback list)."""
+def _fetch_repo_file_list(
+    repo_id: str,
+    endpoint: str,
+    proxy: str,
+    engine: str = ENGINE_WHISPER,
+    names: Optional[Tuple[str, ...]] = None,
+) -> List[Tuple[str, int]]:
+    """Fetch `(rfilename, exact_size_bytes)` list from HuggingFace API (0 in fallback list).
+
+    `names` restricts the result to exactly those files (used to fetch only the SenseVoice fp32 weights).
+    """
     api_url = f"{endpoint.rstrip('/')}/api/models/{repo_id}"
-    allowed_names = {
-        "config.json",
-        "preprocessor_config.json",
-        "tokenizer.json",
-        "vocabulary.json",
-        "vocabulary.txt",
-        "model.bin",
-    }
+    if names:
+        allowed_names = set(names)
+        required_name = names[0]
+        fallback_files = [(n, 0) for n in names]
+    elif engine == ENGINE_SENSEVOICE:
+        allowed_names = set(SENSEVOICE_DOWNLOAD_FILES)
+        required_name = "model.int8.onnx"
+        fallback_files: List[Tuple[str, int]] = [(n, 0) for n in SENSEVOICE_DOWNLOAD_FILES]
+    else:
+        allowed_names = {
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "vocabulary.json",
+            "vocabulary.txt",
+            "model.bin",
+        }
+        required_name = "model.bin"
+        fallback_files = [
+            ("config.json", 0),
+            ("preprocessor_config.json", 0),
+            ("tokenizer.json", 0),
+            ("vocabulary.json", 0),
+            ("vocabulary.txt", 0),
+            ("model.bin", 0),
+        ]
     try:
         meta = http_client.fetch_json(api_url, proxy=proxy, timeout=20)
         siblings = meta.get("siblings") or []
@@ -229,19 +350,14 @@ def _fetch_repo_file_list(repo_id: str, endpoint: str, proxy: str) -> List[Tuple
             if rfile in allowed_names:
                 size = int(s.get("size") or (s.get("lfs") or {}).get("size") or 0)
                 files.append((rfile, size))
-        if any(f[0] == "model.bin" for f in files):
+        if any(f[0] == required_name for f in files) and (
+            names or engine != ENGINE_SENSEVOICE or any(f[0] == "tokens.txt" for f in files)
+        ):
             return files
     except Exception:
         pass
 
-    return [
-        ("config.json", 0),
-        ("preprocessor_config.json", 0),
-        ("tokenizer.json", 0),
-        ("vocabulary.json", 0),
-        ("vocabulary.txt", 0),
-        ("model.bin", 0),
-    ]
+    return fallback_files
 
 
 def download_model(
@@ -252,17 +368,24 @@ def download_model(
     on_log: Optional[LogCallback] = None,
     token: Optional[CancelToken] = None,
     paths: AppPaths = PATHS,
+    only_files: Optional[Tuple[str, ...]] = None,
 ) -> Path:
-    """Stream-download a CTranslate2 Whisper model from HuggingFace or `hf-mirror.com` with Range resume & instant cancel."""
+    """Stream-download a model (Whisper CT2 / SenseVoiceSmall ONNX) from HuggingFace or `hf-mirror.com` with Range resume & instant cancel.
+
+    `only_files` limits the download to the listed repo files (SenseVoice GPU weights).
+    """
     if token:
         token.check()
 
     spec = MODEL_SPEC_MAP.get(model_name)
+    engine = spec.engine if spec else ENGINE_WHISPER
     repos_to_try = [spec.repo_id] if spec else [model_name]
     if spec and spec.fallback_repo_id:
         repos_to_try.append(spec.fallback_repo_id)
 
     approx_total_bytes = (spec.approx_size_mb if spec else 500) * 1024 * 1024
+    if only_files and SENSEVOICE_FP32_FILE in only_files:
+        approx_total_bytes = SENSEVOICE_FP32_APPROX_MB * 1024 * 1024
     target_dir = paths.models_dir / model_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,7 +407,14 @@ def download_model(
             if on_progress:
                 on_progress(0.02, f"正在连接 {endpoint} 获取 {repo_id} 文件列表...")
 
-            file_entries = _fetch_repo_file_list(repo_id=repo_id, endpoint=endpoint, proxy=proxy)
+            if only_files:
+                file_entries = _fetch_repo_file_list(
+                    repo_id=repo_id, endpoint=endpoint, proxy=proxy, engine=engine, names=tuple(only_files)
+                )
+            elif engine == ENGINE_WHISPER:
+                file_entries = _fetch_repo_file_list(repo_id=repo_id, endpoint=endpoint, proxy=proxy)
+            else:
+                file_entries = _fetch_repo_file_list(repo_id=repo_id, endpoint=endpoint, proxy=proxy, engine=engine)
             known_sum = sum(sz for _, sz in file_entries if sz > 0)
             total_expected_bytes = known_sum if known_sum > 10 * 1024 * 1024 else approx_total_bytes
 
@@ -300,7 +430,7 @@ def download_model(
 
                     if dest_file.exists():
                         sz = dest_file.stat().st_size
-                        if sz == 0 or (rfile == "model.bin" and sz < 1024 * 1024):
+                        if sz == 0 or (rfile in ("model.bin", "model.int8.onnx", "model.onnx") and sz < 1024 * 1024):
                             dest_file.unlink(missing_ok=True)
                         elif rfile.endswith(".json") and not _is_valid_json_file(dest_file, expect_dict=(rfile != "vocabulary.json")):
                             dest_file.unlink(missing_ok=True)
@@ -358,10 +488,12 @@ def download_model(
                     actual_sz = dest_file.stat().st_size if dest_file.exists() else declared_size
                     completed_prior_bytes += actual_sz
 
-                if spec:
+                if spec and engine == ENGINE_WHISPER:
                     _ensure_preprocessor_config(target_dir, spec.mel_bins)
 
-                ok, missing = verify_model_dir(target_dir)
+                ok, missing = verify_model_dir(target_dir, engine=engine)
+                if ok and only_files and SENSEVOICE_FP32_FILE in only_files and find_sensevoice_fp32(target_dir) is None:
+                    ok, missing = False, [SENSEVOICE_FP32_FILE]
                 if ok:
                     if on_progress:
                         on_progress(1.0, f"模型 {model_name} 下载并校验完成")
@@ -387,18 +519,41 @@ def download_model(
     )
 
 
+def download_sensevoice_fp32(
+    hf_mirror: bool = True,
+    proxy: str = "",
+    on_progress: Optional[ProgressCallback] = None,
+    on_log: Optional[LogCallback] = None,
+    token: Optional[CancelToken] = None,
+    paths: AppPaths = PATHS,
+) -> Path:
+    """Download only the fp32 `model.onnx` that SenseVoiceSmall needs for CUDA inference (~940 MB)."""
+    return download_model(
+        "SenseVoiceSmall",
+        hf_mirror=hf_mirror,
+        proxy=proxy,
+        on_progress=on_progress,
+        on_log=on_log,
+        token=token,
+        paths=paths,
+        only_files=(SENSEVOICE_FP32_FILE,),
+    )
+
+
 def import_model_directory(
     model_name: str,
     source_dir: Path,
     on_log: Optional[LogCallback] = None,
     paths: AppPaths = PATHS,
 ) -> Path:
-    """Validate and copy a local CTranslate2 model folder into `models/<model_name>/`."""
+    """Validate and copy a local model folder (CTranslate2 Whisper or SenseVoiceSmall ONNX) into `models/<model_name>/`."""
     source_dir = source_dir.expanduser().resolve()
-    ok, missing = verify_model_dir(source_dir)
+    engine = get_model_engine(model_name)
+    ok, missing = verify_model_dir(source_dir, engine=engine)
     if not ok:
+        kind = "SenseVoiceSmall (model.int8.onnx + tokens.txt)" if engine == ENGINE_SENSEVOICE else "CTranslate2 Whisper"
         raise ModelError(
-            f"所选文件夹不是完整的 CTranslate2 Whisper 模型目录（缺少或损坏：{', '.join(missing)}）。",
+            f"所选文件夹不是完整的 {kind} 模型目录（缺少或损坏：{', '.join(missing)}）。",
             detail=str(source_dir),
         )
 
@@ -409,7 +564,7 @@ def import_model_directory(
         shutil.copytree(source_dir, target_dir)
 
     spec = MODEL_SPEC_MAP.get(model_name)
-    if spec:
+    if spec and engine == ENGINE_WHISPER:
         _ensure_preprocessor_config(target_dir, spec.mel_bins)
 
     if on_log:

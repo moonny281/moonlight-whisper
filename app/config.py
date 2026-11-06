@@ -12,6 +12,11 @@ from app.paths import PATHS, AppPaths
 
 CURRENT_CONFIG_VERSION = 1
 
+# Language routing defaults: Chinese / Cantonese go to SenseVoiceSmall, every other language to the fallback model.
+DEFAULT_ROUTE_RULES: Dict[str, str] = {"zh": "SenseVoiceSmall", "yue": "SenseVoiceSmall"}
+DEFAULT_ROUTE_FALLBACK_MODEL = "large-v3-turbo"
+DEFAULT_ROUTE_DETECT_MODEL = "base"
+
 DEFAULT_LLM_PROMPT = (
     "请阅读以下视频转录文本，用简洁清晰的中文提炼：\n"
     "1. 核心内容摘要（150字以内）\n"
@@ -69,6 +74,10 @@ class Config:
     pypi_mirror: str = "tuna"      # "tuna" | "aliyun" | "official"
     filename_template: str = "{title}"
     log_level: str = "INFO"
+    route_enabled: bool = False
+    route_rules: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROUTE_RULES))
+    route_fallback_model: str = DEFAULT_ROUTE_FALLBACK_MODEL
+    route_detect_model: str = DEFAULT_ROUTE_DETECT_MODEL
     ui: UiConfig = field(default_factory=UiConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
 
@@ -120,6 +129,17 @@ class Config:
             except (TypeError, ValueError):
                 return default
 
+        route_rules = dict(DEFAULT_ROUTE_RULES)
+        rules_raw = data.get("route_rules")
+        if isinstance(rules_raw, dict):
+            from app.core.languages import ALL_CODES
+
+            route_rules = {}
+            for lang, mdl in rules_raw.items():
+                lang_s, mdl_s = str(lang).strip().lower(), str(mdl).strip()
+                if lang_s in ALL_CODES and mdl_s:
+                    route_rules[lang_s] = mdl_s
+
         pypi_mirror = _str("pypi_mirror", defaults.pypi_mirror)
         if pypi_mirror not in ("tuna", "aliyun", "official"):
             pypi_mirror = "tuna"
@@ -161,6 +181,12 @@ class Config:
             pypi_mirror=pypi_mirror,
             filename_template=filename_template,
             log_level=_str("log_level", defaults.log_level).upper() or "INFO",
+            route_enabled=bool(data.get("route_enabled", defaults.route_enabled)),
+            route_rules=route_rules,
+            route_fallback_model=_str("route_fallback_model", defaults.route_fallback_model).strip()
+            or defaults.route_fallback_model,
+            route_detect_model=_str("route_detect_model", defaults.route_detect_model).strip()
+            or defaults.route_detect_model,
             ui=ui_cfg,
             llm=llm_cfg,
         )

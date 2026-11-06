@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="视频链接 (URL) 或本地音视频文件路径，支持多个输入",
     )
-    parser.add_argument("-m", "--model", help="Whisper 模型名称 (如 tiny/base/small/medium/large-v3/large-v3-turbo)")
+    parser.add_argument("-m", "--model", help="模型名称 (Whisper: tiny/base/small/medium/large-v3/large-v3-turbo；或 SenseVoiceSmall)")
     parser.add_argument("-l", "--language", help="音频语言代码 (如 zh/en/ja，留空为自动检测)")
     parser.add_argument("-o", "--output-dir", help="输出目录路径")
     parser.add_argument("--cpu", action="store_true", help="强制使用 CPU 模式")
@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--refresh-cookies", metavar="SITE_OR_URL", help="后台无头静默刷新指定托管站点（如 youtube）的 Cookie 后退出")
     parser.add_argument("--diagnose", action="store_true", help="打印 yt-dlp / deno / yt-dlp-ejs / rookie-cookies / 账号托管环境诊断信息后退出")
     parser.add_argument("--detect-gpu", action="store_true", help="仅检测当前机器的 NVIDIA GPU 与 CUDA 运行库状态")
+    parser.add_argument("--route", action="store_true", help="启用语言路由：按语言自动选择模型（规则见 config.json 的 route_rules）")
+    parser.add_argument("--no-route", action="store_true", help="关闭语言路由，始终使用 --model 指定的模型")
     parser.add_argument("--install-gpu-runtime", action="store_true", help="在线下载并安装 CUDA 12 运行库")
     return parser
 
@@ -85,6 +87,10 @@ def main(argv: List[str] | None = None) -> int:
         cfg.keep_audio = True
     if args.playlist:
         cfg.allow_playlist = True
+    if args.route:
+        cfg.route_enabled = True
+    if args.no_route:
+        cfg.route_enabled = False
     if args.no_vad:
         cfg.vad = False
     if args.no_timestamps:

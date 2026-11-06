@@ -3,7 +3,11 @@ faster-whisper>=1.1.0,<2.0.0
 ctranslate2>=4.5.0,<5.0.0
 # faster-whisper <=1.2.1 调用 av.open(..., metadata_errors="ignore")，而 PyAV 18+ 移除了该参数
 av>=11.0.0,<17.0.0
-onnxruntime>=1.17.0,<2.0.0
+# onnxruntime-gpu 同时内置 CPU 推理，用于 Silero VAD 与 SenseVoiceSmall (CPU int8 / CUDA fp32)。
+# 注意：与 onnxruntime 互斥（同一包目录），请勿同时安装；1.25+ 的 PyPI 构建已改用 CUDA 13，而本项目的运行库是 CUDA 12，故限定 <1.25。
+onnxruntime-gpu>=1.22.0,<1.25.0
+# SenseVoiceSmall 前端特征 (Kaldi fbank)；推理复用上面的 onnxruntime，不依赖 PyTorch / FunASR / sherpa-onnx
+kaldi-native-fbank>=1.19.0
 huggingface_hub>=0.23.0,<1.0.0
 tokenizers>=0.19.0,<1.0.0
 # [default] 会同时安装 yt-dlp-ejs（YouTube JS 挑战解析脚本），且版本由 yt-dlp 精确锁定

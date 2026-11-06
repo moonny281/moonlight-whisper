@@ -1,4 +1,4 @@
-"""faster-whisper transcription engine with PyAV 18/19 compatibility, pure-Python WAV decoding, Chinese-path-safe loading, and VAD/GPU fallback."""
+"""Transcription entry point (faster-whisper engine; SenseVoiceSmall is dispatched to `sensevoice_engine`) with PyAV 18/19 compatibility, pure-Python WAV decoding, Chinese-path-safe loading, and VAD/GPU fallback."""
 
 from __future__ import annotations
 
@@ -243,6 +243,16 @@ def _load_model_files_into_memory(local_dir: Path) -> Dict[str, bytes]:
     return files
 
 
+def _release_sensevoice_cache() -> None:
+    """Free a resident SenseVoice model (only if that engine was ever imported) so one engine stays in memory."""
+    mod = sys.modules.get("app.core.sensevoice_engine")
+    if mod is not None:
+        try:
+            mod.SENSEVOICE_CACHE.clear()
+        except Exception:
+            pass
+
+
 class _ModelCache:
     """Singleton cache keeping at most one loaded WhisperModel in memory."""
 
@@ -261,6 +271,7 @@ class _ModelCache:
         on_log: Optional[LogCallback] = None,
     ) -> Any:
         _patch_runtime_compat()
+        _release_sensevoice_cache()
         key = (model_path_or_size, device, compute_type, cpu_threads)
         with self._lock:
             if self._model is not None and self._key == key:
@@ -368,6 +379,12 @@ class _ModelCache:
 
 
 MODEL_CACHE = _ModelCache()
+
+
+def clear_all_model_caches() -> None:
+    """Drop every resident ASR model (Whisper and SenseVoice), e.g. before re-downloading a corrupted model."""
+    MODEL_CACHE.clear()
+    _release_sensevoice_cache()
 
 
 def build_fallback_chain(opts: TranscribeOptions) -> List[Tuple[str, str]]:
@@ -543,6 +560,77 @@ def _run_single_attempt(
     return collected, meta
 
 
+LANGUAGE_DETECT_MAX_SECONDS = 600
+
+
+def detect_language(
+    wav_path: Path,
+    model_name: str,
+    models_dir: Optional[Path] = None,
+    cpu_threads: int = 0,
+    on_log: Optional[LogCallback] = None,
+    token: Optional[CancelToken] = None,
+    paths: AppPaths = PATHS,
+) -> Tuple[Optional[str], float]:
+    """Identify the spoken language with a small Whisper model (CPU/int8). Returns `(code, probability)`.
+
+    Used by language routing to decide which model transcribes the audio. Detection looks at up to three speech
+    segments from the first `LANGUAGE_DETECT_MAX_SECONDS` seconds. Any failure yields `(None, 0.0)`.
+    """
+    import inspect
+
+    if token:
+        token.check()
+    models_dir = models_dir or paths.models_dir
+    try:
+        model = MODEL_CACHE.get_or_create(
+            model_path_or_size=model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=cpu_threads,
+            download_root=models_dir,
+            on_log=on_log,
+        )
+        if token:
+            token.check()
+        audio = load_wav_as_float32_array(wav_path)
+        if audio is None or getattr(audio, "size", 0) == 0:
+            return None, 0.0
+        audio = audio[: LANGUAGE_DETECT_MAX_SECONDS * 16000]
+
+        params = inspect.signature(model.detect_language).parameters
+        attempts: List[Dict[str, Any]] = []
+        vad_kwargs: Dict[str, Any] = {}
+        if "vad_filter" in params:
+            vad_kwargs["vad_filter"] = True
+        if "language_detection_segments" in params:
+            vad_kwargs["language_detection_segments"] = 3
+        if vad_kwargs:
+            attempts.append(vad_kwargs)
+        attempts.append({})  # plain first-30-seconds detection (also the fallback when VAD finds no speech)
+
+        last_exc: Optional[BaseException] = None
+        for kwargs in attempts:
+            try:
+                result = model.detect_language(audio, **kwargs)
+                lang, prob = str(result[0]), float(result[1])
+                return (lang or None), prob
+            except CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+        if on_log and last_exc is not None:
+            on_log(f"[语言检测] 检测失败：{last_exc}")
+        return None, 0.0
+    except CancelledError:
+        raise
+    except Exception as exc:
+        MODEL_CACHE.clear()
+        if on_log:
+            on_log(f"[语言检测] 无法加载语言检测模型 {model_name}：{exc}")
+        return None, 0.0
+
+
 def transcribe(
     wav_path: Path,
     opts: TranscribeOptions,
@@ -551,9 +639,21 @@ def transcribe(
     token: Optional[CancelToken] = None,
     paths: AppPaths = PATHS,
 ) -> Tuple[List[Segment], Dict[str, Any]]:
-    """Transcribe `wav_path` with automatic GPU OOM/DLL fallback to CPU."""
+    """Transcribe `wav_path` with automatic GPU OOM/DLL fallback to CPU (SenseVoiceSmall runs on CPU only)."""
     if not wav_path.exists():
         raise TranscribeError(f"待转录 WAV 文件不存在：{wav_path}")
+
+    if model_manager.get_model_engine(opts.model) == model_manager.ENGINE_SENSEVOICE:
+        from app.core import sensevoice_engine
+
+        return sensevoice_engine.transcribe_sensevoice(
+            wav_path=wav_path,
+            opts=opts,
+            on_progress=on_progress,
+            on_log=on_log,
+            token=token,
+            paths=paths,
+        )
 
     chain = build_fallback_chain(opts)
     last_exc: Optional[BaseException] = None

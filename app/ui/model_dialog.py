@@ -213,10 +213,11 @@ class ModelManagerDialog(QDialog):
             QMessageBox.information(self, "提示", "请先在列表中选择要导入的目标模型名称。")
             return
 
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            f"选择包含 {model_name} (CTranslate2 格式，含 model.bin / vocabulary.*) 的本地文件夹",
-        )
+        if model_manager.get_model_engine(model_name) == model_manager.ENGINE_SENSEVOICE:
+            hint = f"选择包含 {model_name} (sherpa-onnx 导出，含 model.int8.onnx / tokens.txt) 的本地文件夹"
+        else:
+            hint = f"选择包含 {model_name} (CTranslate2 格式，含 model.bin / vocabulary.*) 的本地文件夹"
+        folder = QFileDialog.getExistingDirectory(self, hint)
         if not folder:
             return
 

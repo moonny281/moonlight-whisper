@@ -52,6 +52,18 @@ PYPI_PACKAGES: Tuple[str, ...] = (
     "nvidia-cudnn-cu12",
 )
 
+# ONNX Runtime's CUDA execution provider (used by SenseVoiceSmall) additionally links the CUDA runtime and
+# cuFFT. Verified from `onnxruntime_providers_cuda.dll` imports of onnxruntime-gpu 1.22 - 1.24 (CUDA 12 builds).
+ONNX_EXTRA_DLLS: Tuple[str, ...] = (
+    "cudart64_12.dll",
+    "cufft64_11.dll",
+)
+
+ONNX_EXTRA_PYPI_PACKAGES: Tuple[str, ...] = (
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cufft-cu12",
+)
+
 _DLL_DIR_HANDLES: Dict[str, Any] = {}
 
 
@@ -81,6 +93,28 @@ def check_runtime_files(gpu_dir: Path) -> List[str]:
         if p.is_file() and p.stat().st_size > 0
     }
     return [dll for dll in REQUIRED_CORE_DLLS if dll.lower() not in existing_lower]
+
+
+def check_onnx_extra_files(gpu_dir: Path) -> List[str]:
+    """Return the ONNX-Runtime-only CUDA DLLs (cudart / cuFFT) missing from `gpu_dir`."""
+    if not gpu_dir.exists():
+        return list(ONNX_EXTRA_DLLS)
+    existing_lower = {
+        p.name.lower()
+        for p in gpu_dir.glob("*.dll")
+        if p.is_file() and p.stat().st_size > 0
+    }
+    return [dll for dll in ONNX_EXTRA_DLLS if dll.lower() not in existing_lower]
+
+
+def onnxruntime_has_cuda() -> bool:
+    """True when the installed `onnxruntime` build exposes `CUDAExecutionProvider` (i.e. `onnxruntime-gpu`)."""
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
 
 
 def _check_nvcuda_dll() -> bool:
@@ -403,6 +437,92 @@ def install(
         on_log(f"CUDA 运行库已安装至：{target_dir}")
 
     return detect(paths)
+
+
+def install_onnx_extras(
+    mirror: str = "tuna",
+    proxy: str = "",
+    on_progress: Optional[ProgressCallback] = None,
+    on_log: Optional[LogCallback] = None,
+    token: Optional[CancelToken] = None,
+    paths: AppPaths = PATHS,
+) -> None:
+    """Download `nvidia-cuda-runtime-cu12` + `nvidia-cufft-cu12` and drop their DLLs into the existing `gpu_runtime/`.
+
+    Needed only by SenseVoiceSmall on GPU (ONNX Runtime). The cuBLAS / cuDNN DLLs already installed for Whisper are
+    left untouched.
+    """
+    if token:
+        token.check()
+
+    gpu_dir = paths.gpu_runtime_dir
+    gpu_dir.mkdir(parents=True, exist_ok=True)
+
+    wheels_meta: List[Tuple[str, Dict[str, Any]]] = []
+    for pkg in ONNX_EXTRA_PYPI_PACKAGES:
+        if token:
+            token.check()
+        if on_log:
+            on_log(f"正在解析 {pkg} 下载地址 (镜像: {mirror})...")
+        try:
+            w = http_client.resolve_pypi_wheel(pkg, mirror=mirror, proxy=proxy, win_amd64_only=True)
+        except Exception as exc:
+            raise GpuError(f"获取 {pkg} 下载信息失败，请检查网络或切换镜像源。", detail=str(exc)) from exc
+        wheels_meta.append((pkg, w))
+
+    dl_cache_dir = paths.temp_dir / "gpu_wheels_onnx"
+    dl_cache_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = paths.temp_dir / "gpu_runtime_onnx_staging"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    total_est = sum(int(w.get("size") or 100 * 1024 * 1024) for _, w in wheels_meta)
+    done_bytes = 0
+    for pkg, w in wheels_meta:
+        filename = str(w["filename"])
+        dest_file = dl_cache_dir / filename
+        sha256 = str(w.get("digests", {}).get("sha256") or "")
+        if on_log:
+            on_log(f"开始下载 {filename}...")
+
+        def _on_chunk(cur: int, file_total: int, base: int = done_bytes, label: str = pkg) -> None:
+            if on_progress:
+                overall = base + cur
+                ratio = min(0.9, max(0.0, overall / max(1, max(total_est, base + file_total))))
+                on_progress(ratio, f"正在下载 {label}: {overall / (1024 * 1024):.1f} MB")
+
+        try:
+            wheel_path = http_client.stream_download_with_resume(
+                url=str(w["url"]),
+                dest_file=dest_file,
+                proxy=proxy,
+                expected_sha256=sha256,
+                on_chunk_progress=_on_chunk,
+                token=token,
+                timeout=60,
+            )
+        except CancelledError:
+            raise
+        except Exception as exc:
+            raise GpuError(f"下载运行库文件失败 ({filename})，支持重试断点续传。", detail=str(exc)) from exc
+        done_bytes += wheel_path.stat().st_size if wheel_path.exists() else 0
+        _extract_dlls_from_archive(wheel_path, staging_dir)
+
+    missing = check_onnx_extra_files(staging_dir)
+    if missing:
+        raise GpuError("解压后的运行库缺少必要 DLL 文件", detail="缺失: " + ", ".join(missing))
+
+    for dll in staging_dir.glob("*.dll"):
+        shutil.copy2(dll, gpu_dir / dll.name)
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    shutil.rmtree(dl_cache_dir, ignore_errors=True)
+    register_dll_directory(gpu_dir)
+
+    if on_progress:
+        on_progress(1.0, "ONNX Runtime CUDA 补充组件安装完成")
+    if on_log:
+        on_log(f"ONNX Runtime CUDA 补充组件 (cudart / cuFFT) 已安装至：{gpu_dir}")
 
 
 def import_from(
