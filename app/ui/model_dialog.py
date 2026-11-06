@@ -8,7 +8,6 @@ from typing import List, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -29,7 +28,7 @@ from app.core.errors import ErrorInfo
 from app.core.model_manager import ModelStatus
 from app.paths import PATHS, AppPaths
 from app.ui.theme import apply_win11_mica_window_attributes, resolve_effective_theme
-from app.ui.widgets import make_mica_section, open_path_in_os
+from app.ui.widgets import SwitchCheckBox, make_mica_section, open_path_in_os
 from app.workers import ModelDownloadWorker
 
 
@@ -62,12 +61,12 @@ class ModelManagerDialog(QDialog):
         root.setSpacing(12)
 
         card, card_box = make_mica_section(
-            "Whisper 模型库 (CTranslate2 格式)",
-            "支持在线流式下载（含断点续传与国内镜像加速）或导入本地已下载的模型文件夹。",
+            "语音识别模型库",
+            "包含 Whisper 系列与 SenseVoiceSmall。支持在线下载（断点续传、国内镜像加速），也可导入本地已下载的模型文件夹。",
         )
 
         top_row = QHBoxLayout()
-        self.chk_hf_mirror = QCheckBox("使用国内 HuggingFace 镜像加速 (hf-mirror.com)")
+        self.chk_hf_mirror = SwitchCheckBox("使用国内 HuggingFace 镜像加速 (hf-mirror.com)")
         self.chk_hf_mirror.setChecked(self.cfg.hf_mirror)
         self.chk_hf_mirror.toggled.connect(self._on_mirror_toggled)
         top_row.addWidget(self.chk_hf_mirror)

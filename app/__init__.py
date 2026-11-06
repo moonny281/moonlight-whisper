@@ -1,4 +1,4 @@
 """Moonlight Whisper package metadata."""
 
 __app_name__ = "Moonlight Whisper"
-__version__ = "1.4.4"
+__version__ = "1.4.5"

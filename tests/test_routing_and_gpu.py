@@ -640,7 +640,7 @@ class ReleaseMetaTests(unittest.TestCase):
     def test_version(self) -> None:
         import app
 
-        self.assertEqual(app.__version__, "1.4.4")
+        self.assertEqual(app.__version__, "1.4.5")
 
     def test_requirements_pin_cuda12_onnxruntime_gpu(self) -> None:
         text = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")

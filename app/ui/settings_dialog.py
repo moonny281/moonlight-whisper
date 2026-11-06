@@ -9,7 +9,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -38,7 +37,7 @@ from app.core.site_cookies import inspect_netscape, netscape_to_header, probe_bi
 from app.paths import PATHS, AppPaths
 from app.ui.cookie_login_dialog import CookieLoginDialog
 from app.ui.theme import apply_win11_mica_window_attributes, resolve_effective_theme
-from app.ui.widgets import make_mica_section
+from app.ui.widgets import SwitchCheckBox, make_mica_section
 from app.workers import YtDlpUpdateWorker
 
 
@@ -117,7 +116,7 @@ class SettingsDialog(QDialog):
         self.edit_proxy.setPlaceholderText("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:10808（留空自动检测系统代理）")
         proxy_form.addRow("代理地址：", self.edit_proxy)
 
-        self.chk_hf_mirror = QCheckBox("启用 HuggingFace 国内镜像 (https://hf-mirror.com)")
+        self.chk_hf_mirror = SwitchCheckBox("启用 HuggingFace 国内镜像 (https://hf-mirror.com)")
         proxy_form.addRow("模型下载源：", self.chk_hf_mirror)
 
         self.combo_pypi = QComboBox()
@@ -165,7 +164,7 @@ class SettingsDialog(QDialog):
         self.lbl_vault_status.setWordWrap(True)
         cookie_form.addRow("账号托管状态：", self.lbl_vault_status)
 
-        self.chk_auto_refresh_cookies = QCheckBox("当托管账号 Cookie 过期或触发验证时，后台自动无头静默提取新凭据")
+        self.chk_auto_refresh_cookies = SwitchCheckBox("当托管账号 Cookie 过期或触发验证时，后台自动无头静默提取新凭据")
         cookie_form.addRow("托管自动续期：", self.chk_auto_refresh_cookies)
 
         cookie_file_row = QHBoxLayout()
@@ -229,16 +228,16 @@ class SettingsDialog(QDialog):
         tr_form = QFormLayout()
         self._configure_form(tr_form)
 
-        self.chk_allow_playlist = QCheckBox("允许解析播放列表 / 多 P 视频（自动展开加入任务队列）")
+        self.chk_allow_playlist = SwitchCheckBox("允许解析播放列表 / 多 P 视频（自动展开加入任务队列）")
         tr_form.addRow("播放列表：", self.chk_allow_playlist)
 
-        self.chk_include_timestamps = QCheckBox("在输出的 Markdown 正文中保留段落时间轴（如 **[00:01:23]**）")
+        self.chk_include_timestamps = SwitchCheckBox("在输出的 Markdown 正文中保留段落时间轴（如 **[00:01:23]**）")
         tr_form.addRow("正文时间轴：", self.chk_include_timestamps)
 
-        self.chk_include_video_info = QCheckBox("在输出的 Markdown 顶部保留视频元数据信息表（来源/作者/时长/模型等）")
+        self.chk_include_video_info = SwitchCheckBox("在输出的 Markdown 顶部保留视频元数据信息表（来源/作者/时长/模型等）")
         tr_form.addRow("视频信息表：", self.chk_include_video_info)
 
-        self.chk_vad = QCheckBox("开启 VAD 静音过滤（有效减少静音段幻觉与重复循环）")
+        self.chk_vad = SwitchCheckBox("开启 VAD 静音过滤（有效减少静音段幻觉与重复循环）")
         tr_form.addRow("静音过滤：", self.chk_vad)
 
         self.spin_vad_ms = QSpinBox()
@@ -288,7 +287,7 @@ class SettingsDialog(QDialog):
         info.setObjectName("HintLabel")
         box.addWidget(info)
 
-        self.chk_route_enabled = QCheckBox("启用语言路由")
+        self.chk_route_enabled = SwitchCheckBox("启用语言路由")
         box.addWidget(self.chk_route_enabled)
 
         self.tbl_route_rules = QTableWidget(0, 2)
@@ -411,7 +410,7 @@ class SettingsDialog(QDialog):
         llm_form = QFormLayout()
         self._configure_form(llm_form)
 
-        self.chk_llm_enabled = QCheckBox("转录完成后自动调用 LLM 生成「## 摘要」章节")
+        self.chk_llm_enabled = SwitchCheckBox("转录完成后自动调用 LLM 生成「## 摘要」章节")
         llm_form.addRow("启用摘要：", self.chk_llm_enabled)
 
         self.edit_llm_base_url = QLineEdit()
